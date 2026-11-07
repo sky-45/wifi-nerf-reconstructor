@@ -1,11 +1,19 @@
 """
-Blob Storage Client & Session Assembler.
+Blob Storage Client & Multi-Device Session Assembler.
 Supports:
 1. Oracle Cloud Infrastructure (OCI) Object Storage (oci://bucket@namespace/prefix or OCI S3-compatible endpoints)
 2. AWS S3 / MinIO (s3://bucket/prefix)
 3. Local file/directory storage (file://... or raw path)
-Deduplicates batch_id, decompresses .ndjson.gz streams in memory, filters stale scans,
-and stitches multi-rate sensor streams into a chronologically ordered session.
+
+Partition Hierarchy:
+  fleet/{device_id}/{env_id}/batch_{timestamp_ns}_{batch_seq}.ndjson.gz
+
+Capabilities:
+- Deduplicates batch_id / batch_seq per device.
+- Decompresses .ndjson.gz streams in-memory.
+- Filters stale scans and transient mobile hotspots.
+- Multi-device collaborative session merging: aligns walks from independent
+  devices into a unified coordinate frame via shared AP anchors.
 """
 
 import gzip
@@ -13,8 +21,15 @@ import io
 import json
 import os
 import re
-from typing import Dict, Any, List, Optional, Iterator
+from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse
+
+from reconstructor.session_partitioner import (
+    SessionPartitioner,
+    MultiDeviceAligner,
+    parse_fleet_key
+)
+
 
 class BlobStoreAdapter:
     """Pluggable adapter for reading raw .ndjson.gz batches from OCI, S3, or Local storage."""
@@ -24,28 +39,88 @@ class BlobStoreAdapter:
         self.parsed = urlparse(base_uri)
         self._oci_client = None
 
+    def list_all_objects(self, prefix: str = "") -> List[str]:
+        """Lists all telemetry batch files across the storage target matching the prefix."""
+        scheme = self.parsed.scheme
+
+        if scheme in ("", "file"):
+            base_dir = self.parsed.path if scheme == "file" else self.base_uri
+            search_dir = os.path.join(base_dir, prefix) if prefix else base_dir
+            if not os.path.exists(search_dir):
+                return []
+            found = []
+            for root, _, files in os.walk(search_dir):
+                for fname in files:
+                    if (fname.endswith(".ndjson.gz") or fname.endswith(".jsonl.gz") or
+                        fname.endswith(".jsonl") or fname.endswith(".ndjson")):
+                        found.append(os.path.join(root, fname))
+            return sorted(found)
+
+        elif scheme == "oci":
+            return self._list_all_oci_objects(prefix)
+
+        elif scheme == "s3":
+            return self._list_all_s3_objects(prefix)
+
+        else:
+            raise ValueError(f"Unsupported storage scheme: {scheme}")
+
+    def list_fleet_objects(self, device_id: Optional[str] = None, env_id: Optional[str] = None) -> List[str]:
+        """Filters objects under the fleet partition hierarchy by device_id and/or env_id."""
+        all_objs = self.list_all_objects()
+        matching = []
+        for obj in all_objs:
+            parsed = parse_fleet_key(obj)
+            if not parsed:
+                continue
+            d_id, e_id, _ = parsed
+            if device_id and d_id != device_id:
+                continue
+            if env_id and e_id != env_id:
+                continue
+            matching.append(obj)
+        return sorted(matching)
+
     def list_batch_objects(self, session_id: str) -> List[str]:
-        """Returns a list of object identifiers for the given session_id."""
+        """Returns a list of object identifiers for the given session_id or environment_id."""
         scheme = self.parsed.scheme
 
         if scheme in ("", "file"):
             base_dir = self.parsed.path if scheme == "file" else self.base_uri
             session_dir = os.path.join(base_dir, session_id)
-            if not os.path.isdir(session_dir):
-                return []
             files = []
-            for fname in os.listdir(session_dir):
-                if fname.endswith(".ndjson.gz") or fname.endswith(".jsonl.gz") or fname.endswith(".jsonl"):
-                    files.append(os.path.join(session_dir, fname))
+            if os.path.isdir(session_dir):
+                for fname in os.listdir(session_dir):
+                    if fname.endswith(".ndjson.gz") or fname.endswith(".jsonl.gz") or fname.endswith(".jsonl") or fname.endswith(".ndjson"):
+                        files.append(os.path.join(session_dir, fname))
+            if files:
+                return sorted(files)
+
+            # Fallback: search for session_id in fleet hierarchy (e.g. fleet/*/{session_id})
+            all_objs = self.list_all_objects()
+            for obj in all_objs:
+                norm = obj.replace("\\", "/")
+                parsed = parse_fleet_key(obj)
+                if parsed and (parsed[1] == session_id or parsed[0] == session_id):
+                    files.append(obj)
+                elif f"/{session_id}/" in norm:
+                    files.append(obj)
             return sorted(files)
 
         elif scheme == "oci":
-            # OCI Object Storage URI format: oci://bucket_name@namespace_name/prefix
-            # or uses OCI S3-compatibility API
-            return self._list_oci_objects(session_id)
+            files = self._list_oci_objects(session_id)
+            if not files:
+                # Fallback to search all objects
+                all_objs = self._list_all_oci_objects()
+                return [o for o in all_objs if f"/{session_id}/" in o]
+            return files
 
         elif scheme == "s3":
-            return self._list_s3_objects(session_id)
+            files = self._list_s3_objects(session_id)
+            if not files:
+                all_objs = self._list_all_s3_objects()
+                return [o for o in all_objs if f"/{session_id}/" in o]
+            return files
 
         else:
             raise ValueError(f"Unsupported storage scheme: {scheme}")
@@ -63,13 +138,10 @@ class BlobStoreAdapter:
             raise ValueError(f"Unsupported storage scheme: {scheme}")
 
     def _list_oci_objects(self, session_id: str) -> List[str]:
-        """
-        Lists objects in OCI Object Storage bucket.
-        Requires 'oci' python SDK if running in cloud, or falls back to OCI S3-compatible credentials.
-        """
+        """Lists objects in OCI Object Storage bucket under prefix/{session_id}/."""
         try:
             import oci
-            config = oci.config.from_file() # Reads ~/.oci/config or OCI Instance Principal
+            config = oci.config.from_file()
             object_storage = oci.object_storage.ObjectStorageClient(config)
             bucket_name = self.parsed.netloc.split("@")[0]
             namespace = self.parsed.netloc.split("@")[1] if "@" in self.parsed.netloc else config["namespace"]
@@ -79,9 +151,40 @@ class BlobStoreAdapter:
             session_prefix = f"{prefix}{session_id}/"
 
             objects = object_storage.list_objects(namespace, bucket_name, prefix=session_prefix)
-            return [item.name for item in objects.data.objects if item.name.endswith(".gz") or item.name.endswith(".jsonl")]
+            return [item.name for item in objects.data.objects if item.name.endswith(".gz") or item.name.endswith(".jsonl") or item.name.endswith(".ndjson")]
         except ImportError:
-            # Fallback to OCI S3 compatibility or simulated mock
+            print("[BlobStore] Warning: 'oci' SDK not installed; using simulated/mock OCI adapter.")
+            return []
+
+    def _list_all_oci_objects(self, prefix: str = "") -> List[str]:
+        """Lists all objects in OCI Object Storage bucket under prefix with pagination."""
+        try:
+            import oci
+            config = oci.config.from_file()
+            object_storage = oci.object_storage.ObjectStorageClient(config)
+            bucket_name = self.parsed.netloc.split("@")[0]
+            namespace = self.parsed.netloc.split("@")[1] if "@" in self.parsed.netloc else config["namespace"]
+            base_prefix = self.parsed.path.lstrip("/")
+            if base_prefix and not base_prefix.endswith("/"):
+                base_prefix += "/"
+            full_prefix = f"{base_prefix}{prefix}"
+
+            all_objects = []
+            next_start = None
+            while True:
+                resp = object_storage.list_objects(
+                    namespace, bucket_name,
+                    prefix=full_prefix,
+                    start=next_start
+                )
+                for item in resp.data.objects:
+                    if item.name.endswith(".gz") or item.name.endswith(".jsonl") or item.name.endswith(".ndjson"):
+                        all_objects.append(item.name)
+                next_start = resp.data.next_start_with
+                if not next_start:
+                    break
+            return sorted(all_objects)
+        except ImportError:
             print("[BlobStore] Warning: 'oci' SDK not installed; using simulated/mock OCI adapter.")
             return []
 
@@ -105,7 +208,25 @@ class BlobStoreAdapter:
             prefix = self.parsed.path.lstrip("/")
             session_prefix = f"{prefix}/{session_id}/".lstrip("/")
             resp = s3.list_objects_v2(Bucket=bucket, Prefix=session_prefix)
-            return [item["Key"] for item in resp.get("Contents", []) if item["Key"].endswith(".gz") or item["Key"].endswith(".jsonl")]
+            return [item["Key"] for item in resp.get("Contents", []) if item["Key"].endswith(".gz") or item["Key"].endswith(".jsonl") or item["Key"].endswith(".ndjson")]
+        except ImportError:
+            return []
+
+    def _list_all_s3_objects(self, prefix: str = "") -> List[str]:
+        try:
+            import boto3
+            s3 = boto3.client("s3")
+            bucket = self.parsed.netloc
+            base_prefix = self.parsed.path.lstrip("/")
+            full_prefix = f"{base_prefix}/{prefix}".strip("/")
+            paginator = s3.get_paginator("list_objects_v2")
+            all_keys = []
+            for page in paginator.paginate(Bucket=bucket, Prefix=full_prefix):
+                for item in page.get("Contents", []):
+                    key = item["Key"]
+                    if key.endswith(".gz") or key.endswith(".jsonl") or key.endswith(".ndjson"):
+                        all_keys.append(key)
+            return sorted(all_keys)
         except ImportError:
             return []
 
@@ -121,12 +242,45 @@ class SessionAssembler:
     """
     Decompresses and sanitizes .ndjson.gz batches from blob storage,
     stitches multi-rate sensor streams, and outputs a chronologically ordered event log.
+    Supports single-session loading and multi-device collaborative environment assembly.
     """
 
     def __init__(self, adapter: BlobStoreAdapter):
         self.adapter = adapter
+        self.aligner = MultiDeviceAligner()
+
+    def _parse_batch_bytes(self, raw_bytes: bytes, key: str = "") -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
+        if key.endswith(".gz") or raw_bytes[:2] == b"\x1f\x8b":
+            try:
+                decompressed = gzip.decompress(raw_bytes)
+            except Exception as e:
+                print(f"[Assembler] Warning: corrupt gzip in {key}: {e}")
+                return None, []
+        else:
+            decompressed = raw_bytes
+
+        envelope = None
+        events = []
+        lines = decompressed.decode("utf-8", errors="ignore").splitlines()
+        for line in lines:
+            if not line.strip():
+                continue
+            try:
+                ev = json.loads(line)
+                if ev.get("event_type") == "batch_envelope":
+                    envelope = ev
+                else:
+                    events.append(ev)
+            except json.JSONDecodeError:
+                continue
+
+        return envelope, events
 
     def assemble_session(self, session_id: str) -> Dict[str, Any]:
+        """
+        Assembles all telemetry batches for a single session or environment into
+        a deduplicated, chronologically ordered event stream.
+        """
         object_keys = self.adapter.list_batch_objects(session_id)
         if not object_keys:
             raise FileNotFoundError(f"No telemetry batches found for session_id: {session_id}")
@@ -137,44 +291,23 @@ class SessionAssembler:
 
         for key in object_keys:
             raw_bytes = self.adapter.read_object_bytes(key)
+            envelope, batch_events = self._parse_batch_bytes(raw_bytes, key)
 
-            # Decompress if gzipped
-            if key.endswith(".gz") or raw_bytes[:2] == b"\x1f\x8b":
-                try:
-                    decompressed = gzip.decompress(raw_bytes)
-                except Exception as e:
-                    print(f"[Assembler] Warning: corrupt gzip in {key}: {e}")
-                    continue
-            else:
-                decompressed = raw_bytes
+            if envelope:
+                batch_seq = envelope.get("batch_seq")
+                if batch_seq is not None and batch_seq in seen_batch_ids:
+                    continue  # Deduplicate retried batch
+                seen_batch_ids.add(batch_seq)
+                envelopes.append(envelope)
 
-            lines = decompressed.decode("utf-8", errors="ignore").splitlines()
-            for line in lines:
-                if not line.strip():
-                    continue
-                try:
-                    event = json.loads(line)
-                    ev_type = event.get("event_type")
+            all_events.extend(batch_events)
 
-                    if ev_type == "batch_envelope":
-                        batch_seq = event.get("batch_seq")
-                        if batch_seq in seen_batch_ids:
-                            continue # Deduplicate retried batch
-                        seen_batch_ids.add(batch_seq)
-                        envelopes.append(event)
-                    else:
-                        all_events.append(event)
-                except json.JSONDecodeError:
-                    continue
-
-        # Sort globally by hardware timestamp
         all_events.sort(key=lambda ev: ev.get("timestamp_ns", 0))
-
-        # Filter transient Wi-Fi hotspots (keep infrastructure APs)
         sanitized_events = self._filter_transient_hotspots(all_events)
 
         return {
             "session_id": session_id,
+            "environment_id": session_id,
             "batch_count": len(envelopes),
             "total_events": len(sanitized_events),
             "start_time_ns": sanitized_events[0]["timestamp_ns"] if sanitized_events else 0,
@@ -183,9 +316,80 @@ class SessionAssembler:
             "envelopes": envelopes
         }
 
+    def assemble_environment(
+        self,
+        env_id: str,
+        device_ids: Optional[List[str]] = None,
+        align_coordinates: bool = True
+    ) -> Dict[str, Any]:
+        """
+        Assembles batches across multiple devices for a shared environment:
+        1. Discovers all devices mapping env_id.
+        2. Ingests and deduplicates events per device.
+        3. Aligns device trajectories into a unified coordinate frame using shared APs.
+        4. Merges into a consolidated chronological stream.
+        """
+        partitioner = SessionPartitioner(self.adapter)
+        device_batches = partitioner.get_environment_device_batches(env_id, device_ids=device_ids)
+
+        if not device_batches:
+            raise FileNotFoundError(f"No telemetry batches found for environment '{env_id}'")
+
+        device_events: Dict[str, List[Dict[str, Any]]] = {}
+        all_envelopes: List[Dict[str, Any]] = []
+        total_batches = 0
+
+        for dev_id, keys in device_batches.items():
+            seen_batch_ids = set()
+            dev_evs = []
+
+            for key in keys:
+                raw_bytes = self.adapter.read_object_bytes(key)
+                envelope, batch_events = self._parse_batch_bytes(raw_bytes, key)
+
+                if envelope:
+                    batch_seq = envelope.get("batch_seq")
+                    if batch_seq is not None and batch_seq in seen_batch_ids:
+                        continue
+                    seen_batch_ids.add(batch_seq)
+                    all_envelopes.append(envelope)
+
+                dev_evs.extend(batch_events)
+
+            dev_evs.sort(key=lambda ev: ev.get("timestamp_ns", 0))
+            device_events[dev_id] = dev_evs
+            total_batches += len(seen_batch_ids)
+
+        # Multi-Device Trajectory Alignment
+        if align_coordinates and len(device_events) > 1:
+            merged_events, transforms = self.aligner.align_and_merge_devices(device_events)
+        else:
+            merged_events = []
+            transforms = {dev: {"dx": 0.0, "dy": 0.0, "dtheta": 0.0} for dev in device_events}
+            for dev_id, evs in device_events.items():
+                for ev in evs:
+                    ev["device_id"] = dev_id
+                    merged_events.append(ev)
+            merged_events.sort(key=lambda ev: ev.get("timestamp_ns", 0))
+
+        sanitized_events = self._filter_transient_hotspots(merged_events)
+
+        return {
+            "environment_id": env_id,
+            "session_id": env_id,
+            "device_ids": sorted(list(device_events.keys())),
+            "device_stats": {dev: len(evs) for dev, evs in device_events.items()},
+            "batch_count": total_batches,
+            "total_events": len(sanitized_events),
+            "start_time_ns": sanitized_events[0]["timestamp_ns"] if sanitized_events else 0,
+            "end_time_ns": sanitized_events[-1]["timestamp_ns"] if sanitized_events else 0,
+            "events": sanitized_events,
+            "envelopes": all_envelopes,
+            "alignment_transforms": transforms
+        }
+
     def _filter_transient_hotspots(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Removes mobile hotspots (iPhone, AndroidAP) and ephemeral randomized MACs."""
-        # Find BSSIDs with low observation frequency or hotspot SSIDs
         hotspot_regex = re.compile(r"(iphone|androidap|galaxy|pixel|hotspot|portable)", re.IGNORECASE)
         bssid_counts = {}
 
