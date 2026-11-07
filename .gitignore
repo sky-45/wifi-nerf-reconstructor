@@ -1,0 +1,13 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Output directories & blob tests
+output/
+reconstruction_output/
+blob_store/
+ingested_batches/
+/tmp/test_wifi_*
+.idea/
+.vscode/
