@@ -62,6 +62,9 @@ class BlobStoreAdapter:
         elif scheme == "s3":
             return self._list_all_s3_objects(prefix)
 
+        elif scheme in ("http", "https"):
+            return self._list_all_http_par_objects(prefix)
+
         else:
             raise ValueError(f"Unsupported storage scheme: {scheme}")
 
@@ -122,6 +125,11 @@ class BlobStoreAdapter:
                 return [o for o in all_objs if f"/{session_id}/" in o]
             return files
 
+        elif scheme in ("http", "https"):
+            all_objs = self.list_all_objects()
+            matching = [o for o in all_objs if f"/{session_id}/" in o or o.endswith(f"/{session_id}") or o.startswith(f"{session_id}/")]
+            return matching
+
         else:
             raise ValueError(f"Unsupported storage scheme: {scheme}")
 
@@ -134,8 +142,52 @@ class BlobStoreAdapter:
             return self._read_oci_bytes(object_key)
         elif scheme == "s3":
             return self._read_s3_bytes(object_key)
+        elif scheme in ("http", "https"):
+            return self._read_http_par_bytes(object_key)
         else:
             raise ValueError(f"Unsupported storage scheme: {scheme}")
+
+    def _list_all_http_par_objects(self, prefix: str = "") -> List[str]:
+        """Lists objects via an HTTP/HTTPS Pre-Authenticated Request (PAR) endpoint."""
+        import urllib.request
+        base = self.base_uri.rstrip("/")
+        list_url = f"{base}/" if not base.endswith("/o") else f"{base}"
+        query_char = "&" if "?" in list_url else "?"
+        if prefix:
+            list_url = f"{list_url}{query_char}prefix={prefix}"
+
+        req = urllib.request.Request(list_url, headers={"User-Agent": "WifiNerfReconstructor/1.0"})
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                items = []
+                if isinstance(data, dict) and "objects" in data:
+                    for obj in data["objects"]:
+                        name = obj.get("name", "")
+                        if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
+                            items.append(name)
+                elif isinstance(data, list):
+                    for item in data:
+                        name = item if isinstance(item, str) else item.get("name", "")
+                        if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
+                            items.append(name)
+                return sorted(items)
+        except Exception as e:
+            print(f"[BlobStore] Warning: Failed to list objects via HTTP/HTTPS PAR: {e}")
+            return []
+
+    def _read_http_par_bytes(self, object_key: str) -> bytes:
+        """Fetches raw object bytes via an HTTP/HTTPS Pre-Authenticated Request (PAR) endpoint."""
+        import urllib.request
+        base = self.base_uri.rstrip("/")
+        if object_key.startswith("http://") or object_key.startswith("https://"):
+            url = object_key
+        else:
+            url = f"{base}/{object_key.lstrip('/')}"
+
+        req = urllib.request.Request(url, headers={"User-Agent": "WifiNerfReconstructor/1.0"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
 
     def _list_oci_objects(self, session_id: str) -> List[str]:
         """Lists objects in OCI Object Storage bucket under prefix/{session_id}/."""

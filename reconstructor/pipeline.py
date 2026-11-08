@@ -518,11 +518,39 @@ def create_demo_fleet_dataset(storage_dir: str, env_id: str = "demo_fleet_house"
     return paths
 
 
+def load_env(env_path: str = ".env"):
+    """Reads a local .env file if present and populates os.environ."""
+    candidates = [
+        env_path,
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"),
+        os.path.join(os.getcwd(), ".env")
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+
 if __name__ == "__main__":
+    load_env()
+    default_blob = os.getenv("BLOB_URI") or os.getenv("OCI_PAR_URL") or "./blob_store"
+    default_env = os.getenv("ENV_ID") or None
+
     parser = argparse.ArgumentParser(description="Wi-Fi NeRF Floorplan Reconstructor CLI")
-    parser.add_argument("--blob-uri", type=str, default="./blob_store", help="URI or path to Blob Storage bucket (file:// or oci:// or s3://)")
+    parser.add_argument("--blob-uri", type=str, default=default_blob, help="URI or path to Blob Storage bucket (file://, oci://, s3://, or https:// OCI PAR)")
     parser.add_argument("--session-id", type=str, default=None, help="Session ID to reconstruct (single-session mode)")
-    parser.add_argument("--env-id", type=str, default=None, help="Environment ID to reconstruct across fleet devices (multi-device mode)")
+    parser.add_argument("--env-id", type=str, default=default_env, help="Environment ID to reconstruct across fleet devices (multi-device mode)")
     parser.add_argument("--devices", nargs="+", default=None, help="Optional filter of device IDs to include for multi-device reconstruction")
     parser.add_argument("--output-dir", type=str, default="./reconstruction_output", help="Directory for output floorplan, GeoJSON, and HTML viewer")
     parser.add_argument("--list-partitions", action="store_true", help="Scan storage and list discovered environments and transit quarantines")
