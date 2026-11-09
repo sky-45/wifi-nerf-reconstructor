@@ -38,13 +38,13 @@ flowchart TD
     end
 
     subgraph Reconstructor["Cloud Reconstructor (wifi-nerf-reconstructor)"]
-        OCI --> S0["Stage 0: Session Partitioner & Assembler<br/>- 24/7 Fleet Discovery & Transit Quarantining<br/>- Multi-Device Trajectory Alignment (Procrustes/SVD)"]
+        OCI --> S0["Stage 0: Session Partitioner & Assembler<br/>- 24/7 Fleet Discovery & Transit Quarantining<br/>- AP Recurrence & Jaccard Clustering<br/>- Multi-Device Trajectory Alignment (Procrustes/SVD)"]
         S0 --> S1["Stage 1: Camera-Free Pose-Graph SLAM<br/>- Huber-Damped Wi-Fi Loop Closures<br/>- Free-Space Carving & Doorway Bottlenecks"]
         S1 --> S2["Stage 2: AP Multilateration & RTT Mirrors<br/>- LoS Router Pinning & Specular Reflectors"]
-        S2 --> S3["Stage 3: Two-Tier Physics Inversion<br/>- Tier 3A: Fast FISTA Tomography (L1 + TV)<br/>- Tier 3B: Fourier-Feature NeRFMap MLP"]
+        S2 --> S3["Stage 3: Two-Tier Physics Inversion<br/>- Tier 3A: Fast GPU FISTA Tomography (L1 + TV)<br/>- Tier 3B: Continuous NeRF Field (Fourier / HashGrid / SIREN / 3D)"]
         S3 --> S4["Stage 4: Architectural Vectorization<br/>- NMS Wall Thinning & Watershed Room Polygons"]
         S4 --> S5["Stage 5: Zero-Label Holdout Evaluation<br/>- Physical Oracle F1-Score & Median RPE (dB)"]
-        S5 --> S6["Stage 6: Multi-Device Floorplan Export<br/>- Interactive 2D/2.5D HTML Viewer & GeoJSON"]
+        S5 --> S6["Stage 6: Multi-Device Floorplan Export<br/>- Dual-Canvas 60 FPS HTML Viewer & Proximity Rangefinder<br/>- Standard GeoJSON Export"]
     end
 ```
 
@@ -284,3 +284,77 @@ python3 -m reconstructor.pipeline \
   --output-dir ./output
 ```
 Open `output/viewer_residence_oak_42.html` in any web browser to interact with the multi-device merged 2D and 2.5D floorplan!
+
+---
+
+## Environment Clustering & Multi-Walk Consensus
+
+### Why Environments Fragment in Mobile Telemetry
+The mobile collector hashes visible BSSIDs (`Hash(BSSIDs)`) to create `environment_id`. Due to Wi-Fi beacon jitter and intermittent neighbor router visibility, a phone walking between 2 rooms often produces multiple IDs (e.g. `env_71ad368b5034c609` and `env_79f11c4a701db8a1`).
+
+### Unifying Fragmented Environments
+The `SessionPartitioner` computes pairwise Jaccard similarity across visible APs and identifies core recurring routers (e.g., matching MAC prefix or primary home SSID). It clusters fragmented sessions into unified building footprints:
+
+```bash
+# List discovered physical residence clusters
+python3 -m reconstructor.pipeline --blob-uri ./blob_store --list-clusters
+
+# Reconstruct an entire unified cluster across multiple walks and devices
+python3 -m reconstructor.pipeline \
+  --env-id "cluster_env_79f11c4a701db8a1" \
+  --blob-uri ./blob_store \
+  --output-dir ./output
+```
+
+---
+
+## Neural Mapping Architectures
+
+`wifi-nerf-reconstructor` supports 4 continuous neural coordinate representations in `reconstructor/nerfmap_engine.py`:
+
+| Model Flag | Name | Key Capability |
+| :--- | :--- | :--- |
+| `--model fourier` | Fourier Coordinate MLP | Standard positional encoding baseline; robust convergence across dense scans. |
+| `--model hashgrid` | Instant-NGP Hash Grid | Multi-resolution spatial hash tables; 10x faster convergence and sharpest 90° corners. |
+| `--model siren` | SIREN Implicit Network | Periodic sine wave activations; enforces exact Helmholtz continuous physics derivatives. |
+| `--model nerf_3d` | Continuous 3D NeRF | Height-aware (x, y, z) field; disambiguates low furniture (tables, chairs) from full walls. |
+
+Example reconstruction using Instant-NGP Hash Grids:
+```bash
+python3 -m reconstructor.pipeline \
+  --env-id "cluster_env_79f11c4a701db8a1" \
+  --blob-uri ./blob_store \
+  --model hashgrid
+```
+
+---
+
+## Automated GPU Hyperparameter Tuning
+
+Run automated sweeps over Fourier bands, FISTA regularization, wall percentiles, and free-space carver radii using the zero-label validation suite:
+
+```bash
+# Run automated hyperparameter tuning on NVIDIA GPU
+python3 reconstructor/tune_hyperparameters.py \
+  --blob-uri ./blob_store \
+  --environments env_79f11c4a701db8a1 env_71ad368b5034c609 \
+  --device cuda:0
+
+# Benchmark and rank all 4 neural architectures side-by-side
+python3 reconstructor/tune_hyperparameters.py \
+  --benchmark-models \
+  --blob-uri ./blob_store \
+  --device cuda:0
+```
+
+---
+
+## Dual-Canvas High-Performance HTML Viewer
+
+The interactive browser dashboard (`output/viewer_*.html`) uses a zero-lag **Dual-Canvas Architecture**:
+1. **Static Canvas (`mapCanvasStatic`)**: Renders isometric grid, room polygons, CAD walls, and RF heatmap only on zoom/pan/resize.
+2. **Dynamic Canvas (`mapCanvasDynamic`)**: Runs at 60 FPS rendering only foreground entities:
+   - **Animated 3D Phone Tracker**: Displays interpolated phone position, orientation flashlight cone, and altitude drop tether.
+   - **Dynamic Laser Rangefinder Rays**: Casts real-time dashed rays to the 4 nearest CAD walls within 3.0 meters with floating distance tags (e.g. `0.78m`).
+   - **Proximity Clearance Halo**: 0.35m radial safety buffer color-coded green (`> 0.8m`), amber (`0.4 - 0.8m`), and red (`<= 0.35m`).
+   - **Real-Time HUD**: Displays coordinates, nearest wall clearance, compass heading, and walking speed throttled to 16 Hz.

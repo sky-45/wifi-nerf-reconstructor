@@ -13,6 +13,7 @@ from reconstructor.ap_localizer import MultiApLocalizer, RttVirtualAnchorSolver
 from reconstructor.nerfmap_engine import NeRFMapEngine
 from reconstructor.floorplan_vectorizer import FloorplanVectorizer
 from reconstructor.unlabeled_evaluator import UnlabeledEvaluator
+from reconstructor.config import DEFAULT_CONFIG, ReconstructorConfig, get_default_config
 from reconstructor.pipeline import (
     create_demo_blob_dataset,
     create_demo_fleet_dataset,
@@ -164,6 +165,128 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         self.assertIsNotNone(env)
         self.assertEqual(len(evs), 1)
         self.assertEqual(evs[0]["event_type"], "connected_probe")
+
+    def test_11_gpu_and_cpu_nerfmap_parity(self):
+        # 1. CPU / NumPy execution path
+        engine_cpu = NeRFMapEngine(room_width_m=8.0, room_height_m=6.0, resolution_m=0.25, device="cpu")
+        self.assertFalse(engine_cpu.using_cuda)
+
+        ray_data = [(2.0, 3.0, 6.0, 3.0, 5.0), (1.0, 1.0, 7.0, 5.0, 7.5)]
+        free_mask = np.zeros((engine_cpu.ny, engine_cpu.nx), dtype=bool)
+
+        cpu_tomo = engine_cpu.run_tier3a_fista_tomography(ray_data, free_mask, iterations=10, l1_reg=0.001, tv_reg=0.01)
+        self.assertEqual(cpu_tomo.shape, (engine_cpu.ny, engine_cpu.nx))
+        self.assertTrue(np.all(cpu_tomo >= 0.0) and np.all(cpu_tomo <= 18.0))
+
+        cpu_grid = engine_cpu.run_tier3b_nerfmap_refinement(ray_data, free_mask, epochs=20, fourier_bands=8, hidden_dim=32)
+        self.assertEqual(cpu_grid.shape, (engine_cpu.ny, engine_cpu.nx))
+
+        # 2. PyTorch CUDA execution path
+        import torch
+        if torch.cuda.is_available():
+            engine_gpu = NeRFMapEngine(room_width_m=8.0, room_height_m=6.0, resolution_m=0.25, device="cuda:0")
+            self.assertTrue(engine_gpu.using_cuda)
+            gpu_tomo = engine_gpu.run_tier3a_fista_tomography(ray_data, free_mask, iterations=10, l1_reg=0.001, tv_reg=0.01)
+            self.assertEqual(gpu_tomo.shape, (engine_gpu.ny, engine_gpu.nx))
+            self.assertTrue(np.all(gpu_tomo >= 0.0) and np.all(gpu_tomo <= 18.0))
+
+            gpu_grid = engine_gpu.run_tier3b_nerfmap_refinement(ray_data, free_mask, epochs=20, fourier_bands=8, hidden_dim=32)
+            self.assertEqual(gpu_grid.shape, (engine_gpu.ny, engine_gpu.nx))
+            self.assertTrue(np.all(gpu_grid >= 0.0) and np.all(gpu_grid <= 18.0))
+
+    def test_12_reconstructor_config_persistence(self):
+        cfg = get_default_config()
+        self.assertIsInstance(cfg, ReconstructorConfig)
+        self.assertEqual(cfg.fourier_bands, 8)
+        self.assertEqual(cfg.free_space_radius_m, 0.35)
+        self.assertEqual(cfg.fista_l1_reg, 0.001)
+        self.assertEqual(cfg.fista_tv_reg, 0.01)
+        self.assertEqual(cfg.wall_threshold_percentile, 60.0)
+
+        # Verify pipeline accepts and executes with custom config instance
+        custom_cfg = ReconstructorConfig(fourier_bands=6, free_space_radius_m=0.40)
+        res = run_reconstruction_pipeline(
+            blob_uri=self.demo_dir,
+            session_id=self.session_id,
+            output_dir=self.output_dir,
+            config=custom_cfg
+        )
+        self.assertTrue(os.path.exists(res["viewer_path"]))
+        self.assertIn("quality_grade", res["metrics"])
+
+    def test_13_advanced_ml_models_and_clustering(self):
+        from reconstructor.session_partitioner import SessionPartitioner
+        from reconstructor.nerfmap_engine import (
+            MultiResolutionHashGridEncoding,
+            HashGridNeRFModel,
+            SIRENCoordinateNet,
+            Volumetric3DCoordinateMLP,
+            DirectionalAntennaPattern
+        )
+        import torch
+
+        # Test 1: AP Recurrence Clustering
+        adapter = BlobStoreAdapter(self.fleet_dir)
+        partitioner = SessionPartitioner(adapter)
+        clusters = partitioner.cluster_environments_by_ap_recurrence(min_jaccard_similarity=0.15)
+        self.assertGreaterEqual(len(clusters), 1)
+
+        # Test 2: Instant-NGP Hash Grid Model
+        coords = torch.tensor([[0.2, 0.3], [0.8, 0.9]], dtype=torch.float32)
+        hash_model = HashGridNeRFModel(num_levels=4, hidden_dim=32)
+        out_hash = hash_model(coords)
+        self.assertEqual(out_hash.shape, (2, 1))
+
+        # Test 3: SIREN Network
+        siren_model = SIRENCoordinateNet(in_features=2, hidden_dim=32, hidden_layers=2, omega_0=30.0)
+        out_siren = siren_model(coords)
+        self.assertEqual(out_siren.shape, (2, 1))
+
+        # Test 4: Volumetric 3D NeRF Model
+        coords_3d = torch.tensor([[0.2, 0.3, 0.5], [0.8, 0.9, 0.1]], dtype=torch.float32)
+        vol_model = Volumetric3DCoordinateMLP(fourier_bands=4, hidden_dim=32)
+        out_3d = vol_model(coords_3d)
+        self.assertEqual(out_3d.shape, (2, 1))
+
+        # Test 5: Directional Antenna Pattern
+        angles = torch.tensor([[0.0, 0.0], [math.pi / 2, 0.0]], dtype=torch.float32)
+        ant_pattern = DirectionalAntennaPattern(hidden_dim=16)
+        out_ant = ant_pattern(angles)
+        self.assertEqual(out_ant.shape, (2, 1))
+
+    def test_14_dual_canvas_proximity_viewer(self):
+        from viewer.viewer_generator import generate_interactive_html_viewer
+        
+        vectorizer = FloorplanVectorizer(resolution_m=0.25)
+        dummy_grid = np.zeros((24, 32), dtype=np.float32)
+        dummy_grid[10:14, 15] = 12.0 # wall segment
+        dummy_free = np.zeros((24, 32), dtype=bool)
+        floorplan = vectorizer.vectorize(dummy_grid, dummy_free, [])
+        
+        traj_points = [
+            {"x": 1.0, "y": 1.0, "z": 0.0, "timestamp": 1000.0, "heading_deg": 45.0},
+            {"x": 2.0, "y": 2.0, "z": 0.0, "timestamp": 1001.0, "heading_deg": 50.0}
+        ]
+        
+        html_content = generate_interactive_html_viewer(
+            session_id=self.session_id,
+            floorplan_data=floorplan,
+            localized_aps={},
+            eval_metrics={"quality_grade": "GRADE A"},
+            raw_trajectory=traj_points,
+            slam_trajectory=traj_points,
+            grid_heatmap=dummy_grid.tolist()
+        )
+        self.assertGreater(len(html_content), 1000)
+            
+        # Verify dual canvas elements are present
+        self.assertIn('id="mapCanvasStatic"', html_content)
+        self.assertIn('id="mapCanvasDynamic"', html_content)
+        # Verify dynamic laser rangefinder, proximity halo, and HUD
+        self.assertIn("distToSegment", html_content)
+        self.assertIn("haloRadius", html_content)
+        self.assertIn("layer-proximity", html_content)
+        self.assertIn("telemetry-hud", html_content)
 
 if __name__ == "__main__":
     unittest.main()

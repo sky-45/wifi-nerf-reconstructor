@@ -27,6 +27,7 @@ from reconstructor.ap_localizer import MultiApLocalizer, RttVirtualAnchorSolver
 from reconstructor.nerfmap_engine import NeRFMapEngine
 from reconstructor.floorplan_vectorizer import FloorplanVectorizer
 from reconstructor.unlabeled_evaluator import UnlabeledEvaluator
+from reconstructor.config import DEFAULT_CONFIG, ReconstructorConfig, get_default_config
 from viewer.viewer_generator import generate_interactive_html_viewer, export_geojson
 
 def _normalize_spatial_bounds(
@@ -137,9 +138,13 @@ def run_reconstruction_pipeline(
     room_width_m: float = 10.0,
     room_height_m: float = 8.0,
     resolution_m: float = 0.20,
-    device_ids: Optional[List[str]] = None
+    device_ids: Optional[List[str]] = None,
+    config: Optional[ReconstructorConfig] = None,
+    device: Optional[str] = None
 ) -> Dict[str, Any]:
     os.makedirs(output_dir, exist_ok=True)
+    cfg = config or DEFAULT_CONFIG
+    res_m = resolution_m or cfg.resolution_m
 
     # -------------------------------------------------------------------------
     # Stage 0: Ingestion, Partitioning & Multi-Device Assembly
@@ -197,8 +202,8 @@ def run_reconstruction_pipeline(
     slam_traj = _extract_rich_trajectory(slam_events)
 
     print("[Stage 1] Carving Walkable Free-Space & Doorway Bottlenecks...")
-    carver = FreeSpaceCarver(room_width_m, room_height_m, resolution_m)
-    free_mask = carver.carve_trajectory(slam_events, body_radius_m=0.45)
+    carver = FreeSpaceCarver(room_width_m, room_height_m, res_m)
+    free_mask = carver.carve_trajectory(slam_events, body_radius_m=cfg.free_space_radius_m)
     doorways = carver.detect_doorways()
     print(f"          Carved {np.sum(free_mask)} free-space cells. Detected {len(doorways)} doorway bottlenecks.")
 
@@ -270,20 +275,39 @@ def run_reconstruction_pipeline(
                 ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
 
     print(f"[Stage 3A] Solving Fast FISTA + TV Sparse Tomography ({len(ray_data)} rays)...")
-    nerf_engine = NeRFMapEngine(room_width_m, room_height_m, resolution_m)
-    tomo_grid = nerf_engine.run_tier3a_fista_tomography(ray_data, free_mask, iterations=40)
+    target_dev = device if device is not None else ("cuda:0" if cfg.use_cuda else "cpu")
+    nerf_engine = NeRFMapEngine(room_width_m, room_height_m, res_m, device=target_dev)
+    tomo_grid = nerf_engine.run_tier3a_fista_tomography(
+        ray_data,
+        free_mask,
+        iterations=cfg.fista_iterations,
+        l1_reg=cfg.fista_l1_reg,
+        tv_reg=cfg.fista_tv_reg,
+        step_size=cfg.fista_step_size
+    )
 
-    print("[Stage 3B] Refining NeRFMap Coordinate MLP with Fourier Positional Features...")
-    final_grid = nerf_engine.run_tier3b_nerfmap_refinement(ray_data, free_mask, epochs=80)
+    print(f"[Stage 3B] Refining NeRFMap Coordinate Field (Architecture: {cfg.model_type})...")
+    final_grid = nerf_engine.run_tier3b_nerfmap_refinement(
+        ray_data,
+        free_mask,
+        epochs=cfg.nerf_epochs,
+        fourier_bands=cfg.fourier_bands,
+        hidden_dim=cfg.mlp_hidden_dim,
+        lr=cfg.nerf_lr,
+        model_type=cfg.model_type,
+        siren_omega=getattr(cfg, "siren_omega", 30.0),
+        hash_levels=getattr(cfg, "hash_levels", 8),
+        learn_antenna_pattern=getattr(cfg, "learn_antenna_pattern", False)
+    )
     print(f"           Reconstructed grid: shape={final_grid.shape}, max_attenuation={np.max(final_grid):.1f} dB/m")
 
     # -------------------------------------------------------------------------
     # Stage 4: Architectural Vectorization
     # -------------------------------------------------------------------------
     print("[Stage 4] Vectorizing CAD Wall Segments & Segmenting Rooms...")
-    vectorizer = FloorplanVectorizer(resolution_m)
+    vectorizer = FloorplanVectorizer(res_m)
     non_zeros = final_grid[final_grid > 0.05]
-    adaptive_thresh = float(np.percentile(non_zeros, 65)) if len(non_zeros) > 10 else 0.5
+    adaptive_thresh = float(np.percentile(non_zeros, cfg.wall_threshold_percentile)) if len(non_zeros) > 10 else 0.5
     floorplan = vectorizer.vectorize(final_grid, free_mask, doorways, wall_threshold_db=adaptive_thresh)
     print(f"          Extracted {len(floorplan['walls'])} CAD wall segments.")
     print(f"          Identified {len(floorplan['rooms'])} distinct rooms:")
@@ -300,7 +324,7 @@ def run_reconstruction_pipeline(
         held_out_events,
         localized_aps,
         free_mask,
-        resolution_m
+        res_m
     )
     print("=" * 75)
     print("ZERO-LABEL EVALUATION REPORT (Physics-Derived Without Ground Truth)")
@@ -684,7 +708,16 @@ if __name__ == "__main__":
     parser.add_argument("--devices", nargs="+", default=None, help="Optional filter of device IDs to include for multi-device reconstruction")
     parser.add_argument("--output-dir", type=str, default=default_out, help="Directory for output floorplan, GeoJSON, and HTML viewer")
     parser.add_argument("--list-partitions", action="store_true", help="Scan storage and list discovered environments and transit quarantines")
+    parser.add_argument("--list-clusters", action="store_true", help="Cluster environments by shared AP recurrence and list unified buildings")
+    parser.add_argument("--auto-cluster", action="store_true", help="Automatically cluster fragmented environments before reconstruction")
     parser.add_argument("--demo", action="store_true", help="Generate synthetic multi-room blob data and run reconstruction end-to-end")
+    parser.add_argument("--device", type=str, default=None, help="Compute device ('cuda:0', 'cpu', or auto-detect)")
+    parser.add_argument("--model", type=str, default=None, choices=["fourier", "hashgrid", "siren", "nerf_3d"], help="Neural continuous coordinate field architecture")
+    parser.add_argument("--bands", type=int, default=None, help="Fourier positional encoding frequency bands (e.g. 4, 6, 8)")
+    parser.add_argument("--l1", type=float, default=None, help="FISTA L1 regularization")
+    parser.add_argument("--tv", type=float, default=None, help="FISTA Total Variation regularization")
+    parser.add_argument("--wall-percentile", type=float, default=None, help="Wall extraction threshold percentile")
+    parser.add_argument("--carve-radius", type=float, default=None, help="Free-space trajectory carver radius (m)")
 
     args = parser.parse_args()
 
@@ -695,6 +728,36 @@ if __name__ == "__main__":
         print(json.dumps(summary, indent=2))
         sys.exit(0)
 
+    if args.list_clusters:
+        adapter = BlobStoreAdapter(args.blob_uri)
+        partitioner = SessionPartitioner(adapter)
+        clusters = partitioner.cluster_environments_by_ap_recurrence()
+        summary = {
+            "total_clusters": len(clusters),
+            "clusters": {
+                c_id: {
+                    "total_batches": c["total_batches"],
+                    "member_envs_count": len(c["member_envs"]),
+                    "member_envs": c["member_envs"],
+                    "shared_aps": c["shared_aps"]
+                }
+                for c_id, c in clusters.items()
+            }
+        }
+        print(json.dumps(summary, indent=2))
+        sys.exit(0)
+
+    if args.auto_cluster and not args.env_id:
+        adapter = BlobStoreAdapter(args.blob_uri)
+        partitioner = SessionPartitioner(adapter)
+        clusters = partitioner.cluster_environments_by_ap_recurrence()
+        if clusters:
+            # Select largest cluster
+            best_cluster = max(clusters.keys(), key=lambda c: clusters[c]["total_batches"])
+            print(f"[*] Auto-clustering selected unified building cluster: '{best_cluster}' "
+                  f"({clusters[best_cluster]['total_batches']} batches across {len(clusters[best_cluster]['member_envs'])} sub-environments)")
+            args.env_id = best_cluster
+
     if args.demo:
         # Create single demo and fleet demo
         create_demo_blob_dataset(args.blob_uri, session_id="demo_apartment_01")
@@ -702,10 +765,26 @@ if __name__ == "__main__":
         if not args.session_id and not args.env_id:
             args.env_id = "demo_fleet_house"
 
+    cfg = get_default_config()
+    if args.model is not None:
+        cfg.model_type = args.model
+    if args.bands is not None:
+        cfg.fourier_bands = args.bands
+    if args.l1 is not None:
+        cfg.fista_l1_reg = args.l1
+    if args.tv is not None:
+        cfg.fista_tv_reg = args.tv
+    if args.wall_percentile is not None:
+        cfg.wall_threshold_percentile = args.wall_percentile
+    if args.carve_radius is not None:
+        cfg.free_space_radius_m = args.carve_radius
+
     run_reconstruction_pipeline(
         blob_uri=args.blob_uri,
         session_id=args.session_id,
         env_id=args.env_id,
         output_dir=args.output_dir,
-        device_ids=args.devices
+        device_ids=args.devices,
+        config=cfg,
+        device=args.device
     )

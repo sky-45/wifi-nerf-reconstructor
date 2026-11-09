@@ -1,9 +1,10 @@
 """
 Interactive 2D & 2.5D Isometric HTML Floorplan Viewer & GeoJSON / SVG Exporter.
 Generates a standalone, beautiful HTML5 web application (no external server required)
-with layer toggles (Trajectory, Free-Space, RF Heatmap, Vector Walls, Doorways, Routers),
+with dual-canvas performance optimization (60 FPS silky-smooth rendering),
+layer toggles (Trajectory, Free-Space, RF Heatmap, Vector Walls, Doorways, Routers),
 2.5D isometric 3D extruded room visualization, and an animated 3D Phone Location Tracker
-with timeline scrubbing, altitude tether, heading frustum, and multi-device telemetry.
+with proximity obstacle boundaries, dynamic laser rangefinder rays, and nearby wall highlights.
 """
 
 import json
@@ -77,6 +78,7 @@ def generate_interactive_html_viewer(
     """
     Renders a self-contained, responsive HTML5 dashboard with 2D blueprint,
     2.5D Isometric 3D extruded rooms, and an animated 3D Phone Location Tracker.
+    Optimized with Dual-Canvas rendering and dynamic obstacle rangefinding.
     """
     dims = floorplan_data.get("grid_dimensions", {"width_m": 10.0, "height_m": 8.0})
     walls_json = json.dumps(floorplan_data.get("walls", []))
@@ -101,7 +103,9 @@ def generate_interactive_html_viewer(
     #viewport-container {{ flex: 1; display: flex; flex-direction: column; position: relative; }}
     #top-bar {{ height: 56px; background: #1e293b; border-bottom: 1px solid #334155; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; }}
     #canvas-container {{ flex: 1; position: relative; background: #0b0f19; overflow: hidden; }}
-    canvas {{ display: block; width: 100%; height: 100%; }}
+    canvas {{ display: block; position: absolute; top: 0; left: 0; width: 100%; height: 100%; }}
+    #mapCanvasStatic {{ z-index: 1; pointer-events: none; }}
+    #mapCanvasDynamic {{ z-index: 2; }}
     .badge {{ display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; background: #38bdf8; color: #0f172a; }}
     .badge-grade {{ background: #22c55e; color: #052e16; }}
     .card {{ background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 14px; font-size: 13px; }}
@@ -112,13 +116,13 @@ def generate_interactive_html_viewer(
     .btn {{ background: #38bdf8; color: #0f172a; border: none; padding: 8px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: 0.2s; }}
     .btn:hover {{ background: #7dd3fc; }}
     .btn-group {{ display: flex; gap: 8px; }}
-    #tooltip {{ position: absolute; background: rgba(15, 23, 42, 0.95); border: 1px solid #38bdf8; padding: 6px 10px; border-radius: 4px; font-size: 12px; pointer-events: none; display: none; }}
+    #tooltip {{ position: absolute; background: rgba(15, 23, 42, 0.95); border: 1px solid #38bdf8; padding: 6px 10px; border-radius: 4px; font-size: 12px; pointer-events: none; display: none; z-index: 20; }}
     #telemetry-hud {{
       position: absolute;
       top: 14px;
       right: 14px;
       z-index: 10;
-      width: 260px;
+      width: 270px;
       background: rgba(15, 23, 42, 0.90);
       backdrop-filter: blur(8px);
       border: 1px solid #38bdf8;
@@ -160,14 +164,15 @@ def generate_interactive_html_viewer(
 
     <div class="card">
       <div style="font-weight: 600; margin-bottom: 10px; color: #e2e8f0;">Layer Visibility</div>
-      <label class="toggle-row"><input type="checkbox" id="layer-walls" checked onchange="draw()"> <span>Vector CAD Walls</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-doors" checked onchange="draw()"> <span>Doorways</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-rooms" checked onchange="draw()"> <span>Room Zones & Labels</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-aps" checked onchange="draw()"> <span>Wi-Fi Access Points</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-phone" checked onchange="draw()"> <span>3D Phone Avatar & Beam</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-slam" checked onchange="draw()"> <span>SLAM Corrected Path</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-raw" onchange="draw()"> <span>Raw Drifted IMU Path</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-heatmap" onchange="draw()"> <span>RF Voxel Density Heatmap</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-walls" checked onchange="drawStaticScene()"> <span>Vector CAD Walls</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-doors" checked onchange="drawStaticScene()"> <span>Doorways</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-rooms" checked onchange="drawStaticScene()"> <span>Room Zones & Labels</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-aps" checked onchange="drawStaticScene()"> <span>Wi-Fi Access Points</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-phone" checked onchange="drawDynamicScene()"> <span>3D Phone Avatar & Beam</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-proximity" checked onchange="drawDynamicScene()"> <span>Proximity Halo & Range Rays</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-slam" checked onchange="drawStaticScene()"> <span>SLAM Corrected Path</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-raw" onchange="drawStaticScene()"> <span>Raw Drifted IMU Path</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-heatmap" onchange="drawStaticScene()"> <span>RF Voxel Density Heatmap</span></label>
     </div>
 
     <div class="card">
@@ -193,16 +198,19 @@ def generate_interactive_html_viewer(
     </div>
 
     <div id="canvas-container">
-      <canvas id="mapCanvas"></canvas>
+      <!-- Dual-Canvas Architecture: Static background (walls/grid/heatmap) + Dynamic foreground (phone/rays) -->
+      <canvas id="mapCanvasStatic"></canvas>
+      <canvas id="mapCanvasDynamic"></canvas>
 
       <!-- Real-Time Telemetry HUD -->
       <div id="telemetry-hud">
         <div style="font-weight: 700; color: #38bdf8; font-size: 12px; margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between;">
-          <span>📍 Phone Location</span>
-          <span id="hud-status" class="badge" style="font-size: 10px; background: #22c55e; color: #052e16;">LIVE 3D</span>
+          <span>📍 Phone & Clearance HUD</span>
+          <span id="hud-status" class="badge" style="font-size: 10px; background: #22c55e; color: #052e16;">CLEAR</span>
         </div>
         <div class="metric-row"><span>Device:</span><span class="metric-val" id="hud-device">Phone 1</span></div>
         <div class="metric-row"><span>Position (X, Y, Z):</span><span class="metric-val" id="hud-coords">0.0m, 0.0m, 1.1m</span></div>
+        <div class="metric-row"><span>Nearest Wall:</span><span class="metric-val" id="hud-nearest">-- m</span></div>
         <div class="metric-row"><span>Heading (Yaw):</span><span class="metric-val" id="hud-yaw">0° (N)</span></div>
         <div class="metric-row"><span>Walking Speed:</span><span class="metric-val" id="hud-speed">0.0 m/s</span></div>
         <div class="metric-row"><span>Survey Progress:</span><span class="metric-val" id="hud-pct">100%</span></div>
@@ -230,7 +238,7 @@ def generate_interactive_html_viewer(
         <span style="font-size: 12px;">Follow Phone</span>
       </label>
       <label class="toggle-row" style="margin-bottom: 0; white-space: nowrap; gap: 4px;">
-        <input type="checkbox" id="chk-full-trail" checked onchange="draw()">
+        <input type="checkbox" id="chk-full-trail" checked onchange="drawStaticScene(); drawDynamicScene();">
         <span style="font-size: 12px;">Full Trail</span>
       </label>
     </div>
@@ -247,12 +255,32 @@ def generate_interactive_html_viewer(
     const HEATMAP = {heatmap_json};
     const METRICS = {metrics_json};
 
-    let viewMode = '3D'; // Default to 2.5D Isometric 3D for spatial depth
+    // Precomputed Isometric Constants
+    const COS_30 = 0.86602540378;
+    const SIN_30 = 0.5;
+
+    let viewMode = '3D'; // 2D Blueprint or 2.5D Isometric 3D
     let zoom = 40; // px per meter
     let panX = 100;
     let panY = 100;
     let isDragging = false;
     let startX, startY;
+
+    // Trajectory decimation for fast, high-FPS canvas rendering
+    function decimatePoints(pts, minStepM = 0.06) {{
+      if (!pts || pts.length <= 400) return pts;
+      const res = [pts[0]];
+      let last = pts[0];
+      for (let i = 1; i < pts.length - 1; i++) {{
+        const d = Math.hypot(pts[i].x - last.x, pts[i].y - last.y);
+        if (d >= minStepM) {{
+          res.push(pts[i]);
+          last = pts[i];
+        }}
+      }}
+      res.push(pts[pts.length - 1]);
+      return res;
+    }}
 
     // Normalizes input points into rich 3D trajectory structure
     function parseTraj(raw) {{
@@ -279,37 +307,42 @@ def generate_interactive_html_viewer(
       }});
     }}
 
-    const SLAM_POINTS = parseTraj(SLAM_TRAJ);
-    const RAW_POINTS = parseTraj(RAW_TRAJ);
+    const FULL_SLAM_POINTS = parseTraj(SLAM_TRAJ);
+    const FULL_RAW_POINTS = parseTraj(RAW_TRAJ);
+    const DISPLAY_SLAM_POINTS = decimatePoints(FULL_SLAM_POINTS);
+    const DISPLAY_RAW_POINTS = decimatePoints(FULL_RAW_POINTS);
 
     // Group trajectory points by device ID
     const DEVICE_MAP = {{}};
     const DEVICE_COLORS = ['#38bdf8', '#10b981', '#f59e0b', '#ec4899', '#a855f7'];
-    SLAM_POINTS.forEach(pt => {{
+    FULL_SLAM_POINTS.forEach(pt => {{
       if (!DEVICE_MAP[pt.device]) {{
         DEVICE_MAP[pt.device] = [];
       }}
       DEVICE_MAP[pt.device].push(pt);
     }});
     const DEVICE_KEYS = Object.keys(DEVICE_MAP);
-    if (DEVICE_KEYS.length === 0 && SLAM_POINTS.length > 0) {{
-      DEVICE_MAP['phone_1'] = SLAM_POINTS;
+    if (DEVICE_KEYS.length === 0 && FULL_SLAM_POINTS.length > 0) {{
+      DEVICE_MAP['phone_1'] = FULL_SLAM_POINTS;
       DEVICE_KEYS.push('phone_1');
     }}
 
     // Playback state
     let isPlaying = false;
-    let playbackPct = 1.0; // 0.0 to 1.0
+    let playbackPct = 1.0;
     let playbackSpeed = 1.0;
     let followPhone = true;
     let pulseAnim = 0;
 
-    const minTs = SLAM_POINTS.length > 0 ? SLAM_POINTS[0].ts : 0;
-    const maxTs = SLAM_POINTS.length > 0 ? SLAM_POINTS[SLAM_POINTS.length - 1].ts : 0;
+    const minTs = FULL_SLAM_POINTS.length > 0 ? FULL_SLAM_POINTS[0].ts : 0;
+    const maxTs = FULL_SLAM_POINTS.length > 0 ? FULL_SLAM_POINTS[FULL_SLAM_POINTS.length - 1].ts : 0;
     const totalDurationMs = Math.max(1000, maxTs - minTs);
 
-    const canvas = document.getElementById('mapCanvas');
-    const ctx = canvas.getContext('2d');
+    // Canvases
+    const canvasStatic = document.getElementById('mapCanvasStatic');
+    const staticCtx = canvasStatic.getContext('2d');
+    const canvasDynamic = document.getElementById('mapCanvasDynamic');
+    const dynamicCtx = canvasDynamic.getContext('2d');
     const tooltip = document.getElementById('tooltip');
 
     function formatTime(ms) {{
@@ -320,9 +353,14 @@ def generate_interactive_html_viewer(
     }}
 
     function resize() {{
-      canvas.width = canvas.parentElement.clientWidth;
-      canvas.height = canvas.parentElement.clientHeight;
-      draw();
+      const w = canvasDynamic.parentElement.clientWidth;
+      const h = canvasDynamic.parentElement.clientHeight;
+      canvasStatic.width = w;
+      canvasStatic.height = h;
+      canvasDynamic.width = w;
+      canvasDynamic.height = h;
+      drawStaticScene();
+      drawDynamicScene();
     }}
     window.addEventListener('resize', resize);
 
@@ -340,7 +378,8 @@ def generate_interactive_html_viewer(
       document.getElementById('btn-2d').style.color = (mode === '2D') ? '#0f172a' : '#f8fafc';
       document.getElementById('btn-3d').style.background = (mode === '3D') ? '#38bdf8' : '#334155';
       document.getElementById('btn-3d').style.color = (mode === '3D') ? '#0f172a' : '#f8fafc';
-      draw();
+      drawStaticScene();
+      drawDynamicScene();
     }}
 
     function togglePlayback() {{
@@ -359,7 +398,10 @@ def generate_interactive_html_viewer(
     function onScrub(val) {{
       playbackPct = Math.max(0, Math.min(1, val / 1000));
       updateUI();
-      draw();
+      drawDynamicScene();
+      if (!document.getElementById('chk-full-trail').checked) {{
+        drawStaticScene();
+      }}
     }}
 
     window.addEventListener('keydown', e => {{
@@ -371,14 +413,14 @@ def generate_interactive_html_viewer(
 
     function worldToScreen(wx, wy, wz = 0) {{
       if (viewMode === '2D') {{
-        return {{ x: panX + wx * zoom, y: canvas.height - (panY + wy * zoom) }};
+        return {{ x: panX + wx * zoom, y: canvasDynamic.height - (panY + wy * zoom) }};
       }} else {{
-        // 2.5D Isometric projection: 30 degree tilt with Z altitude elevation
-        const isoX = (wx - wy) * Math.cos(Math.PI / 6);
-        const isoY = (wx + wy) * Math.sin(Math.PI / 6) - (wz * 0.85);
+        // Fast 2.5D Isometric projection using precomputed trig constants
+        const isoX = (wx - wy) * COS_30;
+        const isoY = (wx + wy) * SIN_30 - (wz * 0.85);
         return {{
-          x: panX + isoX * zoom + canvas.width / 2.3,
-          y: panY + isoY * zoom + canvas.height / 3.0
+          x: panX + isoX * zoom + canvasDynamic.width / 2.3,
+          y: panY + isoY * zoom + canvasDynamic.height / 3.0
         }};
       }}
     }}
@@ -420,17 +462,38 @@ def generate_interactive_html_viewer(
       if (!pose) return;
 
       if (viewMode === '2D') {{
-        panX = canvas.width / 2 - pose.x * zoom;
-        panY = canvas.height / 2 - (canvas.height - pose.y * zoom);
+        panX = canvasDynamic.width / 2 - pose.x * zoom;
+        panY = canvasDynamic.height / 2 - (canvasDynamic.height - pose.y * zoom);
       }} else {{
-        const isoX = (pose.x - pose.y) * Math.cos(Math.PI / 6);
-        const isoY = (pose.x + pose.y) * Math.sin(Math.PI / 6) - (pose.z * 0.85);
-        panX = canvas.width / 2 - (isoX * zoom + canvas.width / 2.3);
-        panY = canvas.height / 2 - (isoY * zoom + canvas.height / 3.0);
+        const isoX = (pose.x - pose.y) * COS_30;
+        const isoY = (pose.x + pose.y) * SIN_30 - (pose.z * 0.85);
+        panX = canvasDynamic.width / 2 - (isoX * zoom + canvasDynamic.width / 2.3);
+        panY = canvasDynamic.height / 2 - (isoY * zoom + canvasDynamic.height / 3.0);
       }}
+      drawStaticScene();
     }}
 
-    function updateUI() {{
+    // Distance from point (px, py) to segment (x1, y1)-(x2, y2)
+    function distToSegment(px, py, x1, y1, x2, y2) {{
+      const dx = x2 - x1;
+      const dy = y2 - y1;
+      const lenSq = dx * dx + dy * dy;
+      if (lenSq < 1e-6) {{
+        return {{ dist: Math.hypot(px - x1, py - y1), cx: x1, cy: y1 }};
+      }}
+      let t = ((px - x1) * dx + (py - y1) * dy) / lenSq;
+      t = Math.max(0, Math.min(1, t));
+      const cx = x1 + t * dx;
+      const cy = y1 + t * dy;
+      return {{ dist: Math.hypot(px - cx, py - cy), cx, cy }};
+    }}
+
+    let lastUIUpdate = 0;
+    function updateUI(force = false) {{
+      const now = performance.now();
+      if (!force && now - lastUIUpdate < 60) return; // Throttle to ~16 Hz
+      lastUIUpdate = now;
+
       const currentMs = totalDurationMs * playbackPct;
       document.getElementById('time-label').textContent = `${{formatTime(currentMs)}} / ${{formatTime(totalDurationMs)}}`;
       document.getElementById('hud-pct').textContent = `${{Math.round(playbackPct * 100)}}%`;
@@ -446,75 +509,100 @@ def generate_interactive_html_viewer(
           const normalizedDeg = deg < 0 ? deg + 360 : deg;
           document.getElementById('hud-yaw').textContent = `${{normalizedDeg}}°`;
           document.getElementById('hud-speed').textContent = `${{(pose.speed || 0.0).toFixed(2)}} m/s`;
+
+          // Proximity to nearest predicted wall
+          let minD = 999.0;
+          WALLS.forEach(w => {{
+            const res = distToSegment(pose.x, pose.y, w.x1, w.y1, w.x2, w.y2);
+            if (res.dist < minD) minD = res.dist;
+          }});
+          const statusEl = document.getElementById('hud-status');
+          const nearEl = document.getElementById('hud-nearest');
+          if (minD < 900.0) {{
+            nearEl.textContent = `${{minD.toFixed(2)}} m`;
+            if (minD <= 0.35) {{
+              statusEl.textContent = 'PROXIMITY ALERT';
+              statusEl.style.background = '#ef4444';
+              statusEl.style.color = '#ffffff';
+            }} else if (minD <= 0.80) {{
+              statusEl.textContent = 'NEAR WALL';
+              statusEl.style.background = '#f59e0b';
+              statusEl.style.color = '#0f172a';
+            }} else {{
+              statusEl.textContent = 'CLEAR';
+              statusEl.style.background = '#22c55e';
+              statusEl.style.color = '#052e16';
+            }}
+          }} else {{
+            nearEl.textContent = 'Open Space';
+            statusEl.textContent = 'CLEAR';
+            statusEl.style.background = '#22c55e';
+            statusEl.style.color = '#052e16';
+          }}
         }}
       }}
     }}
 
-    function draw() {{
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+    // =========================================================================
+    // LAYER 1: STATIC SCENE (Cached Background Canvas)
+    // =========================================================================
+    function drawStaticScene() {{
+      staticCtx.clearRect(0, 0, canvasStatic.width, canvasStatic.height);
 
-      // Grid background
-      drawGrid();
+      // 1. Grid background
+      drawGrid(staticCtx);
 
-      // Layer: RF Density Heatmap
+      // 2. Layer: RF Density Heatmap
       if (document.getElementById('layer-heatmap').checked && HEATMAP.length > 0) {{
-        drawHeatmap();
+        drawHeatmap(staticCtx);
       }}
 
-      // Layer: Room Zones
+      // 3. Layer: Room Zones
       if (document.getElementById('layer-rooms').checked) {{
-        drawRooms();
+        drawRooms(staticCtx);
       }}
 
-      // Layer: Raw Drifted IMU Trajectory
-      if (document.getElementById('layer-raw').checked && RAW_POINTS.length > 0) {{
-        drawTrajectory(RAW_POINTS, '#ef4444', true);
+      // 4. Layer: Full Static Trajectories
+      const isFull = document.getElementById('chk-full-trail').checked;
+      if (document.getElementById('layer-raw').checked && DISPLAY_RAW_POINTS.length > 0) {{
+        drawTrajectory(staticCtx, DISPLAY_RAW_POINTS, '#ef4444', true, isFull ? 1.0 : playbackPct);
+      }}
+      if (document.getElementById('layer-slam').checked && DISPLAY_SLAM_POINTS.length > 0) {{
+        drawTrajectory(staticCtx, DISPLAY_SLAM_POINTS, '#06b6d4', false, isFull ? 1.0 : playbackPct);
       }}
 
-      // Layer: SLAM Corrected Trajectory
-      if (document.getElementById('layer-slam').checked && SLAM_POINTS.length > 0) {{
-        drawTrajectory(SLAM_POINTS, '#06b6d4', false);
-      }}
-
-      // Layer: CAD Walls (2D Lines or 3D Extrusion)
+      // 5. Layer: CAD Walls
       if (document.getElementById('layer-walls').checked) {{
-        drawWalls();
+        drawWalls(staticCtx);
       }}
 
-      // Layer: Doorways
+      // 6. Layer: Doorways
       if (document.getElementById('layer-doors').checked) {{
-        drawDoorways();
+        drawDoorways(staticCtx);
       }}
 
-      // Layer: APs
+      // 7. Layer: Access Points
       if (document.getElementById('layer-aps').checked) {{
-        drawAPs();
-      }}
-
-      // Layer: 3D Animated Phone Tracker
-      if (document.getElementById('layer-phone').checked) {{
-        drawPhones();
+        drawAPs(staticCtx);
       }}
     }}
 
-    function drawGrid() {{
+    function drawGrid(ctx) {{
       ctx.strokeStyle = '#1e293b';
       ctx.lineWidth = 1;
       const step = zoom;
-      for (let x = 0; x < canvas.width; x += step) {{
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvas.height); ctx.stroke();
+      for (let x = 0; x < canvasStatic.width; x += step) {{
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvasStatic.height); ctx.stroke();
       }}
-      for (let y = 0; y < canvas.height; y += step) {{
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvas.width, y); ctx.stroke();
+      for (let y = 0; y < canvasStatic.height; y += step) {{
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvasStatic.width, y); ctx.stroke();
       }}
     }}
 
-    function drawTrajectory(pts, color, isDashed) {{
+    function drawTrajectory(ctx, pts, color, isDashed, pct) {{
       if (!pts || pts.length === 0) return;
-      const isFull = document.getElementById('chk-full-trail').checked;
-      const cutIdx = isFull ? pts.length - 1 : Math.floor(playbackPct * (pts.length - 1));
+      const cutIdx = Math.floor(pct * (pts.length - 1));
 
-      // 1. Walked portion (solid path)
       ctx.save();
       ctx.strokeStyle = color;
       ctx.lineWidth = isDashed ? 2 : 3;
@@ -527,200 +615,9 @@ def generate_interactive_html_viewer(
       }}
       ctx.stroke();
       ctx.restore();
-
-      // 2. Unwalked / Future portion (subtle dashed preview)
-      if (!isFull && cutIdx < pts.length - 1) {{
-        ctx.save();
-        ctx.strokeStyle = color;
-        ctx.globalAlpha = 0.25;
-        ctx.lineWidth = 1.5;
-        ctx.setLineDash([2, 4]);
-        ctx.beginPath();
-        for (let i = cutIdx; i < pts.length; i++) {{
-          const p = worldToScreen(pts[i].x, pts[i].y, 0);
-          if (i === cutIdx) ctx.moveTo(p.x, p.y);
-          else ctx.lineTo(p.x, p.y);
-        }}
-        ctx.stroke();
-        ctx.restore();
-      }}
     }}
 
-    function drawPhones() {{
-      DEVICE_KEYS.forEach((devKey, dIdx) => {{
-        const pts = DEVICE_MAP[devKey];
-        if (!pts || pts.length === 0) return;
-        const color = DEVICE_COLORS[dIdx % DEVICE_COLORS.length];
-        const pose = getInterpolatedPose(pts, playbackPct);
-        if (!pose) return;
-
-        const floorP = worldToScreen(pose.x, pose.y, 0);
-        const phoneP = worldToScreen(pose.x, pose.y, pose.z);
-
-        if (viewMode === '3D') {{
-          // 1. Floor Drop Shadow (Soft ellipse directly under phone)
-          ctx.save();
-          ctx.beginPath();
-          ctx.ellipse(floorP.x, floorP.y, 16 * (zoom / 40), 8 * (zoom / 40), 0, 0, Math.PI * 2);
-          ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
-          ctx.fill();
-          ctx.restore();
-
-          // 2. Altitude Tether Line (Floor to hand elevation Z)
-          ctx.save();
-          ctx.setLineDash([3, 3]);
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 1.5;
-          ctx.globalAlpha = 0.75;
-          ctx.beginPath();
-          ctx.moveTo(floorP.x, floorP.y);
-          ctx.lineTo(phoneP.x, phoneP.y);
-          ctx.stroke();
-          ctx.restore();
-
-          // 3. Directional Heading Flashlight Cone (Projected on floor along yaw)
-          ctx.save();
-          const fLen = 2.4;
-          const leftA = pose.yaw - 0.40;
-          const rightA = pose.yaw + 0.40;
-          const pLeft = worldToScreen(pose.x + fLen * Math.cos(leftA), pose.y + fLen * Math.sin(leftA), 0);
-          const pRight = worldToScreen(pose.x + fLen * Math.cos(rightA), pose.y + fLen * Math.sin(rightA), 0);
-          const pTip = worldToScreen(pose.x + (fLen + 0.3) * Math.cos(pose.yaw), pose.y + (fLen + 0.3) * Math.sin(pose.yaw), 0);
-
-          const grad = ctx.createRadialGradient(floorP.x, floorP.y, 4, floorP.x, floorP.y, 75 * (zoom / 40));
-          grad.addColorStop(0, 'rgba(56, 189, 248, 0.40)');
-          grad.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
-          ctx.fillStyle = grad;
-          ctx.beginPath();
-          ctx.moveTo(floorP.x, floorP.y);
-          ctx.lineTo(pLeft.x, pLeft.y);
-          ctx.lineTo(pTip.x, pTip.y);
-          ctx.lineTo(pRight.x, pRight.y);
-          ctx.closePath();
-          ctx.fill();
-          ctx.restore();
-
-          // 4. Pulsing Wi-Fi RF Wave Rings around the phone
-          ctx.save();
-          const pRadius = 10 + pulseAnim * 28;
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 1.5;
-          ctx.globalAlpha = Math.max(0, 1 - pulseAnim);
-          ctx.beginPath();
-          ctx.arc(phoneP.x, phoneP.y, pRadius, 0, Math.PI * 2);
-          ctx.stroke();
-          ctx.restore();
-
-          // 5. 3D Smartphone Body (Extruded handheld chassis)
-          ctx.save();
-          ctx.translate(phoneP.x, phoneP.y);
-          const pw = 14;
-          const ph = 26;
-          // Outer metal chassis
-          ctx.fillStyle = '#0f172a';
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 2;
-          ctx.beginPath();
-          ctx.roundRect(-pw/2, -ph/2, pw, ph, 4);
-          ctx.fill();
-          ctx.stroke();
-
-          // Glass screen gradient
-          const screenGrad = ctx.createLinearGradient(0, -ph/2, 0, ph/2);
-          screenGrad.addColorStop(0, '#1e293b');
-          screenGrad.addColorStop(1, '#0369a1');
-          ctx.fillStyle = screenGrad;
-          ctx.beginPath();
-          ctx.roundRect(-pw/2 + 2, -ph/2 + 3, pw - 4, ph - 6, 2);
-          ctx.fill();
-
-          // Camera sensor dot
-          ctx.fillStyle = '#ffffff';
-          ctx.beginPath();
-          ctx.arc(0, -ph/2 + 2, 1, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.restore();
-
-          // 6. Floating Device Badge
-          ctx.save();
-          ctx.font = '10px -apple-system, sans-serif';
-          const labelText = `📱 ${{devKey}} (Z=${{pose.z.toFixed(1)}}m)`;
-          const tw = ctx.measureText(labelText).width;
-          ctx.fillStyle = 'rgba(15, 23, 42, 0.88)';
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 1;
-          ctx.beginPath();
-          ctx.roundRect(phoneP.x - tw / 2 - 6, phoneP.y - 34, tw + 12, 18, 4);
-          ctx.fill();
-          ctx.stroke();
-          ctx.fillStyle = '#f8fafc';
-          ctx.fillText(labelText, phoneP.x - tw / 2, phoneP.y - 21);
-          ctx.restore();
-
-        }} else {{
-          // 2D View Mode
-          // 1. Heading flashlight beam
-          ctx.save();
-          const fLen = 2.2;
-          const leftA = pose.yaw - 0.40;
-          const rightA = pose.yaw + 0.40;
-          const pLeft = worldToScreen(pose.x + fLen * Math.cos(leftA), pose.y + fLen * Math.sin(leftA));
-          const pRight = worldToScreen(pose.x + fLen * Math.cos(rightA), pose.y + fLen * Math.sin(rightA));
-          const pTip = worldToScreen(pose.x + (fLen + 0.3) * Math.cos(pose.yaw), pose.y + (fLen + 0.3) * Math.sin(pose.yaw));
-          ctx.fillStyle = 'rgba(56, 189, 248, 0.20)';
-          ctx.beginPath();
-          ctx.moveTo(phoneP.x, phoneP.y);
-          ctx.lineTo(pLeft.x, pLeft.y);
-          ctx.lineTo(pTip.x, pTip.y);
-          ctx.lineTo(pRight.x, pRight.y);
-          ctx.closePath();
-          ctx.fill();
-          ctx.restore();
-
-          // 2. Pulsing RF ring
-          ctx.save();
-          ctx.strokeStyle = color;
-          ctx.lineWidth = 1.5;
-          ctx.globalAlpha = Math.max(0, 1 - pulseAnim);
-          ctx.beginPath();
-          ctx.arc(phoneP.x, phoneP.y, 8 + pulseAnim * 20, 0, Math.PI * 2);
-          ctx.stroke();
-          ctx.restore();
-
-          // 3. Direction Puck
-          ctx.save();
-          ctx.fillStyle = color;
-          ctx.beginPath();
-          ctx.arc(phoneP.x, phoneP.y, 8, 0, Math.PI * 2);
-          ctx.fill();
-          ctx.strokeStyle = '#ffffff';
-          ctx.lineWidth = 2;
-          ctx.stroke();
-
-          // 4. Direction Arrow
-          ctx.fillStyle = '#ffffff';
-          ctx.beginPath();
-          const arrLen = 14;
-          const ax = phoneP.x + arrLen * Math.cos(pose.yaw);
-          const ay = phoneP.y - arrLen * Math.sin(pose.yaw);
-          ctx.moveTo(ax, ay);
-          ctx.lineTo(phoneP.x + 5 * Math.cos(pose.yaw + 2.5), phoneP.y - 5 * Math.sin(pose.yaw + 2.5));
-          ctx.lineTo(phoneP.x + 5 * Math.cos(pose.yaw - 2.5), phoneP.y - 5 * Math.sin(pose.yaw - 2.5));
-          ctx.closePath();
-          ctx.fill();
-          ctx.restore();
-
-          // 5. Badge
-          ctx.save();
-          ctx.font = '10px -apple-system, sans-serif';
-          ctx.fillStyle = '#ffffff';
-          ctx.fillText(`📱 ${{devKey}}`, phoneP.x + 12, phoneP.y - 6);
-          ctx.restore();
-        }}
-      }});
-    }}
-
-    function drawWalls() {{
+    function drawWalls(ctx) {{
       WALLS.forEach(w => {{
         if (viewMode === '2D') {{
           const p1 = worldToScreen(w.x1, w.y1);
@@ -740,7 +637,7 @@ def generate_interactive_html_viewer(
           const t1 = worldToScreen(w.x1, w.y1, wallHeightM);
           const t2 = worldToScreen(w.x2, w.y2, wallHeightM);
 
-          ctx.fillStyle = 'rgba(56, 189, 248, 0.25)';
+          ctx.fillStyle = 'rgba(56, 189, 248, 0.22)';
           ctx.strokeStyle = '#38bdf8';
           ctx.lineWidth = 2;
           ctx.beginPath();
@@ -755,7 +652,7 @@ def generate_interactive_html_viewer(
       }});
     }}
 
-    function drawDoorways() {{
+    function drawDoorways(ctx) {{
       DOORS.forEach(d => {{
         const p = worldToScreen(d.x, d.y, 0);
         ctx.strokeStyle = '#f59e0b';
@@ -766,7 +663,7 @@ def generate_interactive_html_viewer(
       }});
     }}
 
-    function drawRooms() {{
+    function drawRooms(ctx) {{
       ROOMS.forEach(r => {{
         const p = worldToScreen(r.centroid_x, r.centroid_y, 0);
         ctx.fillStyle = '#94a3b8';
@@ -775,7 +672,7 @@ def generate_interactive_html_viewer(
       }});
     }}
 
-    function drawAPs() {{
+    function drawAPs(ctx) {{
       APS.forEach(ap => {{
         const p = worldToScreen(ap.x, ap.y, 0);
         ctx.fillStyle = '#22c55e';
@@ -788,7 +685,7 @@ def generate_interactive_html_viewer(
       }});
     }}
 
-    function drawHeatmap() {{
+    function drawHeatmap(ctx) {{
       const ny = HEATMAP.length;
       const nx = HEATMAP[0].length;
       const cellW = DIMS.width_m / nx;
@@ -807,25 +704,306 @@ def generate_interactive_html_viewer(
       }}
     }}
 
-    // Mouse controls (pan & zoom)
-    canvas.addEventListener('mousedown', e => {{
+    // =========================================================================
+    // LAYER 2: DYNAMIC FOREGROUND (Live 60 FPS Phone, Proximity Rays & Halo)
+    // =========================================================================
+    function drawDynamicScene() {{
+      dynamicCtx.clearRect(0, 0, canvasDynamic.width, canvasDynamic.height);
+
+      if (!document.getElementById('layer-phone').checked) return;
+
+      DEVICE_KEYS.forEach((devKey, dIdx) => {{
+        const pts = DEVICE_MAP[devKey];
+        if (!pts || pts.length === 0) return;
+        const color = DEVICE_COLORS[dIdx % DEVICE_COLORS.length];
+        const pose = getInterpolatedPose(pts, playbackPct);
+        if (!pose) return;
+
+        const floorP = worldToScreen(pose.x, pose.y, 0);
+        const phoneP = worldToScreen(pose.x, pose.y, pose.z);
+
+        // -------------------------------------------------------------
+        // FEATURE: Proximity Clearance Halo & Wall Rangefinder Rays
+        // -------------------------------------------------------------
+        if (document.getElementById('layer-proximity').checked) {{
+          // 1. Calculate clearance distances to all predicted CAD walls
+          const wallDistances = [];
+          WALLS.forEach((w, wIdx) => {{
+            const res = distToSegment(pose.x, pose.y, w.x1, w.y1, w.x2, w.y2);
+            wallDistances.push({{
+              wall: w,
+              dist: res.dist,
+              cx: res.cx,
+              cy: res.cy,
+              idx: wIdx
+            }});
+          }});
+          wallDistances.sort((a, b) => a.dist - b.dist);
+          const nearest = wallDistances[0];
+
+          // 2. Proximity Clearance Halo on Floor (0.35m radius body buffer)
+          dynamicCtx.save();
+          const haloRadius = 0.35 * zoom;
+          dynamicCtx.beginPath();
+          if (viewMode === '3D') {{
+            dynamicCtx.ellipse(floorP.x, floorP.y, haloRadius * 1.4, haloRadius * 0.7, 0, 0, Math.PI * 2);
+          }} else {{
+            dynamicCtx.arc(floorP.x, floorP.y, haloRadius, 0, Math.PI * 2);
+          }}
+
+          let haloColor = 'rgba(6, 182, 212, 0.25)'; // Cyan: Clear
+          let haloStroke = '#06b6d4';
+          if (nearest && nearest.dist <= 0.35) {{
+            haloColor = 'rgba(239, 68, 68, 0.40)'; // Red: Proximity threshold
+            haloStroke = '#ef4444';
+          }} else if (nearest && nearest.dist <= 0.80) {{
+            haloColor = 'rgba(245, 158, 11, 0.30)'; // Amber: Near obstacle
+            haloStroke = '#f59e0b';
+          }}
+          dynamicCtx.fillStyle = haloColor;
+          dynamicCtx.strokeStyle = haloStroke;
+          dynamicCtx.lineWidth = 2;
+          dynamicCtx.fill();
+          dynamicCtx.stroke();
+          dynamicCtx.restore();
+
+          // 3. Dynamic Laser Rangefinder Rays to nearby predicted walls (within 3.0m)
+          dynamicCtx.save();
+          const activeRays = wallDistances.filter(d => d.dist <= 3.0).slice(0, 4);
+          activeRays.forEach(ray => {{
+            const wallPtScreen = worldToScreen(ray.cx, ray.cy, 0);
+
+            // Laser beam
+            dynamicCtx.strokeStyle = ray.dist <= 0.5 ? '#ef4444' : '#38bdf8';
+            dynamicCtx.lineWidth = 1.5;
+            dynamicCtx.setLineDash([3, 3]);
+            dynamicCtx.beginPath();
+            dynamicCtx.moveTo(floorP.x, floorP.y);
+            dynamicCtx.lineTo(wallPtScreen.x, wallPtScreen.y);
+            dynamicCtx.stroke();
+
+            // Obstacle contact point dot
+            dynamicCtx.fillStyle = '#f8fafc';
+            dynamicCtx.beginPath();
+            dynamicCtx.arc(wallPtScreen.x, wallPtScreen.y, 4, 0, Math.PI * 2);
+            dynamicCtx.fill();
+
+            // Distance label tag mid-ray
+            const midX = (floorP.x + wallPtScreen.x) / 2;
+            const midY = (floorP.y + wallPtScreen.y) / 2;
+            dynamicCtx.font = '10px monospace';
+            const distTxt = `${{ray.dist.toFixed(2)}}m`;
+            const tw = dynamicCtx.measureText(distTxt).width;
+            dynamicCtx.fillStyle = 'rgba(15, 23, 42, 0.90)';
+            dynamicCtx.fillRect(midX - tw/2 - 3, midY - 7, tw + 6, 14);
+            dynamicCtx.fillStyle = ray.dist <= 0.5 ? '#f87171' : '#38bdf8';
+            dynamicCtx.fillText(distTxt, midX - tw/2, midY + 4);
+          }});
+          dynamicCtx.restore();
+
+          // 4. Glow highlight on nearby walls
+          dynamicCtx.save();
+          activeRays.forEach(ray => {{
+            const w = ray.wall;
+            const p1 = worldToScreen(w.x1, w.y1, 0);
+            const p2 = worldToScreen(w.x2, w.y2, 0);
+            dynamicCtx.strokeStyle = '#38bdf8';
+            dynamicCtx.shadowColor = '#38bdf8';
+            dynamicCtx.shadowBlur = 10;
+            dynamicCtx.lineWidth = 3;
+            dynamicCtx.beginPath();
+            dynamicCtx.moveTo(p1.x, p1.y);
+            dynamicCtx.lineTo(p2.x, p2.y);
+            dynamicCtx.stroke();
+          }});
+          dynamicCtx.restore();
+        }}
+
+        // -------------------------------------------------------------
+        // Phone Visual Representation (3D Chassis or 2D Direction Puck)
+        // -------------------------------------------------------------
+        if (viewMode === '3D') {{
+          // 1. Floor Drop Shadow
+          dynamicCtx.save();
+          dynamicCtx.beginPath();
+          dynamicCtx.ellipse(floorP.x, floorP.y, 16 * (zoom / 40), 8 * (zoom / 40), 0, 0, Math.PI * 2);
+          dynamicCtx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+          dynamicCtx.fill();
+          dynamicCtx.restore();
+
+          // 2. Altitude Tether Line
+          dynamicCtx.save();
+          dynamicCtx.setLineDash([3, 3]);
+          dynamicCtx.strokeStyle = color;
+          dynamicCtx.lineWidth = 1.5;
+          dynamicCtx.globalAlpha = 0.75;
+          dynamicCtx.beginPath();
+          dynamicCtx.moveTo(floorP.x, floorP.y);
+          dynamicCtx.lineTo(phoneP.x, phoneP.y);
+          dynamicCtx.stroke();
+          dynamicCtx.restore();
+
+          // 3. Directional Heading Flashlight Cone
+          dynamicCtx.save();
+          const fLen = 2.4;
+          const leftA = pose.yaw - 0.40;
+          const rightA = pose.yaw + 0.40;
+          const pLeft = worldToScreen(pose.x + fLen * Math.cos(leftA), pose.y + fLen * Math.sin(leftA), 0);
+          const pRight = worldToScreen(pose.x + fLen * Math.cos(rightA), pose.y + fLen * Math.sin(rightA), 0);
+          const pTip = worldToScreen(pose.x + (fLen + 0.3) * Math.cos(pose.yaw), pose.y + (fLen + 0.3) * Math.sin(pose.yaw), 0);
+
+          const grad = dynamicCtx.createRadialGradient(floorP.x, floorP.y, 4, floorP.x, floorP.y, 75 * (zoom / 40));
+          grad.addColorStop(0, 'rgba(56, 189, 248, 0.40)');
+          grad.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
+          dynamicCtx.fillStyle = grad;
+          dynamicCtx.beginPath();
+          dynamicCtx.moveTo(floorP.x, floorP.y);
+          dynamicCtx.lineTo(pLeft.x, pLeft.y);
+          dynamicCtx.lineTo(pTip.x, pTip.y);
+          dynamicCtx.lineTo(pRight.x, pRight.y);
+          dynamicCtx.closePath();
+          dynamicCtx.fill();
+          dynamicCtx.restore();
+
+          // 4. Pulsing Wi-Fi RF Wave Rings
+          dynamicCtx.save();
+          const pRadius = 10 + pulseAnim * 28;
+          dynamicCtx.strokeStyle = color;
+          dynamicCtx.lineWidth = 1.5;
+          dynamicCtx.globalAlpha = Math.max(0, 1 - pulseAnim);
+          dynamicCtx.beginPath();
+          dynamicCtx.arc(phoneP.x, phoneP.y, pRadius, 0, Math.PI * 2);
+          dynamicCtx.stroke();
+          dynamicCtx.restore();
+
+          // 5. 3D Smartphone Body
+          dynamicCtx.save();
+          dynamicCtx.translate(phoneP.x, phoneP.y);
+          const pw = 14;
+          const ph = 26;
+          dynamicCtx.fillStyle = '#0f172a';
+          dynamicCtx.strokeStyle = color;
+          dynamicCtx.lineWidth = 2;
+          dynamicCtx.beginPath();
+          dynamicCtx.roundRect(-pw/2, -ph/2, pw, ph, 4);
+          dynamicCtx.fill();
+          dynamicCtx.stroke();
+
+          const screenGrad = dynamicCtx.createLinearGradient(0, -ph/2, 0, ph/2);
+          screenGrad.addColorStop(0, '#1e293b');
+          screenGrad.addColorStop(1, '#0369a1');
+          dynamicCtx.fillStyle = screenGrad;
+          dynamicCtx.beginPath();
+          dynamicCtx.roundRect(-pw/2 + 2, -ph/2 + 3, pw - 4, ph - 6, 2);
+          dynamicCtx.fill();
+
+          dynamicCtx.fillStyle = '#ffffff';
+          dynamicCtx.beginPath();
+          dynamicCtx.arc(0, -ph/2 + 2, 1, 0, Math.PI * 2);
+          dynamicCtx.fill();
+          dynamicCtx.restore();
+
+          // 6. Floating Device Badge
+          dynamicCtx.save();
+          dynamicCtx.font = '10px -apple-system, sans-serif';
+          const labelText = `📱 ${{devKey}} (Z=${{pose.z.toFixed(1)}}m)`;
+          const tw = dynamicCtx.measureText(labelText).width;
+          dynamicCtx.fillStyle = 'rgba(15, 23, 42, 0.88)';
+          dynamicCtx.strokeStyle = color;
+          dynamicCtx.lineWidth = 1;
+          dynamicCtx.beginPath();
+          dynamicCtx.roundRect(phoneP.x - tw / 2 - 6, phoneP.y - 34, tw + 12, 18, 4);
+          dynamicCtx.fill();
+          dynamicCtx.stroke();
+          dynamicCtx.fillStyle = '#f8fafc';
+          dynamicCtx.fillText(labelText, phoneP.x - tw / 2, phoneP.y - 21);
+          dynamicCtx.restore();
+
+        }} else {{
+          // 2D View Mode
+          dynamicCtx.save();
+          const fLen = 2.2;
+          const leftA = pose.yaw - 0.40;
+          const rightA = pose.yaw + 0.40;
+          const pLeft = worldToScreen(pose.x + fLen * Math.cos(leftA), pose.y + fLen * Math.sin(leftA));
+          const pRight = worldToScreen(pose.x + fLen * Math.cos(rightA), pose.y + fLen * Math.sin(rightA));
+          const pTip = worldToScreen(pose.x + (fLen + 0.3) * Math.cos(pose.yaw), pose.y + (fLen + 0.3) * Math.sin(pose.yaw));
+          dynamicCtx.fillStyle = 'rgba(56, 189, 248, 0.20)';
+          dynamicCtx.beginPath();
+          dynamicCtx.moveTo(phoneP.x, phoneP.y);
+          dynamicCtx.lineTo(pLeft.x, pLeft.y);
+          dynamicCtx.lineTo(pTip.x, pTip.y);
+          dynamicCtx.lineTo(pRight.x, pRight.y);
+          dynamicCtx.closePath();
+          dynamicCtx.fill();
+          dynamicCtx.restore();
+
+          // Pulsing RF ring
+          dynamicCtx.save();
+          dynamicCtx.strokeStyle = color;
+          dynamicCtx.lineWidth = 1.5;
+          dynamicCtx.globalAlpha = Math.max(0, 1 - pulseAnim);
+          dynamicCtx.beginPath();
+          dynamicCtx.arc(phoneP.x, phoneP.y, 8 + pulseAnim * 20, 0, Math.PI * 2);
+          dynamicCtx.stroke();
+          dynamicCtx.restore();
+
+          // Direction Puck
+          dynamicCtx.save();
+          dynamicCtx.fillStyle = color;
+          dynamicCtx.beginPath();
+          dynamicCtx.arc(phoneP.x, phoneP.y, 8, 0, Math.PI * 2);
+          dynamicCtx.fill();
+          dynamicCtx.strokeStyle = '#ffffff';
+          dynamicCtx.lineWidth = 2;
+          dynamicCtx.stroke();
+
+          // Direction Arrow
+          dynamicCtx.fillStyle = '#ffffff';
+          dynamicCtx.beginPath();
+          const arrLen = 14;
+          const ax = phoneP.x + arrLen * Math.cos(pose.yaw);
+          const ay = phoneP.y - arrLen * Math.sin(pose.yaw);
+          dynamicCtx.moveTo(ax, ay);
+          dynamicCtx.lineTo(phoneP.x + 5 * Math.cos(pose.yaw + 2.5), phoneP.y - 5 * Math.sin(pose.yaw + 2.5));
+          dynamicCtx.lineTo(phoneP.x + 5 * Math.cos(pose.yaw - 2.5), phoneP.y - 5 * Math.sin(pose.yaw - 2.5));
+          dynamicCtx.closePath();
+          dynamicCtx.fill();
+          dynamicCtx.restore();
+
+          // Badge
+          dynamicCtx.save();
+          dynamicCtx.font = '10px -apple-system, sans-serif';
+          dynamicCtx.fillStyle = '#ffffff';
+          dynamicCtx.fillText(`📱 ${{devKey}}`, phoneP.x + 12, phoneP.y - 6);
+          dynamicCtx.restore();
+        }}
+      }});
+    }}
+
+    // =========================================================================
+    // MOUSE & TOUCH CONTROLS
+    // =========================================================================
+    canvasDynamic.addEventListener('mousedown', e => {{
       isDragging = true;
       startX = e.clientX - panX;
       startY = e.clientY - panY;
     }});
     window.addEventListener('mouseup', () => isDragging = false);
-    canvas.addEventListener('mousemove', e => {{
+    canvasDynamic.addEventListener('mousemove', e => {{
       if (isDragging) {{
         panX = e.clientX - startX;
         panY = e.clientY - startY;
-        draw();
+        drawStaticScene();
+        drawDynamicScene();
       }}
     }});
-    canvas.addEventListener('wheel', e => {{
+    canvasDynamic.addEventListener('wheel', e => {{
       e.preventDefault();
       const factor = e.deltaY < 0 ? 1.15 : 0.87;
       zoom = Math.max(15, Math.min(120, zoom * factor));
-      draw();
+      drawStaticScene();
+      drawDynamicScene();
     }});
 
     function downloadGeoJSON() {{
@@ -838,14 +1016,16 @@ def generate_interactive_html_viewer(
       a.click();
     }}
 
-    // Animation ticker loop
+    // =========================================================================
+    // 60 FPS ULTRA-LIGHT ANIMATION TICKER
+    // =========================================================================
     let lastTickTime = performance.now();
     function animLoop(now) {{
       const dt = (now - lastTickTime) / 1000;
       lastTickTime = now;
       pulseAnim = (pulseAnim + dt * 2.0) % 1.0;
 
-      if (isPlaying && SLAM_POINTS.length > 1) {{
+      if (isPlaying && FULL_SLAM_POINTS.length > 1) {{
         const step = (dt * playbackSpeed * 1000) / totalDurationMs;
         playbackPct += step;
         if (playbackPct >= 1.0) {{
@@ -859,13 +1039,17 @@ def generate_interactive_html_viewer(
         if (followPhone) {{
           centerCameraOnActivePhone();
         }}
+      }} else {{
+        updateUI();
       }}
-      draw();
+
+      // Redraw only the dynamic foreground at 60 FPS (zero static redraw lag)
+      drawDynamicScene();
       requestAnimationFrame(animLoop);
     }}
 
     resize();
-    updateUI();
+    updateUI(true);
     setViewMode('3D');
     requestAnimationFrame(animLoop);
   </script>

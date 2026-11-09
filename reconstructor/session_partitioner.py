@@ -409,6 +409,127 @@ class SessionPartitioner:
             return {d: keys for d, keys in dev_map.items() if d in device_ids}
         return dev_map
 
+    def cluster_environments_by_ap_recurrence(
+        self,
+        partitions: Optional[Dict[str, Dict[str, List[str]]]] = None,
+        min_jaccard_similarity: float = 0.15
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Clusters fragmented environment folders (caused by Wi-Fi beacon variance
+        or intermittent neighbor AP visibility in the mobile app) into cohesive physical
+        residence clusters based on shared core Access Point MAC addresses.
+
+        Returns:
+          cluster_id -> {
+              "canonical_env_id": str,
+              "member_envs": [str],
+              "shared_aps": [str],
+              "device_batches": { device_id -> [keys...] },
+              "total_batches": int
+          }
+        """
+        if partitions is None:
+            raw_parts = self.scan_fleet_partitions()
+            valid_parts, _ = self.filter_transit_partitions(raw_parts)
+            partitions = valid_parts
+
+        if not partitions:
+            return {}
+
+        # 1. Extract AP BSSID fingerprint per environment (sample 1-2 batches per environment)
+        env_ap_fingerprints: Dict[str, Set[str]] = {}
+        for env_id, dev_map in partitions.items():
+            bssid_set = set()
+            for dev_id, keys in dev_map.items():
+                for key in keys[:2]:
+                    try:
+                        raw = self.adapter.read_object_bytes(key)
+                        decomp = gzip.decompress(raw) if raw[:2] == b"\x1f\x8b" else raw
+                        for line in decomp.decode("utf-8", errors="ignore").splitlines():
+                            if not line.strip():
+                                continue
+                            ev = json.loads(line)
+                            b = ev.get("bssid")
+                            if b:
+                                bssid_set.add(b[:14].lower())
+                            for s in ev.get("scans", []):
+                                sb = s.get("bssid")
+                                if sb:
+                                    bssid_set.add(sb[:14].lower())
+                    except Exception:
+                        pass
+            env_ap_fingerprints[env_id] = bssid_set
+
+        # 2. Build adjacency graph of environments sharing substantial AP signatures
+        env_keys = sorted(list(partitions.keys()))
+        adj: Dict[str, Set[str]] = {k: set() for k in env_keys}
+
+        for i in range(len(env_keys)):
+            for j in range(i + 1, len(env_keys)):
+                e1 = env_keys[i]
+                e2 = env_keys[j]
+                aps1 = env_ap_fingerprints[e1]
+                aps2 = env_ap_fingerprints[e2]
+                if not aps1 or not aps2:
+                    continue
+                intersection = len(aps1 & aps2)
+                union = len(aps1 | aps2)
+                jaccard = intersection / union if union > 0 else 0.0
+
+                # Cluster if Jaccard >= threshold or they share >= 2 AP prefixes
+                if jaccard >= min_jaccard_similarity or intersection >= 2:
+                    adj[e1].add(e2)
+                    adj[e2].add(e1)
+
+        # 3. Find connected components
+        visited = set()
+        clusters: Dict[str, Dict[str, Any]] = {}
+
+        for env_id in env_keys:
+            if env_id in visited:
+                continue
+            component = []
+            queue = [env_id]
+            visited.add(env_id)
+
+            while queue:
+                curr = queue.pop(0)
+                component.append(curr)
+                for neighbor in adj[curr]:
+                    if neighbor not in visited:
+                        visited.add(neighbor)
+                        queue.append(neighbor)
+
+            # Canonical ID is the member with the most total batches
+            canonical_id = max(
+                component,
+                key=lambda e: sum(len(k) for k in partitions[e].values())
+            )
+            cluster_id = f"cluster_{canonical_id}" if len(component) > 1 else canonical_id
+
+            # Merge device batch lists across all member environments
+            merged_dev_batches: Dict[str, List[str]] = {}
+            all_shared_aps = set()
+            for member in component:
+                all_shared_aps |= env_ap_fingerprints.get(member, set())
+                for dev_id, keys in partitions[member].items():
+                    merged_dev_batches.setdefault(dev_id, []).extend(keys)
+
+            for d in merged_dev_batches:
+                merged_dev_batches[d].sort()
+
+            total_b = sum(len(k) for k in merged_dev_batches.values())
+            clusters[cluster_id] = {
+                "cluster_id": cluster_id,
+                "canonical_env_id": canonical_id,
+                "member_envs": component,
+                "shared_aps": sorted(list(all_shared_aps)),
+                "device_batches": merged_dev_batches,
+                "total_batches": total_b
+            }
+
+        return clusters
+
     def summarize_fleet(self) -> Dict[str, Any]:
         """
         Generates an administrative summary of fleet partitions, devices,

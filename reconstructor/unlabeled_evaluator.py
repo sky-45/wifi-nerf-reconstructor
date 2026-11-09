@@ -9,7 +9,7 @@ Computes:
 """
 
 import math
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 
 class UnlabeledEvaluator:
@@ -51,6 +51,21 @@ class UnlabeledEvaluator:
             "quality_grade": self._assign_quality_grade(ray_metrics["f1"], rpe_metrics["median_error_db"])
         }
 
+    def _find_ap_for_probe(self, bssid: str, aps: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not bssid:
+            return None
+        ap = aps.get(bssid)
+        if ap:
+            return ap
+        masked = (bssid[:15] + "xx") if len(bssid) == 17 else bssid
+        if masked in aps:
+            return aps[masked]
+        prefix = bssid[:14].lower() if len(bssid) >= 14 else bssid.lower()
+        for k, v in aps.items():
+            if k.lower().startswith(prefix):
+                return v
+        return None
+
     def _evaluate_holdout_wall_rays(
         self,
         walls: List[Dict[str, Any]],
@@ -60,28 +75,23 @@ class UnlabeledEvaluator:
         tp, fp, tn, fn = 0, 0, 0, 0
 
         for ev in events:
-            if ev.get("event_type") != "wifi_scan_batch":
-                continue
             pose = ev.get("pose")
             if not pose:
                 continue
             rx_x, rx_y = pose["x"], pose["y"]
+            ev_type = ev.get("event_type") or ev.get("type")
 
-            for pair in ev.get("multiband_pairs", []):
+            # 1. Multi-band differential wall loss (synthetic or high-end multi-radio telemetry)
+            multiband_pairs = ev.get("multiband_pairs", [])
+            for pair in multiband_pairs:
                 gid = pair.get("ap_group_id")
-                ap_info = aps.get(gid)
+                ap_info = aps.get(gid) or self._find_ap_for_probe(gid, aps)
                 if not ap_info:
                     continue
 
                 ap_x, ap_y = ap_info["x"], ap_info["y"]
-
-                # Ground Truth Label from Physics:
-                # If excess differential loss > 3.0 dB, physics dictates a wall physically blocks this ray
                 excess_loss = pair.get("excess_wall_loss_db", 0.0)
                 y_true = (excess_loss >= 3.0)
-
-                # Map Prediction:
-                # Does the reconstructed vector map contain a wall intersecting ray (ap_x, ap_y) -> (rx_x, rx_y)?
                 y_pred = self._ray_intersects_any_wall(ap_x, ap_y, rx_x, rx_y, walls)
 
                 if y_true and y_pred:
@@ -92,6 +102,48 @@ class UnlabeledEvaluator:
                     tn += 1
                 elif y_true and not y_pred:
                     fn += 1
+
+            # 2. Path-loss excess from real scan batches (when multiband_pairs absent)
+            if not multiband_pairs and ev_type == "wifi_scan_batch":
+                for scan in ev.get("scans", []):
+                    gid = scan.get("ap_group_id", scan.get("bssid"))
+                    ap_info = aps.get(gid) or self._find_ap_for_probe(gid, aps)
+                    if not ap_info:
+                        continue
+                    d = max(0.4, math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"]))
+                    fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d)
+                    excess = max(0.0, fs_loss - float(scan.get("rssi_dbm", -70)))
+                    y_true = (excess >= 3.0)
+                    y_pred = self._ray_intersects_any_wall(ap_info["x"], ap_info["y"], rx_x, rx_y, walls)
+
+                    if y_true and y_pred:
+                        tp += 1
+                    elif not y_true and y_pred:
+                        fp += 1
+                    elif not y_true and not y_pred:
+                        tn += 1
+                    elif y_true and not y_pred:
+                        fn += 1
+
+            # 3. Path-loss excess from high-frequency connected probes (real phone telemetry)
+            elif not multiband_pairs and ev_type == "connected_probe":
+                bssid = ev.get("bssid", "")
+                ap_info = self._find_ap_for_probe(bssid, aps)
+                if ap_info:
+                    d = max(0.4, math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"]))
+                    fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d)
+                    excess = max(0.0, fs_loss - float(ev.get("rssi_dbm", -70)))
+                    y_true = (excess >= 3.0)
+                    y_pred = self._ray_intersects_any_wall(ap_info["x"], ap_info["y"], rx_x, rx_y, walls)
+
+                    if y_true and y_pred:
+                        tp += 1
+                    elif not y_true and y_pred:
+                        fp += 1
+                    elif not y_true and not y_pred:
+                        tn += 1
+                    elif y_true and not y_pred:
+                        fn += 1
 
         total = tp + fp + tn + fn
         if total == 0:
@@ -163,29 +215,43 @@ class UnlabeledEvaluator:
         wall_attenuation_db = 4.5 # Expected drywall absorption
 
         for ev in events:
-            if ev.get("event_type") != "wifi_scan_batch":
-                continue
             pose = ev.get("pose")
             if not pose:
                 continue
             rx_x, rx_y = pose["x"], pose["y"]
+            ev_type = ev.get("event_type") or ev.get("type")
 
-            for scan in ev.get("scans", []):
-                gid = scan.get("ap_group_id", scan["bssid"])
-                ap_info = aps.get(gid)
-                if not ap_info:
-                    continue
+            if ev_type == "wifi_scan_batch":
+                for scan in ev.get("scans", []):
+                    gid = scan.get("ap_group_id", scan.get("bssid"))
+                    ap_info = aps.get(gid) or self._find_ap_for_probe(gid, aps)
+                    if not ap_info:
+                        continue
 
-                d = max(0.4, math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"]))
-                num_walls = 0
-                for w in walls:
-                    if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"]):
-                        num_walls += 1
+                    d = max(0.4, math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"]))
+                    num_walls = 0
+                    for w in walls:
+                        if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"]):
+                            num_walls += 1
 
-                # Forward RSSI prediction using map
-                pred_rssi = ap_info["p0_dbm"] - 20.0 * math.log10(d) - (num_walls * wall_attenuation_db)
-                err = abs(pred_rssi - float(scan["rssi_dbm"]))
-                errors.append(err)
+                    # Forward RSSI prediction using map
+                    pred_rssi = ap_info["p0_dbm"] - 20.0 * math.log10(d) - (num_walls * wall_attenuation_db)
+                    err = abs(pred_rssi - float(scan.get("rssi_dbm", -70)))
+                    errors.append(err)
+
+            elif ev_type == "connected_probe":
+                bssid = ev.get("bssid", "")
+                ap_info = self._find_ap_for_probe(bssid, aps)
+                if ap_info:
+                    d = max(0.4, math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"]))
+                    num_walls = 0
+                    for w in walls:
+                        if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"]):
+                            num_walls += 1
+
+                    pred_rssi = ap_info["p0_dbm"] - 20.0 * math.log10(d) - (num_walls * wall_attenuation_db)
+                    err = abs(pred_rssi - float(ev.get("rssi_dbm", -70)))
+                    errors.append(err)
 
         if not errors:
             return {"median_error_db": 0.0, "mae_db": 0.0}

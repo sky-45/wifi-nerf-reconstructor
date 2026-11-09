@@ -429,7 +429,16 @@ class SessionAssembler:
         4. Merges into a consolidated chronological stream.
         """
         partitioner = SessionPartitioner(self.adapter)
-        device_batches = partitioner.get_environment_device_batches(env_id, device_ids=device_ids)
+        if env_id.startswith("cluster_"):
+            clusters = partitioner.cluster_environments_by_ap_recurrence()
+            if env_id in clusters:
+                device_batches = clusters[env_id]["device_batches"]
+                if device_ids:
+                    device_batches = {d: k for d, k in device_batches.items() if d in device_ids}
+            else:
+                device_batches = partitioner.get_environment_device_batches(env_id, device_ids=device_ids)
+        else:
+            device_batches = partitioner.get_environment_device_batches(env_id, device_ids=device_ids)
 
         if not device_batches:
             raise FileNotFoundError(f"No telemetry batches found for environment '{env_id}'")
