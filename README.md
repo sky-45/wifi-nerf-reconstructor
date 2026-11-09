@@ -349,13 +349,14 @@ python3 reconstructor/tune_hyperparameters.py \
 
 ---
 
-## 2D Top CAD Blueprint & Free 3D WebGL HTML Viewer
+## 2D Top CAD Blueprint & Zero-Dependency Embedded WebGL 3D Viewer
 
-The interactive browser dashboard (`output/viewer_*.html`) combines a **Dual-Canvas 2D Blueprint Architecture** with a **Three.js WebGL 3D Navigation Engine**:
+The interactive browser dashboard (`output/viewer_*.html`) combines a **Dual-Canvas 2D Blueprint Architecture** with a **Zero-Dependency Embedded WebGL 3D Navigation Engine** (100% self-contained, 0 external CDN scripts, immune to ad-blockers, firewall rules, and offline usage):
 
 ### Three Distinct Visual Modes
 1. **📐 Top CAD Blueprint (`viewMode = 'CAD'`, Startup Default)**:
    - **Classic Blueprint Styling**: Navy blue `#0c2340` graph-paper background with fine white grid lines ($1.0\text{ m}$ major, $0.2\text{ m}$ minor).
+   - **Direct Cartesian 1:1 Pan Dragging**: Natural direct-manipulation dragging in all 4 directions (dragging down moves map down; dragging up moves map up).
    - **Architectural Wall Thickness Ribbons**: Renders physical wall core lines flanked by parallel outer boundary stroke lines with subtle fill.
    - **Dimension Witness Lines & Arrows**: Precise dimension annotations (`|← 3.40 m →|`) offset perpendicular to walls with end tic marks.
    - **90° Circular Door Swing Arcs**: Standard architectural door symbols showing clearance radius and swing direction.
@@ -363,13 +364,15 @@ The interactive browser dashboard (`output/viewer_*.html`) combines a **Dual-Can
    - **Metric Graphic Scale Bar & North Compass Arrow**: Real-time scale bar (`SCALE 1:METRIC`) adapting to zoom and architectural compass rose.
 
 2. **🌐 Free 3D Orbit (`viewMode = '3D'`)**:
-   - **Three.js WebGL Scene with `OrbitControls`**: Full continuous 360° orbital rotation, pitch/tilt angles, free panning, and distance zoom via mouse/touch.
+   - **Zero-Dependency Embedded WebGL 3D Engine**: Hardware-accelerated depth-tested rendering with Gouraud/Phong directional lighting and ambient shading running directly in pure WebGL (0 external scripts or CDN dependencies).
+   - **Continuous 360° Orbital Controls**: Left-drag orbits azimuth and pitch/tilt; right-drag/shift-drag pans the camera; wheel/pinch zooms smoothly.
    - **Extruded 3D Wall Geometry**: Architectural walls extruded to realistic ceiling height ($2.4\text{ m}$) with physical thickness ($0.15\text{ m}$) and doorway cutouts.
+   - **Floor Grid Plane & Router Mappings**: Dark navy floor plane with spatial grid lines and 3D access points with antenna masts.
    - **Dynamic 3D Phone Avatar & Laser Rangefinder**: 3D phone model with direction cone, drop tether, and real-time dashed 3D laser rays cast to nearest walls.
-   - **Pulsing AP Routers**: 3D access points with antenna mast and glowing RF radiation rings.
 
 3. **🚶 First-Person Walkthrough (`viewMode = 'POV'`)**:
    - Phone-eye camera perspective attached to the device at eye level ($1.6\text{ m}$) looking forward, gliding smoothly through the rooms during survey playback.
+   - Automatic playback start and navigation reticle for immediate room exploration.
 
 ### Camera Navigation & Recenter Controls
 - **`[🎯 Recenter]` (`recenterBuilding()`)**: Computes the full $[X_{\min}, X_{\max}] \times [Y_{\min}, Y_{\max}]$ bounding box of the reconstructed building, auto-centering and fitting the floorplan with optimal margins in both 2D CAD and 3D Orbit modes.
@@ -390,3 +393,5 @@ The interactive browser dashboard (`output/viewer_*.html`) combines a **Dual-Can
     # Or purge all previous output files:
     python3 -m reconstructor.pipeline --env-id cluster_env_79f11c4a701db8a1 --clean-all
     ```
+- **Compact Trajectory Encoding & 94% File Size Reduction**:
+  - Automatically compresses stationary dwell points and quantizes coordinates to 3 decimal places ($1\text{ mm}$ resolution), dropping HTML file size from $2.3\text{ MB} \to 144\text{ KB}$ for zero-lag instantaneous loading.

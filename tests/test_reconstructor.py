@@ -293,15 +293,18 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         self.assertIn('id="layer-coverage"', html_content)
         self.assertIn('id="layer-labels"', html_content)
 
-        # Verify Top CAD Blueprint, Free 3D Orbit, and Recenter controls
+        # Verify Top CAD Blueprint, Zero-Dependency 3D WebGL Orbit, and Recenter controls
+        self.assertIn('id="mapCanvas3D"', html_content)
         self.assertIn('id="btn-cad"', html_content)
         self.assertIn('id="btn-3d"', html_content)
         self.assertIn('id="btn-pov"', html_content)
-        self.assertIn('id="threeContainer"', html_content)
         self.assertIn("recenterBuilding", html_content)
         self.assertIn("centerOnPhone", html_content)
         self.assertIn("drawCADWalls", html_content)
-        self.assertIn("OrbitControls", html_content)
+        self.assertIn("initWebGL", html_content)
+        self.assertIn("rebuild3DScene", html_content)
+        self.assertIn("render3DScene", html_content)
+        self.assertNotIn('<script src="http', html_content)
         self.assertIn("#0c2340", html_content)
 
     def test_15_wall_confidence_and_output_cleanup(self):
