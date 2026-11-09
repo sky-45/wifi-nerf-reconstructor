@@ -84,12 +84,22 @@ class WebServerState:
                 r["has_viewer"] = os.path.exists(viewer_path)
                 r["is_active"] = (env_id == self.active_env)
 
+            # Aggregate unique devices across all environments and active live tracker
+            devices = set()
+            if self.watcher:
+                with self.watcher.lock:
+                    devices.update(self.watcher.latest_poses.keys())
+            for r in self.ranked_environments:
+                for d in r.get("devices", []):
+                    devices.add(d)
+
             return {
                 "active_env": self.active_env,
                 "poll_interval_s": self.watcher.poll_interval_s if self.watcher else 1.0,
                 "is_reconstructing": self.is_reconstructing,
                 "reconstruct_status": self.reconstruct_status,
-                "environments": self.ranked_environments
+                "environments": self.ranked_environments,
+                "devices": sorted(list(devices))
             }
 
     def set_active_environment(self, new_env_id: str):
@@ -244,8 +254,9 @@ def make_request_handler(state: WebServerState):
 
         def _handle_api_live_pose(self, query: Dict[str, list]):
             env_id = query.get("env", [state.active_env])[0]
-            if state.watcher and state.watcher.env_id == env_id:
-                pose = state.watcher.get_latest_pose()
+            device_id = query.get("device", [None])[0]
+            if state.watcher:
+                pose = state.watcher.get_latest_pose(device_id=device_id)
             else:
                 pose = None
                 disk_path = os.path.join(state.output_dir, f"live_pose_{env_id}.json")
@@ -264,7 +275,8 @@ def make_request_handler(state: WebServerState):
                     "x": None,
                     "y": None,
                     "z": None,
-                    "env_id": env_id
+                    "env_id": env_id,
+                    "device_id": device_id
                 })
 
         def _handle_api_status(self):

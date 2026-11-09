@@ -252,7 +252,21 @@ $$\Delta L_{\text{excess}} = \left( \text{RSSI}_{2.4\text{GHz}} - \text{RSSI}_{5
 
 ---
 
-## Quick Start & CLI Usage
+## Quick Start & WebUI Server
+
+### 1. Primary Unified Command (Web Server + Live Reconstruction + Tracking)
+To run the server with all defaults loaded automatically from `.env`:
+```bash
+python3 run.py
+```
+- **Automatic Configuration**: Reads `BLOB_URI` / `OCI_PAR_URL`, `OUTPUT_DIR`, and `PORT` directly from `.env`.
+- **Integrated Pipeline (Command 2 Includes Command 1)**: Automatically discovers all partitions in the bucket, ranks them by completeness score, auto-selects the top physical residence, and automatically triggers floorplan reconstruction if not already built.
+- **Interactive Multi-Device WebUI**: Serves the CAD blueprint and 3D WebGL viewer on `http://localhost:8080`.
+- **Full Reference Documentation**: See [WebUI Telemetry, Controls & Architectural Reference Guide](docs/webui_reference.md) for full descriptions of all HUD metrics, layer toggles, and data streams.
+
+---
+
+## Command Line & Offline Reconstruction
 
 ### 1. Run Complete Test Suite
 ```bash
@@ -305,6 +319,22 @@ python3 -m reconstructor.pipeline \
   --blob-uri ./blob_store \
   --output-dir ./output
 ```
+
+---
+
+## Thin Client Principle & Multi-Floor Altitude Handling
+
+### 1. Thin Client / Thick Server Division of Responsibilities
+To ensure rock-solid stability and battery efficiency on mobile devices:
+- **Mobile (`wifi-nerf-mapper`)**: Pure raw sensor collector. Streamlines raw barometer `pressure_hpa`, step events, and multi-band Wi-Fi scans directly into `fleet/{device_id}/{hf|lf}/`. Does **not** attempt client-side environment clustering, floor guessing, or wall fitting.
+- **Server (`wifi-nerf-reconstructor`)**: Performs all RF graph modularity clustering, barometric hypsometric floor level calculation, multi-device rigid SE(2) trajectory alignment, and neural-radiance / tomography physics inversion.
+
+### 2. Multi-Floor Altitude Physics (Floor 1 vs. Floor 10)
+- **Extreme Inter-Floor RF Attenuation**: Reinforced concrete floor slabs with steel rebar attenuate Wi-Fi signals by $15\text{ dB to }25\text{ dB}$ per slab. Across 10 floors ($>150\text{ dB}$ loss), zero Wi-Fi APs from Floor 1 reach Floor 10. The graph partitions naturally into distinct environments without artificial thresholding.
+- **Barometric Pressure Hypsometry**: For intermediate floors sharing signal bleed, the server evaluates barometric pressure differences:
+  $$\Delta h \approx 8.43 \times (P_{\text{ref}} - P_{\text{raw}}) \quad [\text{meters}]$$
+  $$\text{floor\_index} = \text{round}\left(\frac{\Delta h}{3.0\text{m}}\right) + 1$$
+  Every $3.0\text{m}$ vertical elevation increment maps to a discrete building floor level displayed live in the WebUI.
 
 ---
 

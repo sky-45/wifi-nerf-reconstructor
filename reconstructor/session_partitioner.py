@@ -23,10 +23,13 @@ import numpy as np
 from reconstructor.ap_localizer import MultiApLocalizer
 
 # Regex strictly matching tiered fleet partition hierarchy:
-# e.g., .../fleet/{device_id}/{env_id}/hf/batch_0001.ndjson.gz
-# or fleet/{device_id}/{env_id}/lf/batch_0001.ndjson.gz
+# 1. Standard tiered: fleet/{device_id}/{env_id}/{hf|lf}/batch_{seq}.ndjson.gz
+# 2. Device-centric stream: fleet/{device_id}/{hf|lf}/batch_{seq}.ndjson.gz
 FLEET_PARTITION_REGEX = re.compile(
     r"(?:^|/)fleet/([^/]+)/([^/]+)/(hf|lf)/([^/]+\.(?:ndjson(?:\.gz)?|jsonl(?:\.gz)?))$"
+)
+FLEET_DEVICE_TIER_REGEX = re.compile(
+    r"(?:^|/)fleet/([^/]+)/(hf|lf)/([^/]+\.(?:ndjson(?:\.gz)?|jsonl(?:\.gz)?))$"
 )
 
 # Standard transit naming conventions
@@ -36,15 +39,44 @@ TRANSIT_KEYWORDS = {"transit", "commute", "travel", "driving", "subway", "bus", 
 def parse_fleet_key(object_key: str) -> Optional[Tuple[str, str, str, str]]:
     """
     Parses a storage key or file path into (device_id, env_id, tier, filename).
-    Strictly enforces:
-      - fleet/{device_id}/{env_id}/hf/batch_{seq}.ndjson.gz
-      - fleet/{device_id}/{env_id}/lf/batch_{seq}.ndjson.gz
+    Supports:
+      - fleet/{device_id}/{env_id}/(hf|lf)/batch_{seq}.ndjson.gz (legacy tiered)
+      - fleet/{device_id}/(hf|lf)/batch_{seq}.ndjson.gz (clean device-centric stream)
     """
     normalized = object_key.replace("\\", "/")
     match = FLEET_PARTITION_REGEX.search(normalized)
     if match:
         return match.group(1), match.group(2), match.group(3), match.group(4)
+    m_dev = FLEET_DEVICE_TIER_REGEX.search(normalized)
+    if m_dev:
+        return m_dev.group(1), "raw", m_dev.group(2), m_dev.group(3)
     return None
+
+
+def classify_floor_level(
+    pressure_hpa: Optional[float] = None,
+    z_m: Optional[float] = None,
+    baseline_pressure_hpa: float = 1013.25,
+    floor_height_m: float = 3.0
+) -> Tuple[int, float]:
+    """
+    Server-side algorithm to determine floor level and vertical elevation from raw telemetry:
+    1. If z_m is provided (> 0.05m), uses estimated vertical displacement.
+    2. Else if raw atmospheric pressure_hpa is present, uses the hypsometric formula:
+       delta_z = 8.43 * (baseline_hpa - pressure_hpa).
+    3. Bins elevation into discrete floors: floor_index = round(delta_z / floor_height_m) + 1.
+    Returns (floor_index, elevation_m).
+    """
+    if z_m is not None and abs(z_m) > 0.05:
+        elev = float(z_m)
+    elif pressure_hpa is not None and pressure_hpa > 300.0:
+        delta_p = baseline_pressure_hpa - pressure_hpa
+        elev = delta_p * 8.43
+    else:
+        elev = 0.0
+
+    floor_idx = int(round(elev / floor_height_m)) + 1
+    return max(1, floor_idx), round(elev, 2)
 
 
 class MultiDeviceAligner:
@@ -383,62 +415,121 @@ class SessionPartitioner:
         device_ids: Optional[List[str]] = None
     ) -> Dict[str, List[str]]:
         """
-        Returns {device_id -> [batch_keys]} for the requested environment_id.
+        Returns {device_id -> [batch_keys]} for the requested environment_id or cluster_id.
+        Automatically checks both raw partitions and consolidated macro-space clusters.
         """
         partitions = self.scan_fleet_partitions()
-        if env_id not in partitions:
-            raise FileNotFoundError(f"Environment '{env_id}' not found in fleet partitions.")
+        if env_id in partitions:
+            dev_map = partitions[env_id]
+        else:
+            clusters = self.cluster_environments_by_ap_recurrence(partitions)
+            if env_id in clusters:
+                dev_map = clusters[env_id]["device_batches"]
+            else:
+                matched = False
+                for c_id, c_data in clusters.items():
+                    if c_data.get("canonical_env_id") == env_id or env_id in c_data.get("member_envs", []):
+                        dev_map = c_data["device_batches"]
+                        matched = True
+                        break
+                if not matched:
+                    raise FileNotFoundError(f"Environment '{env_id}' not found in fleet partitions or clusters.")
 
-        dev_map = partitions[env_id]
         if device_ids:
             return {d: keys for d, keys in dev_map.items() if d in device_ids}
         return dev_map
 
     def rank_environments_by_completeness(
         self,
-        partitions: Optional[Dict[str, Dict[str, List[str]]]] = None
+        partitions: Optional[Dict[str, Dict[str, List[str]]]] = None,
+        consolidate: bool = True
     ) -> List[Dict[str, Any]]:
         """
         Ranks all discovered environments by completeness and sample count.
-        Returns a sorted list of dicts with:
-          - env_id: string ID of environment
-          - total_batches: count of all batches
-          - hf_batches: count of high-frequency micro-batches
-          - lf_batches: count of low-frequency architectural scan batches
-          - devices: list of contributing device IDs
-          - is_transit: boolean indicating if transit quarantine applies
-          - transit_reason: explanation string if quarantined
-          - score: numerical completeness score
-          - is_recommended: True for top-ranked stationary environment
+        When consolidate=True, automatically merges fragmented AP-overlapping partitions
+        into unified macro-space physical residences.
         """
         if partitions is None:
             partitions = self.scan_fleet_partitions()
 
         results = []
-        for env_id, dev_map in partitions.items():
-            all_keys = [k for k_list in dev_map.values() for k in k_list]
-            hf_count = sum(1 for k in all_keys if "/hf/" in k)
-            lf_count = sum(1 for k in all_keys if "/lf/" in k)
-            total_batches = len(all_keys)
-            devices = list(dev_map.keys())
 
-            is_transit, reason = self.is_transit_partition(env_id, dev_map)
+        if consolidate:
+            clusters = self.cluster_environments_by_ap_recurrence(partitions)
+            clustered_envs = set()
+            for c_id, c_data in clusters.items():
+                dev_map = c_data["device_batches"]
+                all_keys = [k for k_list in dev_map.values() for k in k_list]
+                hf_count = sum(1 for k in all_keys if "/hf/" in k)
+                lf_count = sum(1 for k in all_keys if "/lf/" in k)
+                total_batches = len(all_keys)
+                devices = list(dev_map.keys())
 
-            # Score: non-transit gets +10000 base score; each LF batch carries high architectural weight
-            # and each HF batch provides high telemetry density
-            score = (0 if is_transit else 10000) + (lf_count * 50) + (hf_count * 2) + (len(devices) * 100)
+                is_transit = False
+                score = 10000 + (lf_count * 50) + (hf_count * 2) + (len(devices) * 100)
+                results.append({
+                    "env_id": c_id,
+                    "canonical_id": c_data.get("canonical_env_id"),
+                    "member_envs": c_data.get("member_envs", []),
+                    "total_batches": total_batches,
+                    "hf_batches": hf_count,
+                    "lf_batches": lf_count,
+                    "devices": devices,
+                    "is_transit": is_transit,
+                    "transit_reason": None,
+                    "score": score,
+                    "is_recommended": False
+                })
+                clustered_envs.update(c_data.get("member_envs", []))
 
-            results.append({
-                "env_id": env_id,
-                "total_batches": total_batches,
-                "hf_batches": hf_count,
-                "lf_batches": lf_count,
-                "devices": devices,
-                "is_transit": is_transit,
-                "transit_reason": reason if is_transit else None,
-                "score": score,
-                "is_recommended": False
-            })
+            # Leftover non-clustered partitions (e.g. transit or solitary environments)
+            for env_id, dev_map in partitions.items():
+                if env_id in clustered_envs:
+                    continue
+                all_keys = [k for k_list in dev_map.values() for k in k_list]
+                hf_count = sum(1 for k in all_keys if "/hf/" in k)
+                lf_count = sum(1 for k in all_keys if "/lf/" in k)
+                total_batches = len(all_keys)
+                devices = list(dev_map.keys())
+                is_transit, reason = self.is_transit_partition(env_id, dev_map)
+                score = (0 if is_transit else 10000) + (lf_count * 50) + (hf_count * 2) + (len(devices) * 100)
+                results.append({
+                    "env_id": env_id,
+                    "canonical_id": env_id,
+                    "member_envs": [env_id],
+                    "total_batches": total_batches,
+                    "hf_batches": hf_count,
+                    "lf_batches": lf_count,
+                    "devices": devices,
+                    "is_transit": is_transit,
+                    "transit_reason": reason if is_transit else None,
+                    "score": score,
+                    "is_recommended": False
+                })
+        else:
+            for env_id, dev_map in partitions.items():
+                all_keys = [k for k_list in dev_map.values() for k in k_list]
+                hf_count = sum(1 for k in all_keys if "/hf/" in k)
+                lf_count = sum(1 for k in all_keys if "/lf/" in k)
+                total_batches = len(all_keys)
+                devices = list(dev_map.keys())
+
+                is_transit, reason = self.is_transit_partition(env_id, dev_map)
+                score = (0 if is_transit else 10000) + (lf_count * 50) + (hf_count * 2) + (len(devices) * 100)
+
+                results.append({
+                    "env_id": env_id,
+                    "canonical_id": env_id,
+                    "member_envs": [env_id],
+                    "total_batches": total_batches,
+                    "hf_batches": hf_count,
+                    "lf_batches": lf_count,
+                    "devices": devices,
+                    "is_transit": is_transit,
+                    "transit_reason": reason if is_transit else None,
+                    "score": score,
+                    "is_recommended": False
+                })
 
         # Sort descending by score
         results.sort(key=lambda x: x["score"], reverse=True)
@@ -474,9 +565,9 @@ class SessionPartitioner:
           }
         """
         if partitions is None:
-            raw_parts = self.scan_fleet_partitions()
-            valid_parts, _ = self.filter_transit_partitions(raw_parts)
-            partitions = valid_parts
+            partitions = self.scan_fleet_partitions()
+        valid_parts, _ = self.filter_transit_partitions(partitions)
+        partitions = valid_parts
 
         if not partitions:
             return {}

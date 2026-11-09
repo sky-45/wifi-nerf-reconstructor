@@ -415,6 +415,86 @@ class TestWifiNerfReconstructor(unittest.TestCase):
             summary = state.get_environments_summary()
             self.assertEqual(summary["active_env"], self.env_id)
             self.assertEqual(len(summary["environments"]), len(ranked))
+            self.assertIn("devices", summary)
+            self.assertIn("device_alice", summary["devices"])
+            self.assertIn("device_bob", summary["devices"])
+
+    def test_18_device_tier_partitioning_and_altitude_floor_classification(self):
+        from reconstructor.session_partitioner import parse_fleet_key, classify_floor_level
+
+        # Test streamlined 4-part device-centric path: (dev_id, env_id, tier, filename)
+        parsed_4 = parse_fleet_key("fleet/phone_98ee358e/hf/batch_000123.ndjson.gz")
+        self.assertIsNotNone(parsed_4)
+        self.assertEqual(parsed_4[0], "phone_98ee358e")
+        self.assertEqual(parsed_4[1], "raw")
+        self.assertEqual(parsed_4[2], "hf")
+        self.assertEqual(parsed_4[3], "batch_000123.ndjson.gz")
+
+        # Test legacy 5-part path: (dev_id, env_id, tier, filename)
+        parsed_5 = parse_fleet_key("fleet/phone_98ee358e/env_7f6d8ba9/lf/batch_000456.ndjson.gz")
+        self.assertIsNotNone(parsed_5)
+        self.assertEqual(parsed_5[0], "phone_98ee358e")
+        self.assertEqual(parsed_5[1], "env_7f6d8ba9")
+        self.assertEqual(parsed_5[2], "lf")
+        self.assertEqual(parsed_5[3], "batch_000456.ndjson.gz")
+
+        # Test Floor Classification from Z elevation: (floor_idx, elev_m)
+        f1_idx, f1_z = classify_floor_level(z_m=0.2)
+        self.assertEqual(f1_idx, 1)
+        self.assertAlmostEqual(f1_z, 0.2, places=1)
+
+        f4_idx, f4_z = classify_floor_level(z_m=9.1)
+        self.assertEqual(f4_idx, 4)
+
+        f10_idx, f10_z = classify_floor_level(z_m=27.4)
+        self.assertEqual(f10_idx, 10)
+
+        # Test Floor Classification from Barometric Pressure (hypsometric formula)
+        # Standard sea level: 1013.25 hPa -> Floor 1
+        fp1_idx, _ = classify_floor_level(pressure_hpa=1013.25, baseline_pressure_hpa=1013.25)
+        self.assertEqual(fp1_idx, 1)
+
+        # ~1.07 hPa drop corresponds to ~9m elevation -> Floor 4
+        fp4_idx, _ = classify_floor_level(pressure_hpa=1012.18, baseline_pressure_hpa=1013.25)
+        self.assertEqual(fp4_idx, 4)
+
+        # ~3.2 hPa drop corresponds to ~27m elevation (Floor 10)
+        fp10_idx, _ = classify_floor_level(pressure_hpa=1010.05, baseline_pressure_hpa=1013.25)
+        self.assertEqual(fp10_idx, 10)
+
+    def test_19_multi_device_live_watcher_and_telemetry(self):
+        from reconstructor.live_tracker import LiveBucketWatcher
+        with tempfile.TemporaryDirectory() as tmp_out:
+            watcher = LiveBucketWatcher(
+                blob_uri=self.fleet_dir,
+                env_id=self.env_id,
+                output_dir=tmp_out,
+                auto_reconstruct=False
+            )
+            # Simulate multi-device pose ingestion
+            watcher.latest_poses["device_alice"] = {
+                "x": 2.5, "y": 4.0, "z": 0.0, "yaw_deg": 45.0, "speed_mps": 0.8,
+                "device_id": "device_alice", "status": "CLEAR"
+            }
+            watcher.latest_poses["device_bob"] = {
+                "x": 6.8, "y": 7.2, "z": 9.0, "yaw_deg": 180.0, "speed_mps": 0.0,
+                "device_id": "device_bob", "status": "CLEAR"
+            }
+
+            # Query all (fleet)
+            pose_all = watcher.get_latest_pose()
+            self.assertIsNotNone(pose_all)
+            self.assertIn("fleet", pose_all)
+            self.assertEqual(len(pose_all["fleet"]), 2)
+            self.assertIn("device_alice", pose_all["fleet"])
+            self.assertIn("device_bob", pose_all["fleet"])
+
+            # Query specific device
+            pose_bob = watcher.get_latest_pose(device_id="device_bob")
+            self.assertIsNotNone(pose_bob)
+            self.assertEqual(pose_bob["device_id"], "device_bob")
+            self.assertEqual(pose_bob["x"], 6.8)
+            self.assertEqual(pose_bob["z"], 9.0)
 
 if __name__ == "__main__":
     unittest.main()

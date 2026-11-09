@@ -265,9 +265,14 @@ def generate_interactive_html_viewer(
 
   <div id="viewport-container">
     <div id="top-bar">
-      <div style="display: flex; align-items: center; gap: 10px;">
-        <span style="font-weight: 700; color: #38bdf8; font-size: 13px;">Space:</span>
-        <select id="env-select" style="background:#0d2238; color:#38bdf8; font-weight:600; border:1px solid #0284c7; padding:4px 8px; border-radius:4px; font-size:12px; cursor:pointer;" onchange="onEnvironmentSelected(this.value)">
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span style="font-weight: 700; color: #10b981; font-size: 12px;">📱 UE:</span>
+        <select id="ue-select" style="background:#052e16; color:#22c55e; font-weight:600; border:1px solid #16a34a; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;" onchange="onUeSelected(this.value)" title="Switch active tracking device">
+          <option value="all">👥 Fleet: All UEs</option>
+          <option value="phone_1" selected>📱 Active UE</option>
+        </select>
+        <span style="font-weight: 600; color: #64748b; font-size: 11px; margin-left: 2px;">Space:</span>
+        <select id="env-select" style="background:#0d2238; color:#38bdf8; font-weight:600; border:1px solid #0284c7; padding:4px 8px; border-radius:4px; font-size:11px; cursor:pointer;" onchange="onEnvironmentSelected(this.value)">
           <option value="{session_id}">{session_id}</option>
         </select>
         <button class="btn btn-secondary" style="padding:4px 8px; font-size:11px;" onclick="triggerReconstruct()" id="btn-reconstruct" title="Re-analyze all Wi-Fi scans and rebuild floorplan">🔄 Reconstruct</button>
@@ -307,8 +312,9 @@ def generate_interactive_html_viewer(
           <div>Coords: <span id="hud-coords" style="color: #f8fafc; font-family: monospace;">--</span></div>
           <div>Heading: <span id="hud-yaw" style="color: #f8fafc; font-weight: 600;">--</span></div>
           <div>Speed: <span id="hud-speed" style="color: #f8fafc;">--</span></div>
+          <div>Level: <span id="hud-floor" style="color: #a78bfa; font-weight: 700;">Floor 1 (0.0m)</span></div>
           <div>Nearest Wall: <span id="hud-nearest" style="color: #38bdf8; font-weight: 700;">--</span></div>
-          <div>Survey Prog: <span id="hud-pct" style="color: #f8fafc;">--</span></div>
+          <div style="grid-column: span 2;">Survey Prog: <span id="hud-pct" style="color: #f8fafc;">--</span></div>
         </div>
       </div>
 
@@ -419,6 +425,9 @@ def generate_interactive_html_viewer(
       DEVICE_MAP['phone_1'] = FULL_SLAM_POINTS;
       DEVICE_KEYS.push('phone_1');
     }}
+
+    let selectedDeviceId = 'all';
+    let liveFleetPoses = {{}};
 
     let isPlaying = false;
     let playbackPct = 1.0;
@@ -1202,21 +1211,41 @@ def generate_interactive_html_viewer(
 
       const activePoses = [];
       if (isLiveMode) {{
-        if (typeof currentPhonePos.x === 'number') {{
+        const fleetKeys = Object.keys(liveFleetPoses);
+        if (selectedDeviceId === 'all' && fleetKeys.length > 0) {{
+          fleetKeys.forEach((dId, idx) => {{
+            const p = liveFleetPoses[dId];
+            activePoses.push({{
+              ...p,
+              color: DEVICE_COLORS[idx % DEVICE_COLORS.length],
+              isFocused: (idx === 0)
+            }});
+          }});
+        }} else if (selectedDeviceId !== 'all' && liveFleetPoses[selectedDeviceId]) {{
+          const p = liveFleetPoses[selectedDeviceId];
+          activePoses.push({{
+            ...p,
+            color: DEVICE_COLORS[0],
+            isFocused: true
+          }});
+        }} else if (typeof currentPhonePos.x === 'number') {{
           activePoses.push({{
             ...currentPhonePos,
-            color: DEVICE_COLORS[0]
+            color: DEVICE_COLORS[0],
+            isFocused: true
           }});
         }}
       }} else {{
         DEVICE_KEYS.forEach((devKey, dIdx) => {{
+          if (selectedDeviceId !== 'all' && devKey !== selectedDeviceId) return;
           const pts = DEVICE_MAP[devKey];
           if (!pts || pts.length === 0) return;
           const pose = getInterpolatedPose(pts, playbackPct);
           if (pose) {{
             activePoses.push({{
               ...pose,
-              color: DEVICE_COLORS[dIdx % DEVICE_COLORS.length]
+              color: DEVICE_COLORS[dIdx % DEVICE_COLORS.length],
+              isFocused: (selectedDeviceId === devKey || (selectedDeviceId === 'all' && dIdx === 0))
             }});
           }}
         }});
@@ -1226,8 +1255,8 @@ def generate_interactive_html_viewer(
         const color = pose.color || DEVICE_COLORS[0];
         const phoneP = cadWorldToScreen(pose.x, pose.y);
 
-        // 1. Proximity Halo & Dynamic Lasers
-        if (document.getElementById('layer-proximity').checked) {{
+        // 1. Proximity Halo & Dynamic Lasers (only for focused device to keep view clear)
+        if (pose.isFocused && document.getElementById('layer-proximity').checked) {{
           const wallDistances = [];
           WALLS.forEach((w, wIdx) => {{
             if ((w.confidence || 0.7) >= minConfidence) {{
@@ -1295,16 +1324,18 @@ def generate_interactive_html_viewer(
         // Note: North (+wy) is screen UP (-Y), so canvas rotation angle is -yaw
         dynamicCtx.rotate(-pose.yaw);
 
-        // Flashlight Cone
-        const coneGrad = dynamicCtx.createRadialGradient(0, 0, 4, 0, 0, 40);
-        coneGrad.addColorStop(0, 'rgba(56, 189, 248, 0.4)');
-        coneGrad.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
-        dynamicCtx.beginPath();
-        dynamicCtx.moveTo(0, 0);
-        dynamicCtx.arc(0, 0, 40, -Math.PI / 6, Math.PI / 6);
-        dynamicCtx.closePath();
-        dynamicCtx.fillStyle = coneGrad;
-        dynamicCtx.fill();
+        // Flashlight Cone for focused device
+        if (pose.isFocused) {{
+          const coneGrad = dynamicCtx.createRadialGradient(0, 0, 4, 0, 0, 40);
+          coneGrad.addColorStop(0, 'rgba(56, 189, 248, 0.4)');
+          coneGrad.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
+          dynamicCtx.beginPath();
+          dynamicCtx.moveTo(0, 0);
+          dynamicCtx.arc(0, 0, 40, -Math.PI / 6, Math.PI / 6);
+          dynamicCtx.closePath();
+          dynamicCtx.fillStyle = coneGrad;
+          dynamicCtx.fill();
+        }}
 
         // Phone body
         dynamicCtx.fillStyle = color;
@@ -1321,6 +1352,15 @@ def generate_interactive_html_viewer(
         dynamicCtx.fillStyle = '#ffffff';
         dynamicCtx.fillRect(-2, -9, 4, 1.5);
 
+        dynamicCtx.restore();
+
+        // 3. Floating Device Label Tag
+        const devName = pose.device ? (pose.device.length > 8 ? pose.device.substring(0, 8) : pose.device) : 'UE';
+        dynamicCtx.save();
+        dynamicCtx.font = 'bold 9px monospace';
+        dynamicCtx.textAlign = 'center';
+        dynamicCtx.fillStyle = color;
+        dynamicCtx.fillText(`📱 ${{devName}}`, phoneP.x, phoneP.y - 14);
         dynamicCtx.restore();
       }});
     }}
@@ -1931,6 +1971,13 @@ def generate_interactive_html_viewer(
           }}
         }});
 
+        const floorEl = document.getElementById('hud-floor');
+        if (floorEl) {{
+          const zVal = (currentPhonePos && typeof currentPhonePos.z === 'number') ? currentPhonePos.z : 0.0;
+          const floorNum = Math.round(zVal / 3.0) + 1;
+          floorEl.textContent = `Floor ${{floorNum}} (${{zVal.toFixed(1)}}m)`;
+        }}
+
         const statusEl = document.getElementById('hud-status');
         const nearEl = document.getElementById('hud-nearest');
         const pctEl = document.getElementById('hud-pct');
@@ -2003,6 +2050,13 @@ def generate_interactive_html_viewer(
             const speedVal = (typeof pose.speed === 'number' && !isNaN(pose.speed)) ? pose.speed.toFixed(2) : '0.00';
             const speedEl = document.getElementById('hud-speed');
             if (speedEl) speedEl.textContent = `${{speedVal}} m/s`;
+
+            const floorEl = document.getElementById('hud-floor');
+            if (floorEl) {{
+              const zVal = (typeof pose.z === 'number') ? pose.z : 0.0;
+              const floorNum = Math.round(zVal / 3.0) + 1;
+              floorEl.textContent = `Floor ${{floorNum}} (${{zVal.toFixed(1)}}m)`;
+            }}
 
             const pctEl = document.getElementById('hud-pct');
             if (pctEl) pctEl.textContent = `${{Math.round(playbackPct * 100)}}%`;
@@ -2098,7 +2152,7 @@ def generate_interactive_html_viewer(
     }}
 
     // =========================================================================
-    // REAL-TIME REST CLIENT & DYNAMIC ENVIRONMENT SWITCHER
+    // REAL-TIME REST CLIENT, MULTI-UE FLEET & DYNAMIC ENVIRONMENT SWITCHER
     // =========================================================================
     let liveTimer = null;
     let livePollIntervalMs = 1000;
@@ -2106,11 +2160,41 @@ def generate_interactive_html_viewer(
     let isLiveStreaming = true;
     let livePose = null;
 
+    function onUeSelected(devId) {{
+      selectedDeviceId = devId;
+      const devEl = document.getElementById('hud-device');
+      if (devEl) {{
+        devEl.textContent = devId === 'all' ? 'Fleet (All UEs)' : devId;
+      }}
+      if (devId !== 'all' && liveFleetPoses[devId]) {{
+        applyLivePose(liveFleetPoses[devId]);
+      }} else {{
+        pollLivePose();
+      }}
+      drawDynamicScene();
+    }}
+
     async function initLiveClient() {{
+      // 1. Fallback initialization from offline DEVICE_KEYS
+      const ueSelect = document.getElementById('ue-select');
+      if (ueSelect && DEVICE_KEYS.length > 0) {{
+        ueSelect.innerHTML = '<option value="all">👥 Fleet: All UEs</option>';
+        DEVICE_KEYS.forEach(k => {{
+          const opt = document.createElement('option');
+          opt.value = k;
+          const shortId = k.length > 12 ? k.substring(0, 12) + '...' : k;
+          opt.textContent = `📱 ${{shortId}}`;
+          ueSelect.appendChild(opt);
+        }});
+      }}
+
+      // 2. Fetch live environments & discovered devices from REST API
       try {{
         const resp = await fetch('/api/environments');
         if (resp.ok) {{
           const data = await resp.json();
+
+          // Populate Environments
           const select = document.getElementById('env-select');
           if (select && data.environments && data.environments.length > 0) {{
             select.innerHTML = '';
@@ -2132,6 +2216,23 @@ def generate_interactive_html_viewer(
               if (pollSel) pollSel.value = String(data.poll_interval_s);
             }}
           }}
+
+          // Populate Discovered UEs / Devices
+          if (ueSelect && data.devices && data.devices.length > 0) {{
+            ueSelect.innerHTML = '<option value="all">👥 Fleet: All UEs</option>';
+            data.devices.forEach(dev => {{
+              const opt = document.createElement('option');
+              opt.value = dev;
+              const shortId = dev.length > 12 ? dev.substring(0, 12) + '...' : dev;
+              opt.textContent = `📱 ${{shortId}}`;
+              if (dev === selectedDeviceId) opt.selected = true;
+              ueSelect.appendChild(opt);
+            }});
+            if (data.devices.length === 1 && selectedDeviceId === 'all') {{
+              selectedDeviceId = data.devices[0];
+              ueSelect.value = selectedDeviceId;
+            }}
+          }}
         }}
       }} catch (e) {{
         console.warn('Standalone viewer mode (no local REST server active):', e);
@@ -2149,7 +2250,11 @@ def generate_interactive_html_viewer(
     async function pollLivePose() {{
       if (!isLiveStreaming) return;
       try {{
-        const resp = await fetch(`/api/live-pose?env=${{encodeURIComponent(activeEnvId)}}`);
+        let url = `/api/live-pose?env=${{encodeURIComponent(activeEnvId)}}`;
+        if (selectedDeviceId && selectedDeviceId !== 'all') {{
+          url += `&device=${{encodeURIComponent(selectedDeviceId)}}`;
+        }}
+        const resp = await fetch(url);
         if (!resp.ok) return;
         const data = await resp.json();
         if (data && typeof data.x === 'number') {{
@@ -2165,12 +2270,40 @@ def generate_interactive_html_viewer(
       if (!pose || typeof pose.x !== 'number') return;
       isLiveMode = true;
 
-      targetPhonePos.x = pose.x;
-      targetPhonePos.y = pose.y;
-      targetPhonePos.z = typeof pose.z === 'number' ? pose.z : 1.1;
-      targetPhonePos.yaw = (Number(pose.yaw_deg) || 0) * Math.PI / 180.0;
-      targetPhonePos.speed = Number(pose.speed_mps) || 0.0;
-      if (pose.device_id) targetPhonePos.device = pose.device_id;
+      // Ingest fleet telemetry
+      if (pose.fleet) {{
+        Object.entries(pose.fleet).forEach(([dId, dPose]) => {{
+          if (typeof dPose.x === 'number') {{
+            liveFleetPoses[dId] = {{
+              x: dPose.x,
+              y: dPose.y,
+              z: typeof dPose.z === 'number' ? dPose.z : 1.1,
+              yaw: (Number(dPose.yaw_deg) || 0) * Math.PI / 180.0,
+              speed: Number(dPose.speed_mps) || 0.0,
+              device: dId,
+              floor: dPose.floor
+            }};
+            if (!DEVICE_KEYS.includes(dId)) {{
+              DEVICE_KEYS.push(dId);
+              DEVICE_MAP[dId] = [];
+            }}
+          }}
+        }});
+      }}
+
+      let activePose = pose;
+      if (selectedDeviceId !== 'all' && liveFleetPoses[selectedDeviceId]) {{
+        activePose = liveFleetPoses[selectedDeviceId];
+      }}
+
+      targetPhonePos.x = activePose.x;
+      targetPhonePos.y = activePose.y;
+      targetPhonePos.z = typeof activePose.z === 'number' ? activePose.z : 1.1;
+      targetPhonePos.yaw = (Number(activePose.yaw_deg) || (activePose.yaw ? activePose.yaw * 180.0 / Math.PI : 0)) * Math.PI / 180.0;
+      targetPhonePos.speed = Number(activePose.speed_mps) || 0.0;
+      if (activePose.device_id || activePose.device) {{
+        targetPhonePos.device = activePose.device_id || activePose.device;
+      }}
 
       if (!isTargetPoseInitialized) {{
         currentPhonePos.x = targetPhonePos.x;
@@ -2189,7 +2322,7 @@ def generate_interactive_html_viewer(
 
       const yawEl = document.getElementById('hud-yaw');
       if (yawEl) {{
-        let deg = Math.round(Number(pose.yaw_deg) || 0) % 360;
+        let deg = Math.round(Number(activePose.yaw_deg || (activePose.yaw * 180 / Math.PI)) || 0) % 360;
         if (deg < 0) deg += 360;
         const cardinals = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'];
         const cardIdx = Math.round(deg / 45) % 8;
@@ -2200,7 +2333,17 @@ def generate_interactive_html_viewer(
       if (speedEl) speedEl.textContent = `${{targetPhonePos.speed.toFixed(2)}} m/s`;
 
       const devEl = document.getElementById('hud-device');
-      if (devEl) devEl.textContent = targetPhonePos.device;
+      if (devEl) {{
+        const dText = selectedDeviceId === 'all' ? `Fleet (${{targetPhonePos.device}})` : targetPhonePos.device;
+        devEl.textContent = dText;
+      }}
+
+      const floorEl = document.getElementById('hud-floor');
+      if (floorEl) {{
+        const zVal = targetPhonePos.z || 0.0;
+        const floorNum = (activePose.floor !== undefined) ? activePose.floor : (Math.round(zVal / 3.0) + 1);
+        floorEl.textContent = `Floor ${{floorNum}} (${{zVal.toFixed(1)}}m)`;
+      }}
 
       // NOTE: hud-status, hud-nearest, hud-pct are kept completely stable and not touched during live ticks!
 

@@ -227,6 +227,7 @@ class LiveBucketWatcher:
         self.seen_batch_keys: Set[str] = set()
         self.lock = threading.Lock()
         self.latest_pose: Optional[Dict[str, Any]] = None
+        self.latest_poses: Dict[str, Dict[str, Any]] = {}
 
         # If env_id is omitted, auto-discover and select recommended environment
         if not env_id:
@@ -259,18 +260,30 @@ class LiveBucketWatcher:
             self.poll_interval_s = max(0.2, float(new_interval_s))
             print(f"[*] Updated live polling interval: {self.poll_interval_s}s")
 
-    def get_latest_pose(self) -> Optional[Dict[str, Any]]:
-        """Returns the most recent EKF-filtered pose."""
+    def get_latest_pose(self, device_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """Returns the most recent EKF-filtered pose for a specific device or the fleet."""
         with self.lock:
-            if self.latest_pose:
-                return dict(self.latest_pose)
+            target = None
+            if device_id and device_id in self.latest_poses:
+                target = dict(self.latest_poses[device_id])
+            elif self.latest_pose:
+                target = dict(self.latest_pose)
+            elif self.latest_poses:
+                target = dict(next(iter(self.latest_poses.values())))
+
+            if target:
+                target["fleet"] = {d: dict(p) for d, p in self.latest_poses.items()}
+                return target
 
         # Fallback to reading disk
         disk_path = os.path.join(self.output_dir, f"live_pose_{self.env_id}.json")
         if os.path.exists(disk_path):
             try:
                 with open(disk_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    disk_pose = json.load(f)
+                    if disk_pose:
+                        disk_pose["fleet"] = {disk_pose.get("device_id", "phone_1"): disk_pose}
+                    return disk_pose
             except Exception:
                 pass
         return None
@@ -371,8 +384,11 @@ class LiveBucketWatcher:
                 print(f"[-] Error processing batch {key}: {e}")
 
         if new_poses:
-            latest = new_poses[-1]
             with self.lock:
+                for p in new_poses:
+                    dev = p.get("device_id", "phone_1")
+                    self.latest_poses[dev] = p
+                latest = new_poses[-1]
                 self.latest_pose = latest
             self._write_live_state(latest, curr_env)
             wall_str = f"{latest['nearest_wall_m']}m ({latest['nearest_wall_id']})" if latest['nearest_wall_m'] else "None"
