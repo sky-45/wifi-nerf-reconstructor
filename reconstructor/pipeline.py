@@ -30,6 +30,38 @@ from reconstructor.unlabeled_evaluator import UnlabeledEvaluator
 from reconstructor.config import DEFAULT_CONFIG, ReconstructorConfig, get_default_config
 from viewer.viewer_generator import generate_interactive_html_viewer, export_geojson
 
+def clean_output_directory(output_dir: str, target_id: Optional[str] = None, purge_all: bool = False) -> List[str]:
+    """
+    Cleans old output files (HTML, GeoJSON, JSON manifests, and grids) in output_dir.
+    If target_id is specified, cleans prior files matching f"*_{target_id}.*".
+    If purge_all is True, cleans all *.html, *.geojson, *.json, *.npy files in output_dir.
+    """
+    if not os.path.exists(output_dir):
+        return []
+
+    removed = []
+    for fname in os.listdir(output_dir):
+        fpath = os.path.join(output_dir, fname)
+        if not os.path.isfile(fpath):
+            continue
+
+        should_remove = False
+        if purge_all and fname.endswith((".html", ".geojson", ".json", ".npy")):
+            should_remove = True
+        elif target_id and target_id in fname and fname.endswith((".html", ".geojson", ".json", ".npy")):
+            should_remove = True
+
+        if should_remove:
+            try:
+                os.remove(fpath)
+                removed.append(fpath)
+            except OSError:
+                pass
+
+    if removed:
+        print(f"[Cleanup] Cleaned {len(removed)} old output file(s) for target '{target_id or 'all'}' in {output_dir}")
+    return removed
+
 def _normalize_spatial_bounds(
     events: List[Dict[str, Any]],
     raw_traj: List[List[float]],
@@ -140,7 +172,9 @@ def run_reconstruction_pipeline(
     resolution_m: float = 0.20,
     device_ids: Optional[List[str]] = None,
     config: Optional[ReconstructorConfig] = None,
-    device: Optional[str] = None
+    device: Optional[str] = None,
+    clean: bool = True,
+    clean_all: bool = False
 ) -> Dict[str, Any]:
     os.makedirs(output_dir, exist_ok=True)
     cfg = config or DEFAULT_CONFIG
@@ -170,6 +204,12 @@ def run_reconstruction_pipeline(
             env_id = target_id
         else:
             target_id = "demo_apartment_01"
+
+    # Clean old output files for target session
+    if clean_all:
+        clean_output_directory(output_dir, purge_all=True)
+    elif clean:
+        clean_output_directory(output_dir, target_id=target_id)
 
     print("=" * 75)
     print(f"[*] Starting Cloud Floorplan Reconstruction: Target={target_id}")
@@ -308,11 +348,18 @@ def run_reconstruction_pipeline(
     vectorizer = FloorplanVectorizer(res_m)
     non_zeros = final_grid[final_grid > 0.05]
     adaptive_thresh = float(np.percentile(non_zeros, cfg.wall_threshold_percentile)) if len(non_zeros) > 10 else 0.5
-    floorplan = vectorizer.vectorize(final_grid, free_mask, doorways, wall_threshold_db=adaptive_thresh)
+    floorplan = vectorizer.vectorize(
+        final_grid,
+        free_mask,
+        doorways,
+        wall_threshold_db=adaptive_thresh,
+        ray_data=ray_data
+    )
     print(f"          Extracted {len(floorplan['walls'])} CAD wall segments.")
     print(f"          Identified {len(floorplan['rooms'])} distinct rooms:")
     for r in floorplan["rooms"]:
-        print(f"            - {r['name']}: Area={r['area_m2']} m² Centroid=({r['centroid_x']}m, {r['centroid_y']}m)")
+        dims_str = f" ({r.get('dimensions_m', '')})" if r.get('dimensions_m') else ""
+        print(f"            - {r['name']}: Area={r['area_m2']} m²{dims_str} Centroid=({r['centroid_x']}m, {r['centroid_y']}m)")
 
     # -------------------------------------------------------------------------
     # Stage 5: Zero-Label Evaluation Suite
@@ -371,7 +418,8 @@ def run_reconstruction_pipeline(
         eval_metrics=metrics,
         raw_trajectory=raw_traj,
         slam_trajectory=slam_traj,
-        grid_heatmap=final_grid.tolist()
+        grid_heatmap=final_grid.tolist(),
+        ray_density_map=floorplan.get("ray_density_map")
     )
     with open(viewer_path, "w", encoding="utf-8") as f:
         f.write(html_content)
@@ -718,6 +766,8 @@ if __name__ == "__main__":
     parser.add_argument("--tv", type=float, default=None, help="FISTA Total Variation regularization")
     parser.add_argument("--wall-percentile", type=float, default=None, help="Wall extraction threshold percentile")
     parser.add_argument("--carve-radius", type=float, default=None, help="Free-space trajectory carver radius (m)")
+    parser.add_argument("--clean", action="store_true", default=True, help="Automatically clean prior output files for target environment")
+    parser.add_argument("--clean-all", action="store_true", default=False, help="Purge all prior output files in output-dir before running")
 
     args = parser.parse_args()
 
@@ -786,5 +836,7 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         device_ids=args.devices,
         config=cfg,
-        device=args.device
+        device=args.device,
+        clean=args.clean,
+        clean_all=args.clean_all
     )

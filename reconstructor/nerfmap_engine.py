@@ -485,11 +485,23 @@ class NeRFMapEngine:
 
                 # Optional learned antenna pattern
                 antenna_net = DirectionalAntennaPattern().to(self.torch_device) if learn_antenna_pattern else None
-                params = list(mlp.parameters())
-                if antenna_net:
-                    params.extend(list(antenna_net.parameters()))
 
-                optimizer = torch.optim.Adam(params, lr=lr)
+                if model_type == "hashgrid":
+                    # Instant-NGP two-group optimizer: higher lr for hash tables, regular lr for MLP trunk
+                    table_params = list(mlp.encoder.parameters())
+                    trunk_params = list(mlp.trunk.parameters())
+                    if antenna_net:
+                        trunk_params.extend(list(antenna_net.parameters()))
+                    optimizer = torch.optim.Adam([
+                        {"params": table_params, "lr": 0.05, "weight_decay": 1e-5},
+                        {"params": trunk_params, "lr": lr}
+                    ])
+                else:
+                    params = list(mlp.parameters())
+                    if antenna_net:
+                        params.extend(list(antenna_net.parameters()))
+                    optimizer = torch.optim.Adam(params, lr=lr)
+
                 tomo_target = torch.from_numpy(self.grid).float().to(self.torch_device).view(-1, 1)
 
                 free_mask_t = None

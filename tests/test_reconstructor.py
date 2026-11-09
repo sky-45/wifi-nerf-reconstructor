@@ -287,6 +287,68 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         self.assertIn("haloRadius", html_content)
         self.assertIn("layer-proximity", html_content)
         self.assertIn("telemetry-hud", html_content)
+        # Verify wall certainty filter slider and wall inspector
+        self.assertIn('id="slider-wall-conf"', html_content)
+        self.assertIn('id="wall-inspector"', html_content)
+        self.assertIn('id="layer-coverage"', html_content)
+        self.assertIn('id="layer-labels"', html_content)
+
+    def test_15_wall_confidence_and_output_cleanup(self):
+        from reconstructor.pipeline import clean_output_directory
+        import tempfile
+
+        # Test 1: Wall Confidence Calculation
+        vectorizer = FloorplanVectorizer(resolution_m=0.25)
+        grid = np.zeros((24, 32), dtype=np.float32)
+        grid[10:16, 12] = 8.5 # Concrete/Drywall ridge
+        free_mask = np.zeros((24, 32), dtype=bool)
+
+        # Cross-cutting simulated rays
+        ray_data = [
+            (2.0, 3.0, 4.0, 3.0, 6.0),
+            (2.0, 3.2, 4.0, 3.2, 6.2),
+            (2.0, 3.5, 4.0, 3.5, 5.8)
+        ]
+
+        floorplan = vectorizer.vectorize(
+            grid,
+            free_mask,
+            doorways=[],
+            wall_threshold_db=2.0,
+            ray_data=ray_data
+        )
+
+        self.assertGreater(len(floorplan["walls"]), 0)
+        wall0 = floorplan["walls"][0]
+        self.assertIn("confidence", wall0)
+        self.assertIn("classification", wall0)
+        self.assertIn("material_guess", wall0)
+        self.assertIn("ray_hits", wall0)
+        self.assertGreaterEqual(wall0["confidence"], 0.05)
+        self.assertLessEqual(wall0["confidence"], 1.0)
+        self.assertIn("ray_density_map", floorplan)
+
+        # Test 2: Output Cleanup
+        with tempfile.TemporaryDirectory() as tmp_out:
+            # Create target files and unrelated file
+            t1 = os.path.join(tmp_out, "viewer_test_target.html")
+            t2 = os.path.join(tmp_out, "floorplan_test_target.geojson")
+            t3 = os.path.join(tmp_out, "viewer_other_target.html")
+            for p in [t1, t2, t3]:
+                with open(p, "w") as f:
+                    f.write("content")
+
+            # Clean target files only
+            removed = clean_output_directory(tmp_out, target_id="test_target")
+            self.assertEqual(len(removed), 2)
+            self.assertFalse(os.path.exists(t1))
+            self.assertFalse(os.path.exists(t2))
+            self.assertTrue(os.path.exists(t3))
+
+            # Clean all
+            removed_all = clean_output_directory(tmp_out, purge_all=True)
+            self.assertEqual(len(removed_all), 1)
+            self.assertFalse(os.path.exists(t3))
 
 if __name__ == "__main__":
     unittest.main()

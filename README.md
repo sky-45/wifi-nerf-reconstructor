@@ -358,3 +358,24 @@ The interactive browser dashboard (`output/viewer_*.html`) uses a zero-lag **Dua
    - **Dynamic Laser Rangefinder Rays**: Casts real-time dashed rays to the 4 nearest CAD walls within 3.0 meters with floating distance tags (e.g. `0.78m`).
    - **Proximity Clearance Halo**: 0.35m radial safety buffer color-coded green (`> 0.8m`), amber (`0.4 - 0.8m`), and red (`<= 0.35m`).
    - **Real-Time HUD**: Displays coordinates, nearest wall clearance, compass heading, and walking speed throttled to 16 Hz.
+3. **Wall Certainty Filter Slider**:
+   - Live range slider in sidebar (`≥ 35%` default): adjusts the minimum confidence threshold in real time to filter out phantom artifacts and speculative noise.
+   - **Visual Wall Tiers**:
+     - **― Solid Bold Cyan (≥ 70%)**: Confirmed structural wall supported by multiple high-angle cross-cutting rays.
+     - **╌ Dashed Amber (40–69%)**: Probable drywall partition or interior barrier.
+     - **··· Dotted Gray (< 40%)**: Speculative shadow or RF diffraction artifact.
+4. **Interactive Wall Inspector Card**:
+   - Hovering or clicking any wall displays an instant floating inspector card detailing:
+     - Certainty Score (e.g. `88%`) & Classification Badge
+     - Wall Length ($m$) and Attenuation ($\text{dB/m}$)
+     - Material Classification (Drywall, Single/Double Gypsum, Brick/Concrete)
+     - Intersecting Ray Count & Angular Diversity ($^\circ$)
+5. **Survey Ray Coverage (Observability) Layer**:
+   - Toggleable density map showing where the phone surveyed thoroughly (emerald/amber) vs unobserved blind spots (dark blue/black).
+6. **Automated Output Cleanup**:
+   - Automatically unlinks and replaces prior `.html`, `.geojson`, `.json`, and `.npy` artifacts for target sessions before generating fresh runs:
+     ```bash
+     python3 -m reconstructor.pipeline --env-id cluster_env_79f11c4a701db8a1 --clean
+     # Or purge all previous output files:
+     python3 -m reconstructor.pipeline --env-id cluster_env_79f11c4a701db8a1 --clean-all
+     ```
