@@ -386,6 +386,7 @@ def generate_interactive_html_viewer(
         y: Number(pt.y) || 0,
         z: pt.z !== undefined ? Number(pt.z) : 1.1,
         yaw: Number(pt.yaw) || 0,
+        speed: Number(pt.speed) || 0.0,
         ts: Number(pt.ts) || idx * 500,
         device: String(pt.device || 'phone_1')
       }}));
@@ -502,49 +503,70 @@ def generate_interactive_html_viewer(
         drawDynamicScene();
       }} else if (mode === '3D') {{
         modeBadge.textContent = '3D Orbit';
-        initWebGL();
-        canvas3D.style.display = 'block';
         canvasStatic.style.display = 'none';
         canvasDynamic.style.display = 'none';
+        canvas3D.style.display = 'block';
         povReticle.style.display = 'none';
         hintEl.textContent = 'Left Drag: Orbit 360° | Right Drag: Pan | Wheel: Zoom';
+        initWebGL();
+        const pw = canvas3D.parentElement ? canvas3D.parentElement.clientWidth : 0;
+        const ph = canvas3D.parentElement ? canvas3D.parentElement.clientHeight : 0;
+        if (pw > 0 && ph > 0) {{
+          canvas3D.width = pw;
+          canvas3D.height = ph;
+        }}
+        if (gl) {{
+          rebuild3DScene();
+          render3DScene();
+        }}
       }} else if (mode === 'POV') {{
         modeBadge.textContent = 'Walkthrough POV';
-        initWebGL();
-        canvas3D.style.display = 'block';
         canvasStatic.style.display = 'none';
         canvasDynamic.style.display = 'none';
+        canvas3D.style.display = 'block';
         povReticle.style.display = 'block';
         hintEl.textContent = 'POV Walkthrough: Looking forward at eye level (1.6m)';
+        initWebGL();
+        const pw = canvas3D.parentElement ? canvas3D.parentElement.clientWidth : 0;
+        const ph = canvas3D.parentElement ? canvas3D.parentElement.clientHeight : 0;
+        if (pw > 0 && ph > 0) {{
+          canvas3D.width = pw;
+          canvas3D.height = ph;
+        }}
         if (playbackPct >= 0.98) {{
           playbackPct = 0.0;
           isPlaying = true;
           document.getElementById('play-icon').textContent = '⏸';
           document.getElementById('play-text').textContent = 'Pause';
         }}
+        if (gl) {{
+          rebuild3DScene();
+          render3DScene();
+        }}
       }}
     }}
 
     function recenterBuilding() {{
-      const w = canvasDynamic.width;
-      const h = canvasDynamic.height;
+      const w = canvasDynamic.width || (canvasDynamic.parentElement ? canvasDynamic.parentElement.clientWidth : 800);
+      const h = canvasDynamic.height || (canvasDynamic.parentElement ? canvasDynamic.parentElement.clientHeight : 600);
 
-      if (viewMode === 'CAD') {{
-        zoom = Math.min((w * 0.75) / BBOX_SPAN, (h * 0.75) / BBOX_SPAN);
-        zoom = Math.max(20, Math.min(100, zoom));
-        // Direct Cartesian recentering: (cx, cy) placed at (w/2, h/2)
-        panX = w / 2.0 - (BBOX_CENTER.x * zoom);
-        panY = h / 2.0 + (BBOX_CENTER.y * zoom);
-        drawStaticScene();
-        drawDynamicScene();
-      }} else {{
-        // Reset 3D camera to framed isometric overview
-        cameraTarget[0] = BBOX_CENTER.x;
-        cameraTarget[1] = 1.0;
-        cameraTarget[2] = BBOX_CENTER.y;
-        orbitRadius = BBOX_SPAN * 1.5;
-        orbitTheta = Math.PI * 0.25;
-        orbitPhi = Math.PI * 0.28;
+      zoom = Math.min((w * 0.75) / BBOX_SPAN, (h * 0.75) / BBOX_SPAN);
+      zoom = Math.max(15, Math.min(120, zoom));
+      panX = w / 2.0 - (BBOX_CENTER.x * zoom);
+      panY = h / 2.0 + (BBOX_CENTER.y * zoom);
+
+      cameraTarget[0] = BBOX_CENTER.x;
+      cameraTarget[1] = 1.0;
+      cameraTarget[2] = BBOX_CENTER.y;
+      orbitRadius = Math.max(8.0, BBOX_SPAN * 1.5);
+      orbitTheta = Math.PI * 0.25;
+      orbitPhi = Math.PI * 0.28;
+
+      drawStaticScene();
+      drawDynamicScene();
+      if (gl) {{
+        rebuild3DScene();
+        render3DScene();
       }}
     }}
 
@@ -1052,8 +1074,28 @@ def generate_interactive_html_viewer(
 
     function getInterpolatedPose(pts, pct) {{
       if (!pts || pts.length === 0) return null;
-      if (pts.length === 1 || pct <= 0) return pts[0];
-      if (pct >= 1.0) return pts[pts.length - 1];
+      if (pts.length === 1 || pct <= 0) {{
+        const p = pts[0];
+        return {{
+          x: (typeof p.x === 'number') ? p.x : 0.0,
+          y: (typeof p.y === 'number') ? p.y : 0.0,
+          z: (typeof p.z === 'number') ? p.z : 1.1,
+          yaw: p.yaw || 0,
+          speed: (typeof p.speed === 'number' && !isNaN(p.speed)) ? p.speed : 0.0,
+          device: p.device || 'phone_1'
+        }};
+      }}
+      if (pct >= 1.0) {{
+        const p = pts[pts.length - 1];
+        return {{
+          x: (typeof p.x === 'number') ? p.x : 0.0,
+          y: (typeof p.y === 'number') ? p.y : 0.0,
+          z: (typeof p.z === 'number') ? p.z : 1.1,
+          yaw: p.yaw || 0,
+          speed: (typeof p.speed === 'number' && !isNaN(p.speed)) ? p.speed : 0.0,
+          device: p.device || 'phone_1'
+        }};
+      }}
 
       const targetTs = minTs + pct * totalDurationMs;
       for (let i = 0; i < pts.length - 1; i++) {{
@@ -1062,19 +1104,32 @@ def generate_interactive_html_viewer(
           const u = span > 0 ? (targetTs - pts[i].ts) / span : 0;
           const x = pts[i].x + u * (pts[i+1].x - pts[i].x);
           const y = pts[i].y + u * (pts[i+1].y - pts[i].y);
-          const z = pts[i].z + u * (pts[i+1].z - pts[i].z);
+          const z = (pts[i].z !== undefined && pts[i+1].z !== undefined)
+            ? pts[i].z + u * (pts[i+1].z - pts[i].z)
+            : 1.1;
 
           // Angle unwrap
           let dyaw = pts[i+1].yaw - pts[i].yaw;
           while (dyaw > Math.PI) dyaw -= 2 * Math.PI;
           while (dyaw < -Math.PI) dyaw += 2 * Math.PI;
           const yaw = pts[i].yaw + u * dyaw;
-          const speed = span > 0 ? Math.hypot(pts[i+1].x - pts[i].x, pts[i+1].y - pts[i].y) / (span / 1000) : 0;
+          const dist = Math.hypot(pts[i+1].x - pts[i].x, pts[i+1].y - pts[i].y);
+          const dtSec = Math.max(0.001, span / 1000.0);
+          const rawSpeed = dist / dtSec;
+          const speed = (typeof rawSpeed === 'number' && !isNaN(rawSpeed)) ? rawSpeed : 0.0;
 
-          return {{ x, y, z, yaw, speed, device: pts[i].device }};
+          return {{ x, y, z, yaw, speed, device: pts[i].device || 'phone_1' }};
         }}
       }}
-      return pts[pts.length - 1];
+      const lastP = pts[pts.length - 1];
+      return {{
+        x: (typeof lastP.x === 'number') ? lastP.x : 0.0,
+        y: (typeof lastP.y === 'number') ? lastP.y : 0.0,
+        z: (typeof lastP.z === 'number') ? lastP.z : 1.1,
+        yaw: lastP.yaw || 0,
+        speed: (typeof lastP.speed === 'number' && !isNaN(lastP.speed)) ? lastP.speed : 0.0,
+        device: lastP.device || 'phone_1'
+      }};
     }}
 
     // =========================================================================
@@ -1389,7 +1444,7 @@ def generate_interactive_html_viewer(
         addQuad(v0, v3, v7, v4, [-cos, 0, sin], col);
       }}
 
-      // 1. Floor Plane & Subtle Ground Grid
+      // 1. Floor Plane & Subtle Blueprint Ground Grid
       const fSpan = BBOX_SPAN * 2.2;
       const fMinX = BBOX_CENTER.x - fSpan / 2;
       const fMaxX = BBOX_CENTER.x + fSpan / 2;
@@ -1406,6 +1461,20 @@ def generate_interactive_html_viewer(
         [0.05, 0.14, 0.25, 1.0]
       );
 
+      // Floor blueprint grid lines
+      const gridStep = 1.0;
+      const startX = Math.floor(fMinX);
+      const endX = Math.ceil(fMaxX);
+      const startZ = Math.floor(fMinZ);
+      const endZ = Math.ceil(fMaxZ);
+      const gridCol = [0.10, 0.24, 0.42, 0.7];
+      for (let x = startX; x <= endX; x += gridStep) {{
+        addBox(x, 0.005, (startZ + endZ) / 2.0, 0.02, 0.005, (endZ - startZ), 0, gridCol);
+      }}
+      for (let z = startZ; z <= endZ; z += gridStep) {{
+        addBox((startX + endX) / 2.0, 0.005, z, (endX - startX), 0.005, 0.02, 0, gridCol);
+      }}
+
       // 2. Extruded Structural Walls
       if (document.getElementById('layer-walls').checked) {{
         WALLS.forEach(w => {{
@@ -1421,7 +1490,7 @@ def generate_interactive_html_viewer(
           const mz = (w.y1 + w.y2) / 2.0;
           const angle = Math.atan2(dy, dx);
           const wallHeight = 2.4;
-          const wallThick = 0.15;
+          const wallThick = 0.16;
 
           let col = [0.22, 0.74, 0.97, 0.95]; // Confirmed bold cyan
           if (conf < 0.40) {{
@@ -1438,8 +1507,37 @@ def generate_interactive_html_viewer(
       if (document.getElementById('layer-aps').checked) {{
         APS.forEach(ap => {{
           addBox(ap.x, 2.2, ap.y, 0.3, 0.08, 0.3, 0, [0.13, 0.77, 0.37, 1.0]);
-          addBox(ap.x, 2.35, ap.y, 0.04, 0.25, 0.04, 0, [0.8, 0.9, 1.0, 1.0]);
+          addBox(ap.x, 2.35, ap.y, 0.04, 0.25, 0.04, 0, [0.85, 0.95, 1.0, 1.0]);
         }});
+      }}
+
+      // 4. SLAM Trajectory Path in 3D
+      if (document.getElementById('layer-slam').checked && FULL_SLAM_POINTS.length > 0) {{
+        const count = Math.max(1, Math.floor(FULL_SLAM_POINTS.length * playbackPct));
+        for (let i = 0; i < count; i++) {{
+          const pt = FULL_SLAM_POINTS[i];
+          addBox(pt.x, 0.06, pt.y, 0.10, 0.03, 0.10, 0, [0.06, 0.71, 0.82, 0.75]);
+        }}
+      }}
+
+      // 5. Dynamic Phone Avatar & Heading Pointer
+      if (document.getElementById('layer-phone').checked) {{
+        const primaryKey = DEVICE_KEYS[0];
+        const pts = DEVICE_MAP[primaryKey];
+        if (pts && pts.length > 0) {{
+          const pose = getInterpolatedPose(pts, playbackPct);
+          if (pose) {{
+            // Phone body at 1.1m elevation
+            addBox(pose.x, 1.1, pose.y, 0.18, 0.04, 0.36, -pose.yaw, [0.93, 0.28, 0.6, 1.0]);
+            // Screen display
+            addBox(pose.x, 1.125, pose.y, 0.14, 0.01, 0.30, -pose.yaw, [0.22, 0.74, 0.97, 1.0]);
+            // Forward heading pointer
+            const hLen = 0.9;
+            const hx = pose.x + Math.cos(pose.yaw) * (hLen / 2);
+            const hz = pose.y + Math.sin(pose.yaw) * (hLen / 2);
+            addBox(hx, 1.1, hz, 0.05, 0.02, hLen, -pose.yaw + Math.PI / 2, [0.96, 0.62, 0.07, 0.9]);
+          }}
+        }}
       }}
 
       // Upload buffers
@@ -1461,8 +1559,15 @@ def generate_interactive_html_viewer(
     function render3DScene() {{
       if (!gl || (viewMode !== '3D' && viewMode !== 'POV')) return;
 
-      const w = canvas3D.width;
-      const h = canvas3D.height;
+      const pw = canvas3D.parentElement ? canvas3D.parentElement.clientWidth : 0;
+      const ph = canvas3D.parentElement ? canvas3D.parentElement.clientHeight : 0;
+      if (pw > 0 && ph > 0 && (canvas3D.width !== pw || canvas3D.height !== ph)) {{
+        canvas3D.width = pw;
+        canvas3D.height = ph;
+      }}
+      const w = canvas3D.width || 800;
+      const h = canvas3D.height || 600;
+
       gl.viewport(0, 0, w, h);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
 
@@ -1476,14 +1581,16 @@ def generate_interactive_html_viewer(
         // Snap camera directly to active phone pose looking forward at eye level (1.6m)
         const primaryKey = DEVICE_KEYS[0];
         const pts = DEVICE_MAP[primaryKey];
-        const pose = getInterpolatedPose(pts, playbackPct);
+        const pose = (pts && pts.length > 0) ? getInterpolatedPose(pts, playbackPct) : null;
+        let eye = [BBOX_CENTER.x, 1.6, BBOX_CENTER.y];
+        let target = [BBOX_CENTER.x + 1.0, 1.55, BBOX_CENTER.y];
         if (pose) {{
-          const eye = [pose.x, 1.6, pose.y];
-          const lookX = Math.cos(pose.yaw);
-          const lookZ = Math.sin(pose.yaw);
-          const target = [pose.x + lookX * 5.0, 1.55, pose.y + lookZ * 5.0];
-          Mat4.lookAt(viewMatrix, eye, target, [0, 1, 0]);
+          eye = [pose.x, 1.6, pose.y];
+          const lookX = Math.cos(pose.yaw || 0);
+          const lookZ = Math.sin(pose.yaw || 0);
+          target = [pose.x + lookX * 5.0, 1.55, pose.y + lookZ * 5.0];
         }}
+        Mat4.lookAt(viewMatrix, eye, target, [0, 1, 0]);
       }} else {{
         // Free 3D Orbit Camera
         const eyeX = cameraTarget[0] + orbitRadius * Math.sin(orbitPhi) * Math.sin(orbitTheta);
@@ -1494,25 +1601,27 @@ def generate_interactive_html_viewer(
 
       gl.uniformMatrix4fv(uViewLoc, false, viewMatrix);
 
-      // Bind attributes and draw static building geometry
-      const aPosLoc = gl.getAttribLocation(shaderProgram, 'aPosition');
-      const aNormLoc = gl.getAttribLocation(shaderProgram, 'aNormal');
-      const aColLoc = gl.getAttribLocation(shaderProgram, 'aColor');
+      if (indexCount > 0) {{
+        // Bind attributes and draw static building geometry
+        const aPosLoc = gl.getAttribLocation(shaderProgram, 'aPosition');
+        const aNormLoc = gl.getAttribLocation(shaderProgram, 'aNormal');
+        const aColLoc = gl.getAttribLocation(shaderProgram, 'aColor');
 
-      gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
-      gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
-      gl.enableVertexAttribArray(aPosLoc);
+        gl.bindBuffer(gl.ARRAY_BUFFER, posBuffer);
+        gl.vertexAttribPointer(aPosLoc, 3, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(aPosLoc);
 
-      gl.bindBuffer(gl.ARRAY_BUFFER, normalBuffer);
-      gl.vertexAttribPointer(aNormLoc, 3, gl.FLOAT, false, 0, 0);
-      gl.enableVertexAttribArray(aNormLoc);
+        gl.bindBuffer(gl.ARRAY_BUFFER, normalBuffer);
+        gl.vertexAttribPointer(aNormLoc, 3, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(aNormLoc);
 
-      gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
-      gl.vertexAttribPointer(aColLoc, 4, gl.FLOAT, false, 0, 0);
-      gl.enableVertexAttribArray(aColLoc);
+        gl.bindBuffer(gl.ARRAY_BUFFER, colorBuffer);
+        gl.vertexAttribPointer(aColLoc, 4, gl.FLOAT, false, 0, 0);
+        gl.enableVertexAttribArray(aColLoc);
 
-      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-      gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
+        gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0);
+      }}
     }}
 
     // =========================================================================
@@ -1638,6 +1747,7 @@ def generate_interactive_html_viewer(
         cameraTarget[0] -= (cosT * dx - sinT * dy) * factor;
         cameraTarget[2] -= (-sinT * dx - cosT * dy) * factor;
       }}
+      render3DScene();
     }});
 
     canvas3D.addEventListener('wheel', e => {{
@@ -1645,6 +1755,7 @@ def generate_interactive_html_viewer(
       e.preventDefault();
       const factor = e.deltaY < 0 ? 0.90 : 1.11;
       orbitRadius = Math.max(1.5, Math.min(250.0, orbitRadius * factor));
+      render3DScene();
     }});
 
     // =========================================================================
@@ -1666,67 +1777,94 @@ def generate_interactive_html_viewer(
     function onTimeSlider(val) {{
       playbackPct = parseInt(val) / 1000.0;
       updateUI();
-      drawDynamicScene();
+      if (viewMode === 'CAD') {{
+        drawDynamicScene();
+      }} else {{
+        if (gl) {{
+          rebuild3DScene();
+          render3DScene();
+        }}
+      }}
     }}
 
     let lastHudUpdate = 0;
     function updateUI(force = false) {{
-      const now = performance.now();
-      const currentMs = minTs + playbackPct * totalDurationMs;
-      document.getElementById('time-display').textContent =
-        `${{formatTime(currentMs - minTs)}} / ${{formatTime(totalDurationMs)}}`;
+      try {{
+        const now = performance.now();
+        const currentMs = minTs + playbackPct * totalDurationMs;
+        const timeDisplay = document.getElementById('time-display');
+        if (timeDisplay) {{
+          timeDisplay.textContent =
+            `${{formatTime(currentMs - minTs)}} / ${{formatTime(totalDurationMs)}}`;
+        }}
 
-      if (force || now - lastHudUpdate > 60) {{
-        lastHudUpdate = now;
-        const primaryKey = DEVICE_KEYS[0];
-        const pts = DEVICE_MAP[primaryKey];
-        if (pts && pts.length > 0) {{
-          const pose = getInterpolatedPose(pts, playbackPct);
-          if (!pose) return;
+        if (force || now - lastHudUpdate > 60) {{
+          lastHudUpdate = now;
+          const primaryKey = DEVICE_KEYS[0];
+          const pts = DEVICE_MAP[primaryKey];
+          if (pts && pts.length > 0) {{
+            const pose = getInterpolatedPose(pts, playbackPct);
+            if (!pose) return;
 
-          document.getElementById('hud-device').textContent = pose.device;
-          document.getElementById('hud-coords').textContent =
-            `${{pose.x.toFixed(2)}}m, ${{pose.y.toFixed(2)}}m, ${{pose.z.toFixed(2)}}m`;
+            const devEl = document.getElementById('hud-device');
+            if (devEl) devEl.textContent = pose.device || 'phone_1';
 
-          let deg = Math.round(pose.yaw * 180 / Math.PI) % 360;
-          if (deg < 0) deg += 360;
-          const cardinals = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'];
-          const cardIdx = Math.round(deg / 45) % 8;
-          document.getElementById('hud-yaw').textContent = `${{deg}}° (${{cardinals[cardIdx]}})`;
-          document.getElementById('hud-speed').textContent = `${{pose.speed.toFixed(2)}} m/s`;
-          document.getElementById('hud-pct').textContent = `${{Math.round(playbackPct * 100)}}%`;
+            const xVal = (typeof pose.x === 'number') ? pose.x.toFixed(2) : '0.00';
+            const yVal = (typeof pose.y === 'number') ? pose.y.toFixed(2) : '0.00';
+            const zVal = (typeof pose.z === 'number') ? pose.z.toFixed(2) : '1.10';
+            const coordsEl = document.getElementById('hud-coords');
+            if (coordsEl) coordsEl.textContent = `${{xVal}}m, ${{yVal}}m, ${{zVal}}m`;
 
-          let minD = 999.0;
-          WALLS.forEach(w => {{
-            if ((w.confidence || 0.7) >= minConfidence) {{
-              const res = distToSegment(pose.x, pose.y, w.x1, w.y1, w.x2, w.y2);
-              if (res.dist < minD) minD = res.dist;
+            let deg = Math.round((pose.yaw || 0) * 180 / Math.PI) % 360;
+            if (deg < 0) deg += 360;
+            const cardinals = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'];
+            const cardIdx = Math.round(deg / 45) % 8;
+            const yawEl = document.getElementById('hud-yaw');
+            if (yawEl) yawEl.textContent = `${{deg}}° (${{cardinals[cardIdx]}})`;
+
+            const speedVal = (typeof pose.speed === 'number' && !isNaN(pose.speed)) ? pose.speed.toFixed(2) : '0.00';
+            const speedEl = document.getElementById('hud-speed');
+            if (speedEl) speedEl.textContent = `${{speedVal}} m/s`;
+
+            const pctEl = document.getElementById('hud-pct');
+            if (pctEl) pctEl.textContent = `${{Math.round(playbackPct * 100)}}%`;
+
+            let minD = 999.0;
+            WALLS.forEach(w => {{
+              if ((w.confidence || 0.7) >= minConfidence) {{
+                const res = distToSegment(pose.x, pose.y, w.x1, w.y1, w.x2, w.y2);
+                if (res.dist < minD) minD = res.dist;
+              }}
+            }});
+            const statusEl = document.getElementById('hud-status');
+            const nearEl = document.getElementById('hud-nearest');
+            if (nearEl && statusEl) {{
+              if (minD < 900.0) {{
+                nearEl.textContent = `${{minD.toFixed(2)}} m`;
+                if (minD <= 0.35) {{
+                  statusEl.textContent = 'PROXIMITY ALERT';
+                  statusEl.style.background = '#ef4444';
+                  statusEl.style.color = '#ffffff';
+                }} else if (minD <= 0.80) {{
+                  statusEl.textContent = 'NEAR WALL';
+                  statusEl.style.background = '#f59e0b';
+                  statusEl.style.color = '#0a192f';
+                }} else {{
+                  statusEl.textContent = 'CLEAR';
+                  statusEl.style.background = '#22c55e';
+                  statusEl.style.color = '#052e16';
+                }}
+              }} else {{
+                nearEl.textContent = 'Open Space';
+                statusEl.textContent = 'CLEAR';
+                statusEl.style.background = '#22c55e';
+                statusEl.style.color = '#052e16';
+              }}
             }}
-          }});
-          const statusEl = document.getElementById('hud-status');
-          const nearEl = document.getElementById('hud-nearest');
-          if (minD < 900.0) {{
-            nearEl.textContent = `${{minD.toFixed(2)}} m`;
-            if (minD <= 0.35) {{
-              statusEl.textContent = 'PROXIMITY ALERT';
-              statusEl.style.background = '#ef4444';
-              statusEl.style.color = '#ffffff';
-            }} else if (minD <= 0.80) {{
-              statusEl.textContent = 'NEAR WALL';
-              statusEl.style.background = '#f59e0b';
-              statusEl.style.color = '#0a192f';
-            }} else {{
-              statusEl.textContent = 'CLEAR';
-              statusEl.style.background = '#22c55e';
-              statusEl.style.color = '#052e16';
-            }}
-          }} else {{
-            nearEl.textContent = 'Open Space';
-            statusEl.textContent = 'CLEAR';
-            statusEl.style.background = '#22c55e';
-            statusEl.style.color = '#052e16';
           }}
         }}
+      }} catch (err) {{
+        console.warn('HUD update error:', err);
       }}
     }}
 
@@ -1745,42 +1883,53 @@ def generate_interactive_html_viewer(
     // =========================================================================
     let lastTickTime = performance.now();
     function animLoop(now) {{
-      const dt = (now - lastTickTime) / 1000;
-      lastTickTime = now;
-      pulseAnim = (pulseAnim + dt * 2.0) % 1.0;
+      try {{
+        const dt = (now - lastTickTime) / 1000;
+        lastTickTime = now;
+        pulseAnim = (pulseAnim + dt * 2.0) % 1.0;
 
-      if (isPlaying && FULL_SLAM_POINTS.length > 1) {{
-        const step = (dt * playbackSpeed * 1000) / totalDurationMs;
-        playbackPct += step;
-        if (playbackPct >= 1.0) {{
-          playbackPct = 1.0;
-          isPlaying = false;
-          document.getElementById('play-icon').textContent = '▶';
-          document.getElementById('play-text').textContent = 'Play';
-        }}
-        document.getElementById('time-slider').value = Math.round(playbackPct * 1000);
-        updateUI();
+        if (isPlaying && FULL_SLAM_POINTS.length > 1) {{
+          const step = (dt * playbackSpeed * 1000) / totalDurationMs;
+          playbackPct += step;
+          if (playbackPct >= 1.0) {{
+            playbackPct = 1.0;
+            isPlaying = false;
+            const playIcon = document.getElementById('play-icon');
+            const playText = document.getElementById('play-text');
+            if (playIcon) playIcon.textContent = '▶';
+            if (playText) playText.textContent = 'Play';
+          }}
+          const timeSlider = document.getElementById('time-slider');
+          if (timeSlider) timeSlider.value = Math.round(playbackPct * 1000);
+          updateUI();
 
-        if (followPhone && viewMode === 'CAD') {{
-          const primaryKey = DEVICE_KEYS[0];
-          const pts = DEVICE_MAP[primaryKey];
-          if (pts && pts.length > 0) {{
-            const pose = getInterpolatedPose(pts, playbackPct);
-            if (pose) {{
-              panX = canvasDynamic.width / 2.0 - (pose.x * zoom);
-              panY = canvasDynamic.height / 2.0 + (pose.y * zoom);
-              drawStaticScene();
+          if (followPhone && viewMode === 'CAD') {{
+            const primaryKey = DEVICE_KEYS[0];
+            const pts = DEVICE_MAP[primaryKey];
+            if (pts && pts.length > 0) {{
+              const pose = getInterpolatedPose(pts, playbackPct);
+              if (pose) {{
+                panX = canvasDynamic.width / 2.0 - (pose.x * zoom);
+                panY = canvasDynamic.height / 2.0 + (pose.y * zoom);
+                drawStaticScene();
+              }}
             }}
           }}
-        }}
-      }} else {{
-        updateUI();
-      }}
 
-      if (viewMode === 'CAD') {{
-        drawDynamicScene();
-      }} else {{
-        render3DScene();
+          if (viewMode !== 'CAD' && gl) {{
+            rebuild3DScene();
+          }}
+        }} else {{
+          updateUI();
+        }}
+
+        if (viewMode === 'CAD') {{
+          drawDynamicScene();
+        }} else {{
+          render3DScene();
+        }}
+      }} catch (loopErr) {{
+        console.error('animLoop error:', loopErr);
       }}
 
       requestAnimationFrame(animLoop);
