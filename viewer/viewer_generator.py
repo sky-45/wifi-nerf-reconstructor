@@ -265,12 +265,23 @@ def generate_interactive_html_viewer(
 
   <div id="viewport-container">
     <div id="top-bar">
-      <div style="display: flex; align-items: center; gap: 12px;">
-        <span style="font-weight: 700; color: #38bdf8; font-size: 14px;">Environment:</span>
-        <span style="font-family: monospace; font-size: 13px; color: #e2e8f0;">{session_id}</span>
-      </div>
       <div style="display: flex; align-items: center; gap: 10px;">
-        <select id="room-jump-select" style="background:#0d2238; color:#cbd5e1; border:1px solid #1e3a5f; padding:5px 8px; border-radius:4px; font-size:11px;" onchange="jumpToRoom(this.value)">
+        <span style="font-weight: 700; color: #38bdf8; font-size: 13px;">Space:</span>
+        <select id="env-select" style="background:#0d2238; color:#38bdf8; font-weight:600; border:1px solid #0284c7; padding:4px 8px; border-radius:4px; font-size:12px; cursor:pointer;" onchange="onEnvironmentSelected(this.value)">
+          <option value="{session_id}">{session_id}</option>
+        </select>
+        <button class="btn btn-secondary" style="padding:4px 8px; font-size:11px;" onclick="triggerReconstruct()" id="btn-reconstruct" title="Re-analyze all Wi-Fi scans and rebuild floorplan">🔄 Reconstruct</button>
+      </div>
+      <div style="display: flex; align-items: center; gap: 8px;">
+        <span style="font-size: 11px; color: #94a3b8;">Poll:</span>
+        <select id="poll-interval-select" style="background:#0d2238; color:#cbd5e1; border:1px solid #1e3a5f; padding:4px 6px; border-radius:4px; font-size:11px;" onchange="onPollIntervalChanged(this.value)">
+          <option value="0.5">0.5s</option>
+          <option value="1.0" selected>1.0s</option>
+          <option value="2.0">2.0s</option>
+          <option value="5.0">5.0s</option>
+        </select>
+        <span id="live-badge" class="badge" style="background:#052e16; color:#22c55e; border:1px solid #22c55e; font-size:10px;">● LIVE</span>
+        <select id="room-jump-select" style="background:#0d2238; color:#cbd5e1; border:1px solid #1e3a5f; padding:4px 8px; border-radius:4px; font-size:11px;" onchange="jumpToRoom(this.value)">
           <option value="">🏠 Jump to Room...</option>
         </select>
         <span id="nav-hint" style="font-size: 11px; color: #64748b;">Left Drag: Pan | Wheel: Zoom | Click Wall: Inspect</span>
@@ -339,16 +350,16 @@ def generate_interactive_html_viewer(
   </div>
 
   <script>
-    const DIMS = {json.dumps(dims)};
-    const WALLS = {walls_json};
-    const DOORS = {doorways_json};
-    const ROOMS = {rooms_json};
-    const APS = {aps_json};
-    const RAW_TRAJ = {raw_traj_json};
-    const SLAM_TRAJ = {slam_traj_json};
-    const HEATMAP = {heatmap_json};
-    const RAY_COVERAGE = {ray_density_json};
-    const METRICS = {metrics_json};
+    let DIMS = {json.dumps(dims)};
+    let WALLS = {walls_json};
+    let DOORS = {doorways_json};
+    let ROOMS = {rooms_json};
+    let APS = {aps_json};
+    let RAW_TRAJ = {raw_traj_json};
+    let SLAM_TRAJ = {slam_traj_json};
+    let HEATMAP = {heatmap_json};
+    let RAY_COVERAGE = {ray_density_json};
+    let METRICS = {metrics_json};
 
     // Calculate Bounding Box of all walls for auto-framing
     let BBOX = {{ minX: 0, maxX: DIMS.width_m, minY: 0, maxY: DIMS.height_m }};
@@ -362,11 +373,11 @@ def generate_interactive_html_viewer(
         maxY: Math.max(...ys)
       }};
     }}
-    const BBOX_CENTER = {{
+    let BBOX_CENTER = {{
       x: (BBOX.minX + BBOX.maxX) / 2.0,
       y: (BBOX.minY + BBOX.maxY) / 2.0
     }};
-    const BBOX_SPAN = Math.max(4.0, Math.max(BBOX.maxX - BBOX.minX, BBOX.maxY - BBOX.minY));
+    let BBOX_SPAN = Math.max(4.0, Math.max(BBOX.maxX - BBOX.minX, BBOX.maxY - BBOX.minY));
 
     // View mode: 'CAD' (Default 2D Top Blueprint), '3D' (Embedded WebGL Orbit), 'POV' (Walkthrough)
     let viewMode = 'CAD';
@@ -1943,12 +1954,222 @@ def generate_interactive_html_viewer(
       requestAnimationFrame(animLoop);
     }}
 
+    // =========================================================================
+    // REAL-TIME REST CLIENT & DYNAMIC ENVIRONMENT SWITCHER
+    // =========================================================================
+    let liveTimer = null;
+    let livePollIntervalMs = 1000;
+    let activeEnvId = '{session_id}';
+    let isLiveStreaming = true;
+    let livePose = null;
+
+    async function initLiveClient() {{
+      try {{
+        const resp = await fetch('/api/environments');
+        if (resp.ok) {{
+          const data = await resp.json();
+          const select = document.getElementById('env-select');
+          if (select && data.environments && data.environments.length > 0) {{
+            select.innerHTML = '';
+            data.environments.forEach(env => {{
+              const opt = document.createElement('option');
+              opt.value = env.env_id;
+              const recTag = env.is_recommended ? ' - 🏆 Recommended' : '';
+              const transitTag = env.is_transit ? ' [Transit]' : '';
+              opt.textContent = `${{env.env_id}} (${{env.total_batches}} batches${{recTag}}${{transitTag}})`;
+              if (env.env_id === activeEnvId || (env.is_active && !activeEnvId)) {{
+                opt.selected = true;
+              }}
+              select.appendChild(opt);
+            }});
+            if (data.active_env) activeEnvId = data.active_env;
+            if (data.poll_interval_s) {{
+              livePollIntervalMs = data.poll_interval_s * 1000;
+              const pollSel = document.getElementById('poll-interval-select');
+              if (pollSel) pollSel.value = String(data.poll_interval_s);
+            }}
+          }}
+        }}
+      }} catch (e) {{
+        console.warn('Standalone viewer mode (no local REST server active):', e);
+      }}
+
+      startLivePolling();
+    }}
+
+    function startLivePolling() {{
+      if (liveTimer) clearInterval(liveTimer);
+      liveTimer = setInterval(pollLivePose, livePollIntervalMs);
+      pollLivePose();
+    }}
+
+    async function pollLivePose() {{
+      if (!isLiveStreaming) return;
+      try {{
+        const resp = await fetch(`/api/live-pose?env=${{encodeURIComponent(activeEnvId)}}`);
+        if (!resp.ok) return;
+        const data = await resp.json();
+        if (data && typeof data.x === 'number') {{
+          livePose = data;
+          applyLivePose(data);
+        }}
+      }} catch (e) {{
+        // Silent catch for offline static files
+      }}
+    }}
+
+    function applyLivePose(pose) {{
+      const devKey = pose.device_id || 'live_phone';
+      DEVICE_MAP[devKey] = [pose];
+      if (!DEVICE_KEYS.includes(devKey)) {{
+        DEVICE_KEYS.unshift(devKey);
+      }}
+
+      const devEl = document.getElementById('hud-device');
+      if (devEl) devEl.textContent = devKey;
+      const coordsEl = document.getElementById('hud-coords');
+      if (coordsEl) coordsEl.textContent = `${{pose.x.toFixed(2)}}m, ${{pose.y.toFixed(2)}}m, ${{pose.z.toFixed(2)}}m`;
+      const speedEl = document.getElementById('hud-speed');
+      if (speedEl) speedEl.textContent = `${{(pose.speed_mps || 0).toFixed(2)}} m/s`;
+      const yawEl = document.getElementById('hud-yaw');
+      if (yawEl) yawEl.textContent = `${{Math.round(pose.yaw_deg || 0)}}°`;
+
+      const statusEl = document.getElementById('hud-status');
+      const nearEl = document.getElementById('hud-nearest');
+      if (nearEl && statusEl) {{
+        if (typeof pose.nearest_wall_m === 'number') {{
+          nearEl.textContent = `${{pose.nearest_wall_m.toFixed(2)}} m (${{pose.nearest_wall_id || ''}})`;
+          if (pose.status === 'PROXIMITY_ALERT') {{
+            statusEl.textContent = 'PROXIMITY ALERT';
+            statusEl.style.background = '#ef4444';
+            statusEl.style.color = '#ffffff';
+          }} else if (pose.status === 'NEAR_WALL') {{
+            statusEl.textContent = 'NEAR WALL';
+            statusEl.style.background = '#f59e0b';
+            statusEl.style.color = '#0a192f';
+          }} else {{
+            statusEl.textContent = 'CLEAR';
+            statusEl.style.background = '#22c55e';
+            statusEl.style.color = '#052e16';
+          }}
+        }}
+      }}
+
+      if (viewMode === 'CAD') {{
+        if (followPhone) {{
+          panX = canvasDynamic.width / 2.0 - (pose.x * zoom);
+          panY = canvasDynamic.height / 2.0 + (pose.y * zoom);
+          drawStaticScene();
+        }}
+        drawDynamicScene();
+      }} else {{
+        if (gl) {{
+          rebuild3DScene();
+          render3DScene();
+        }}
+      }}
+    }}
+
+    async function onEnvironmentSelected(newEnv) {{
+      if (!newEnv || newEnv === activeEnvId) return;
+      activeEnvId = newEnv;
+      fetch('/api/settings', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ env_id: newEnv }})
+      }}).catch(() => {{}});
+
+      try {{
+        const resp = await fetch(`/api/floorplan?env=${{encodeURIComponent(newEnv)}}`);
+        if (resp.ok) {{
+          const data = await resp.json();
+          if (data.floorplan) {{
+            WALLS = data.floorplan.walls || [];
+            DOORS = data.floorplan.doorways || [];
+            ROOMS = data.floorplan.rooms || [];
+            DIMS = data.floorplan.grid_dimensions || {{ width_m: 15, height_m: 15 }};
+            if (data.aps) {{
+              APS = Array.isArray(data.aps) ? data.aps : Object.values(data.aps);
+            }}
+            if (WALLS.length > 0) {{
+              const xs = WALLS.flatMap(w => [w.x1, w.x2]);
+              const ys = WALLS.flatMap(w => [w.y1, w.y2]);
+              BBOX = {{ minX: Math.min(...xs), maxX: Math.max(...xs), minY: Math.min(...ys), maxY: Math.max(...ys) }};
+            }} else {{
+              BBOX = {{ minX: 0, maxX: DIMS.width_m, minY: 0, maxY: DIMS.height_m }};
+            }}
+            BBOX_CENTER = {{ x: (BBOX.minX + BBOX.maxX) / 2.0, y: (BBOX.minY + BBOX.maxY) / 2.0 }};
+            BBOX_SPAN = Math.max(4.0, Math.max(BBOX.maxX - BBOX.minX, BBOX.maxY - BBOX.minY));
+
+            recenterBuilding();
+            if (gl) {{
+              rebuild3DScene();
+              render3DScene();
+            }}
+          }}
+        }}
+      }} catch (err) {{
+        console.error('Failed to load floorplan for', newEnv, err);
+      }}
+      pollLivePose();
+    }}
+
+    function onPollIntervalChanged(val) {{
+      const sec = parseFloat(val) || 1.0;
+      livePollIntervalMs = sec * 1000;
+      fetch('/api/settings', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ poll_interval_s: sec }})
+      }}).catch(() => {{}});
+      startLivePolling();
+    }}
+
+    async function triggerReconstruct() {{
+      const btn = document.getElementById('btn-reconstruct');
+      if (btn) {{
+        btn.disabled = true;
+        btn.textContent = '⏳ Reconstructing...';
+      }}
+      try {{
+        const resp = await fetch(`/api/reconstruct?env=${{encodeURIComponent(activeEnvId)}}`, {{ method: 'POST' }});
+        const res = await resp.json();
+        alert(res.message || 'Reconstruction started in background.');
+        let checkCount = 0;
+        const checker = setInterval(async () => {{
+          checkCount++;
+          const st = await fetch('/api/status').then(r => r.json()).catch(() => null);
+          if (st && !st.is_reconstructing) {{
+            clearInterval(checker);
+            if (btn) {{
+              btn.disabled = false;
+              btn.textContent = '🔄 Reconstruct';
+            }}
+            onEnvironmentSelected(activeEnvId);
+          }} else if (checkCount > 30) {{
+            clearInterval(checker);
+            if (btn) {{
+              btn.disabled = false;
+              btn.textContent = '🔄 Reconstruct';
+            }}
+          }}
+        }}, 2000);
+      }} catch (e) {{
+        alert('Reconstruct request failed: ' + e);
+        if (btn) {{
+          btn.disabled = false;
+          btn.textContent = '🔄 Reconstruct';
+        }}
+      }}
+    }}
+
     // Boot into Classic CAD Blueprint Mode & Recenter Building
     resize();
     recenterBuilding();
     updateUI(true);
     setViewMode('CAD');
     requestAnimationFrame(animLoop);
+    initLiveClient();
   </script>
 </body>
 </html>

@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -391,10 +392,19 @@ class SessionAssembler:
         envelopes = []
         seen_batch_ids = set()
 
-        for key in object_keys:
-            raw_bytes = self.adapter.read_object_bytes(key)
-            envelope, batch_events = self._parse_batch_bytes(raw_bytes, key)
+        def _fetch_batch(k):
+            try:
+                raw = self.adapter.read_object_bytes(k)
+                env, evs = self._parse_batch_bytes(raw, k)
+                return k, env, evs
+            except Exception:
+                return k, None, []
 
+        max_workers = min(32, max(1, len(object_keys)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            batch_results = list(executor.map(_fetch_batch, object_keys))
+
+        for key, envelope, batch_events in batch_results:
             if envelope:
                 batch_seq = envelope.get("batch_seq")
                 tier = "hf" if "/hf/" in key.replace("\\", "/") else ("lf" if "/lf/" in key.replace("\\", "/") else "default")
@@ -456,10 +466,19 @@ class SessionAssembler:
             seen_batch_ids = set()
             dev_evs = []
 
-            for key in keys:
-                raw_bytes = self.adapter.read_object_bytes(key)
-                envelope, batch_events = self._parse_batch_bytes(raw_bytes, key)
+            def _fetch_dev_batch(k):
+                try:
+                    raw = self.adapter.read_object_bytes(k)
+                    env, evs = self._parse_batch_bytes(raw, k)
+                    return k, env, evs
+                except Exception:
+                    return k, None, []
 
+            max_workers = min(32, max(1, len(keys)))
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                dev_results = list(executor.map(_fetch_dev_batch, keys))
+
+            for key, envelope, batch_events in dev_results:
                 if envelope:
                     batch_seq = envelope.get("batch_seq")
                     tier = "hf" if "/hf/" in key.replace("\\", "/") else ("lf" if "/lf/" in key.replace("\\", "/") else "default")

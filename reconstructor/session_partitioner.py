@@ -394,6 +394,66 @@ class SessionPartitioner:
             return {d: keys for d, keys in dev_map.items() if d in device_ids}
         return dev_map
 
+    def rank_environments_by_completeness(
+        self,
+        partitions: Optional[Dict[str, Dict[str, List[str]]]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Ranks all discovered environments by completeness and sample count.
+        Returns a sorted list of dicts with:
+          - env_id: string ID of environment
+          - total_batches: count of all batches
+          - hf_batches: count of high-frequency micro-batches
+          - lf_batches: count of low-frequency architectural scan batches
+          - devices: list of contributing device IDs
+          - is_transit: boolean indicating if transit quarantine applies
+          - transit_reason: explanation string if quarantined
+          - score: numerical completeness score
+          - is_recommended: True for top-ranked stationary environment
+        """
+        if partitions is None:
+            partitions = self.scan_fleet_partitions()
+
+        results = []
+        for env_id, dev_map in partitions.items():
+            all_keys = [k for k_list in dev_map.values() for k in k_list]
+            hf_count = sum(1 for k in all_keys if "/hf/" in k)
+            lf_count = sum(1 for k in all_keys if "/lf/" in k)
+            total_batches = len(all_keys)
+            devices = list(dev_map.keys())
+
+            is_transit, reason = self.is_transit_partition(env_id, dev_map)
+
+            # Score: non-transit gets +10000 base score; each LF batch carries high architectural weight
+            # and each HF batch provides high telemetry density
+            score = (0 if is_transit else 10000) + (lf_count * 50) + (hf_count * 2) + (len(devices) * 100)
+
+            results.append({
+                "env_id": env_id,
+                "total_batches": total_batches,
+                "hf_batches": hf_count,
+                "lf_batches": lf_count,
+                "devices": devices,
+                "is_transit": is_transit,
+                "transit_reason": reason if is_transit else None,
+                "score": score,
+                "is_recommended": False
+            })
+
+        # Sort descending by score
+        results.sort(key=lambda x: x["score"], reverse=True)
+        if results:
+            rec_found = False
+            for r in results:
+                if not r["is_transit"]:
+                    r["is_recommended"] = True
+                    rec_found = True
+                    break
+            if not rec_found and results:
+                results[0]["is_recommended"] = True
+
+        return results
+
     def cluster_environments_by_ap_recurrence(
         self,
         partitions: Optional[Dict[str, Dict[str, List[str]]]] = None,

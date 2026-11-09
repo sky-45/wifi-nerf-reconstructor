@@ -16,6 +16,36 @@ import json
 import math
 import os
 import sys
+
+_ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _ROOT_DIR not in sys.path:
+    sys.path.insert(0, _ROOT_DIR)
+
+def load_env(env_path: str = ".env"):
+    """Reads a local .env file if present and populates os.environ."""
+    candidates = [
+        env_path,
+        os.path.join(_ROOT_DIR, ".env"),
+        os.path.join(os.getcwd(), ".env")
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            if k and k not in os.environ:
+                                os.environ[k] = v
+                break
+            except Exception:
+                pass
+
+load_env()
+
 from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
@@ -166,6 +196,7 @@ def run_reconstruction_pipeline(
     blob_uri: str,
     session_id: Optional[str] = None,
     env_id: Optional[str] = None,
+    target_id: Optional[str] = None,
     output_dir: str = "./output",
     room_width_m: float = 10.0,
     room_height_m: float = 8.0,
@@ -179,6 +210,7 @@ def run_reconstruction_pipeline(
     os.makedirs(output_dir, exist_ok=True)
     cfg = config or DEFAULT_CONFIG
     res_m = resolution_m or cfg.resolution_m
+    env_id = env_id or target_id
 
     # -------------------------------------------------------------------------
     # Stage 0: Ingestion, Partitioning & Multi-Device Assembly
@@ -434,6 +466,9 @@ def run_reconstruction_pipeline(
         "geojson_path": geojson_path,
         "session_data": session_data
     }
+
+
+run_pipeline = run_reconstruction_pipeline
 
 
 def create_demo_blob_dataset(storage_dir: str, session_id: str = "demo_apartment_01") -> str:

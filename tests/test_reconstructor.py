@@ -2,6 +2,7 @@ import unittest
 import math
 import os
 import sys
+import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -383,6 +384,37 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         env_data = assembler.assemble_environment(self.env_id)
         self.assertGreater(len(env_data["events"]), 50)
         self.assertGreaterEqual(env_data["batch_count"], 4)
+
+    def test_17_environment_ranking_and_live_web_server(self):
+        adapter = BlobStoreAdapter(self.fleet_dir)
+        partitioner = SessionPartitioner(adapter)
+        ranked = partitioner.rank_environments_by_completeness()
+        self.assertGreater(len(ranked), 0)
+
+        # Top ranked environment should not be transit commute
+        top_env = ranked[0]
+        self.assertTrue(top_env["is_recommended"])
+        self.assertEqual(top_env["env_id"], self.env_id)
+        self.assertFalse(top_env["is_transit"])
+
+        # Quarantined transit commute should have lower rank
+        transit_item = next((r for r in ranked if r["env_id"] == "transit_commute"), None)
+        self.assertIsNotNone(transit_item)
+        self.assertTrue(transit_item["is_transit"])
+        self.assertFalse(transit_item["is_recommended"])
+        self.assertLess(transit_item["score"], top_env["score"])
+
+        # Test WebServerState
+        from reconstructor.web_server import WebServerState
+        with tempfile.TemporaryDirectory() as tmp_out:
+            state = WebServerState(
+                blob_uri=self.fleet_dir,
+                output_dir=tmp_out,
+                enable_watcher=False
+            )
+            summary = state.get_environments_summary()
+            self.assertEqual(summary["active_env"], self.env_id)
+            self.assertEqual(len(summary["environments"]), len(ranked))
 
 if __name__ == "__main__":
     unittest.main()
