@@ -524,8 +524,10 @@ def create_demo_blob_dataset(storage_dir: str, session_id: str = "demo_apartment
             })
 
         if len(events_batch) >= 25 or i == num_steps - 1:
+            tier_dir = os.path.join(session_dir, "lf")
+            os.makedirs(tier_dir, exist_ok=True)
             batch_filename = f"batch_{batch_seq:04d}.ndjson.gz"
-            batch_path = os.path.join(session_dir, batch_filename)
+            batch_path = os.path.join(tier_dir, batch_filename)
 
             envelope = {
                 "event_type": "batch_envelope",
@@ -549,7 +551,7 @@ def create_demo_blob_dataset(storage_dir: str, session_id: str = "demo_apartment
 def create_demo_fleet_dataset(storage_dir: str, env_id: str = "demo_fleet_house") -> Dict[str, str]:
     """
     Generates a realistic multi-device collaborative dataset conforming to:
-      fleet/{device_id}/{env_id}/batch_{timestamp_ns}_{seq}.ndjson.gz
+      fleet/{device_id}/{env_id}/(hf|lf)/batch_{timestamp_ns}_{seq}.ndjson.gz
 
     Simulates:
     1. Device A (device_alice): Walks Room 1 (west wing: x=1..5, y=1..5), seeing AP 1 and AP 2.
@@ -565,11 +567,15 @@ def create_demo_fleet_dataset(storage_dir: str, env_id: str = "demo_fleet_house"
 
     # 1. Device Alice in env_id (Room 1)
     alice_dir = os.path.join(base_fleet, "device_alice", env_id)
-    os.makedirs(alice_dir, exist_ok=True)
+    alice_lf = os.path.join(alice_dir, "lf")
+    alice_hf = os.path.join(alice_dir, "hf")
+    os.makedirs(alice_lf, exist_ok=True)
+    os.makedirs(alice_hf, exist_ok=True)
     paths["alice_env"] = alice_dir
 
     t_start = 1_700_100_000_000_000_000
     events_alice = []
+    hf_alice = []
     batch_seq = 1
     num_steps_a = 70
 
@@ -588,10 +594,21 @@ def create_demo_fleet_dataset(storage_dir: str, env_id: str = "demo_fleet_house"
             "confidence": 0.95
         }
 
+        # High-frequency connected probe telemetry
+        hf_alice.append({
+            "event_type": "connected_probe",
+            "timestamp_ns": t_ns,
+            "bssid": "a4:97:b1:11:22:15",
+            "freq_mhz": 5180,
+            "rssi_dbm": int(round(-42.0 - 20.0 * math.log10(max(0.4, math.hypot(px - ap1_pos[0], py - ap1_pos[1]))))),
+            "tx_mbps": 433,
+            "rx_mbps": 433,
+            "pose": pose
+        })
+
         if i % 2 == 0:
             d1 = max(0.4, math.hypot(px - ap1_pos[0], py - ap1_pos[1]))
             d2 = max(0.4, math.hypot(px - ap2_pos[0], py - ap2_pos[1]))
-            # Alice is mostly in Room 1 (x < 5.0). Wall is at x=5.0
             crosses_wall_ap2 = True
             rssi_24_1 = int(round(-36.0 - 20.0 * math.log10(d1)))
             rssi_5_1 = int(round(-42.0 - 20.0 * math.log10(d1)))
@@ -616,21 +633,33 @@ def create_demo_fleet_dataset(storage_dir: str, env_id: str = "demo_fleet_house"
             })
 
         if len(events_alice) >= 20 or i == num_steps_a - 1:
-            batch_path = os.path.join(alice_dir, f"batch_{t_ns}_{batch_seq:04d}.ndjson.gz")
+            batch_path = os.path.join(alice_lf, f"batch_{t_ns}_{batch_seq:04d}.ndjson.gz")
             envelope = {"event_type": "batch_envelope", "device_id": "device_alice", "environment_id": env_id, "timestamp_ns": t_ns, "batch_seq": batch_seq, "event_count": len(events_alice)}
             raw = json.dumps(envelope) + "\n" + "\n".join(json.dumps(e) for e in events_alice) + "\n"
             with gzip.open(batch_path, "wb") as f:
                 f.write(raw.encode("utf-8"))
             events_alice = []
+
+            # Write corresponding HF batch
+            hf_path = os.path.join(alice_hf, f"batch_{t_ns}_{batch_seq:04d}.ndjson.gz")
+            hf_env = {"event_type": "batch_envelope", "device_id": "device_alice", "environment_id": env_id, "timestamp_ns": t_ns, "batch_seq": batch_seq, "event_count": len(hf_alice)}
+            raw_hf = json.dumps(hf_env) + "\n" + "\n".join(json.dumps(e) for e in hf_alice) + "\n"
+            with gzip.open(hf_path, "wb") as f:
+                f.write(raw_hf.encode("utf-8"))
+            hf_alice = []
             batch_seq += 1
 
     # 2. Device Bob in env_id (Room 2)
     bob_dir = os.path.join(base_fleet, "device_bob", env_id)
-    os.makedirs(bob_dir, exist_ok=True)
+    bob_lf = os.path.join(bob_dir, "lf")
+    bob_hf = os.path.join(bob_dir, "hf")
+    os.makedirs(bob_lf, exist_ok=True)
+    os.makedirs(bob_hf, exist_ok=True)
     paths["bob_env"] = bob_dir
 
     t_start_b = t_start + 120_000_000_000  # 2 minutes later
     events_bob = []
+    hf_bob = []
     batch_seq = 1
     num_steps_b = 70
 
@@ -649,10 +678,21 @@ def create_demo_fleet_dataset(storage_dir: str, env_id: str = "demo_fleet_house"
             "confidence": 0.95
         }
 
+        # High-frequency connected probe telemetry
+        hf_bob.append({
+            "event_type": "connected_probe",
+            "timestamp_ns": t_ns,
+            "bssid": "c8:3a:35:88:99:25",
+            "freq_mhz": 5240,
+            "rssi_dbm": int(round(-43.0 - 20.0 * math.log10(max(0.4, math.hypot(px - ap2_pos[0], py - ap2_pos[1]))))),
+            "tx_mbps": 866,
+            "rx_mbps": 866,
+            "pose": pose
+        })
+
         if i % 2 == 0:
             d1 = max(0.4, math.hypot(px - ap1_pos[0], py - ap1_pos[1]))
             d2 = max(0.4, math.hypot(px - ap2_pos[0], py - ap2_pos[1]))
-            # Bob is in Room 2 (x > 5.0). Wall to AP1 is crossed
             rssi_24_1 = int(round(-36.0 - 20.0 * math.log10(d1) - 2.5))
             rssi_5_1 = int(round(-42.0 - 20.0 * math.log10(d1) - 8.0))
             rssi_24_2 = int(round(-37.0 - 20.0 * math.log10(d2)))
@@ -676,26 +716,33 @@ def create_demo_fleet_dataset(storage_dir: str, env_id: str = "demo_fleet_house"
             })
 
         if len(events_bob) >= 20 or i == num_steps_b - 1:
-            batch_path = os.path.join(bob_dir, f"batch_{t_ns}_{batch_seq:04d}.ndjson.gz")
+            batch_path = os.path.join(bob_lf, f"batch_{t_ns}_{batch_seq:04d}.ndjson.gz")
             envelope = {"event_type": "batch_envelope", "device_id": "device_bob", "environment_id": env_id, "timestamp_ns": t_ns, "batch_seq": batch_seq, "event_count": len(events_bob)}
             raw = json.dumps(envelope) + "\n" + "\n".join(json.dumps(e) for e in events_bob) + "\n"
             with gzip.open(batch_path, "wb") as f:
                 f.write(raw.encode("utf-8"))
             events_bob = []
+
+            # Write corresponding HF batch
+            hf_path = os.path.join(bob_hf, f"batch_{t_ns}_{batch_seq:04d}.ndjson.gz")
+            hf_env = {"event_type": "batch_envelope", "device_id": "device_bob", "environment_id": env_id, "timestamp_ns": t_ns, "batch_seq": batch_seq, "event_count": len(hf_bob)}
+            raw_hf = json.dumps(hf_env) + "\n" + "\n".join(json.dumps(e) for e in hf_bob) + "\n"
+            with gzip.open(hf_path, "wb") as f:
+                f.write(raw_hf.encode("utf-8"))
+            hf_bob = []
             batch_seq += 1
 
     # 3. Transit Session (Device Alice commute)
     transit_dir = os.path.join(base_fleet, "device_alice", "transit_commute")
-    os.makedirs(transit_dir, exist_ok=True)
+    transit_lf = os.path.join(transit_dir, "lf")
+    os.makedirs(transit_lf, exist_ok=True)
     paths["alice_transit"] = transit_dir
 
     transit_events = []
     t_start_tr = t_start + 3600 * int(1e9)
     for i in range(15):
         t_ns = t_start_tr + int(i * 1.0 * 1e9)
-        # Fast linear motion
         pose = {"x": round(i * 15.0, 2), "y": round(i * 8.0, 2), "z": 0.0, "confidence": 0.3}
-        # Ephemeral transient BSSIDs seen once
         transit_events.append({
             "event_type": "wifi_scan_batch",
             "timestamp_ns": t_ns,
@@ -705,7 +752,7 @@ def create_demo_fleet_dataset(storage_dir: str, env_id: str = "demo_fleet_house"
             "pose": pose
         })
 
-    transit_batch = os.path.join(transit_dir, "batch_transit_0001.ndjson.gz")
+    transit_batch = os.path.join(transit_lf, "batch_transit_0001.ndjson.gz")
     tr_envelope = {"event_type": "batch_envelope", "is_transit": True, "device_id": "device_alice", "environment_id": "transit_commute", "timestamp_ns": t_start_tr, "batch_seq": 1, "event_count": len(transit_events)}
     raw_tr = json.dumps(tr_envelope) + "\n" + "\n".join(json.dumps(e) for e in transit_events) + "\n"
     with gzip.open(transit_batch, "wb") as f:
@@ -758,6 +805,7 @@ if __name__ == "__main__":
     parser.add_argument("--list-partitions", action="store_true", help="Scan storage and list discovered environments and transit quarantines")
     parser.add_argument("--list-clusters", action="store_true", help="Cluster environments by shared AP recurrence and list unified buildings")
     parser.add_argument("--auto-cluster", action="store_true", help="Automatically cluster fragmented environments before reconstruction")
+    parser.add_argument("--all-clusters", action="store_true", help="Reconstruct all discovered building clusters in bucket")
     parser.add_argument("--demo", action="store_true", help="Generate synthetic multi-room blob data and run reconstruction end-to-end")
     parser.add_argument("--device", type=str, default=None, help="Compute device ('cuda:0', 'cpu', or auto-detect)")
     parser.add_argument("--model", type=str, default=None, choices=["fourier", "hashgrid", "siren", "nerf_3d"], help="Neural continuous coordinate field architecture")
@@ -795,6 +843,44 @@ if __name__ == "__main__":
             }
         }
         print(json.dumps(summary, indent=2))
+        sys.exit(0)
+
+    cfg = get_default_config()
+    if args.model is not None:
+        cfg.model_type = args.model
+    if args.bands is not None:
+        cfg.fourier_bands = args.bands
+    if args.l1 is not None:
+        cfg.fista_l1_reg = args.l1
+    if args.tv is not None:
+        cfg.fista_tv_reg = args.tv
+    if args.wall_percentile is not None:
+        cfg.wall_threshold_percentile = args.wall_percentile
+    if args.carve_radius is not None:
+        cfg.free_space_radius_m = args.carve_radius
+
+    if args.all_clusters:
+        adapter = BlobStoreAdapter(args.blob_uri)
+        partitioner = SessionPartitioner(adapter)
+        clusters = partitioner.cluster_environments_by_ap_recurrence()
+        if not clusters:
+            print(f"[-] No building clusters found in {args.blob_uri}")
+            sys.exit(0)
+        print(f"[*] Found {len(clusters)} building clusters to reconstruct.")
+        results = {}
+        for c_id in sorted(clusters.keys()):
+            print(f"\n{'='*75}\n[*] Running Reconstruction for Cluster: {c_id}\n{'='*75}")
+            res = run_reconstruction_pipeline(
+                blob_uri=args.blob_uri,
+                env_id=c_id,
+                output_dir=args.output_dir,
+                config=cfg,
+                device=args.device,
+                clean=args.clean,
+                clean_all=False
+            )
+            results[c_id] = res
+        print(f"\n[✓] Successfully reconstructed all {len(results)} clusters in bucket.")
         sys.exit(0)
 
     if args.auto_cluster and not args.env_id:

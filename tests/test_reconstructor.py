@@ -92,12 +92,19 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         adapter = BlobStoreAdapter(self.fleet_dir)
         partitioner = SessionPartitioner(adapter)
 
-        # 1. Test key parsing
-        sample_key = "fleet/device_alice/living_room/batch_001.ndjson.gz"
-        parsed = parse_fleet_key(sample_key)
-        self.assertIsNotNone(parsed)
-        self.assertEqual(parsed[0], "device_alice")
-        self.assertEqual(parsed[1], "living_room")
+        # 1. Test key parsing with strict tiered hierarchy
+        sample_key_hf = "fleet/device_alice/living_room/hf/batch_001.ndjson.gz"
+        sample_key_lf = "fleet/device_bob/office/lf/batch_002.ndjson.gz"
+        parsed_hf = parse_fleet_key(sample_key_hf)
+        parsed_lf = parse_fleet_key(sample_key_lf)
+        self.assertIsNotNone(parsed_hf)
+        self.assertIsNotNone(parsed_lf)
+        self.assertEqual(parsed_hf[0], "device_alice")
+        self.assertEqual(parsed_hf[1], "living_room")
+        self.assertEqual(parsed_hf[2], "hf")
+        self.assertEqual(parsed_lf[2], "lf")
+        # Legacy non-tiered key must be rejected under strict enforcement
+        self.assertIsNone(parse_fleet_key("fleet/device_alice/living_room/batch_001.ndjson.gz"))
 
         # 2. Test scanning fleet partitions
         partitions = partitioner.scan_fleet_partitions()
@@ -363,6 +370,19 @@ class TestWifiNerfReconstructor(unittest.TestCase):
             removed_all = clean_output_directory(tmp_out, purge_all=True)
             self.assertEqual(len(removed_all), 1)
             self.assertFalse(os.path.exists(t3))
+
+    def test_16_tiered_stream_and_all_clusters(self):
+        adapter = BlobStoreAdapter(self.fleet_dir)
+        hf_objs = adapter.list_fleet_objects(tier="hf")
+        lf_objs = adapter.list_fleet_objects(tier="lf")
+        self.assertGreater(len(hf_objs), 0)
+        self.assertGreater(len(lf_objs), 0)
+
+        # Assemble environment across both tiers
+        assembler = SessionAssembler(adapter)
+        env_data = assembler.assemble_environment(self.env_id)
+        self.assertGreater(len(env_data["events"]), 50)
+        self.assertGreaterEqual(env_data["batch_count"], 4)
 
 if __name__ == "__main__":
     unittest.main()

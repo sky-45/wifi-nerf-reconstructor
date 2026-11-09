@@ -68,18 +68,20 @@ class BlobStoreAdapter:
         else:
             raise ValueError(f"Unsupported storage scheme: {scheme}")
 
-    def list_fleet_objects(self, device_id: Optional[str] = None, env_id: Optional[str] = None) -> List[str]:
-        """Filters objects under the fleet partition hierarchy by device_id and/or env_id."""
+    def list_fleet_objects(self, device_id: Optional[str] = None, env_id: Optional[str] = None, tier: Optional[str] = None) -> List[str]:
+        """Filters objects under the fleet partition hierarchy by device_id, env_id, and/or tier ('hf' or 'lf')."""
         all_objs = self.list_all_objects()
         matching = []
         for obj in all_objs:
             parsed = parse_fleet_key(obj)
             if not parsed:
                 continue
-            d_id, e_id, _ = parsed
+            d_id, e_id, t_id, _ = parsed
             if device_id and d_id != device_id:
                 continue
             if env_id and e_id != env_id:
+                continue
+            if tier and t_id != tier:
                 continue
             matching.append(obj)
         return sorted(matching)
@@ -93,9 +95,10 @@ class BlobStoreAdapter:
             session_dir = os.path.join(base_dir, session_id)
             files = []
             if os.path.isdir(session_dir):
-                for fname in os.listdir(session_dir):
-                    if fname.endswith(".ndjson.gz") or fname.endswith(".jsonl.gz") or fname.endswith(".jsonl") or fname.endswith(".ndjson"):
-                        files.append(os.path.join(session_dir, fname))
+                for root, _, fnames in os.walk(session_dir):
+                    for fname in fnames:
+                        if fname.endswith((".ndjson.gz", ".jsonl.gz", ".jsonl", ".ndjson")):
+                            files.append(os.path.join(root, fname))
             if files:
                 return sorted(files)
 
@@ -394,9 +397,11 @@ class SessionAssembler:
 
             if envelope:
                 batch_seq = envelope.get("batch_seq")
-                if batch_seq is not None and batch_seq in seen_batch_ids:
+                tier = "hf" if "/hf/" in key.replace("\\", "/") else ("lf" if "/lf/" in key.replace("\\", "/") else "default")
+                batch_uid = (tier, batch_seq)
+                if batch_seq is not None and batch_uid in seen_batch_ids:
                     continue  # Deduplicate retried batch
-                seen_batch_ids.add(batch_seq)
+                seen_batch_ids.add(batch_uid)
                 envelopes.append(envelope)
 
             all_events.extend(batch_events)
@@ -457,9 +462,11 @@ class SessionAssembler:
 
                 if envelope:
                     batch_seq = envelope.get("batch_seq")
-                    if batch_seq is not None and batch_seq in seen_batch_ids:
+                    tier = "hf" if "/hf/" in key.replace("\\", "/") else ("lf" if "/lf/" in key.replace("\\", "/") else "default")
+                    batch_uid = (tier, batch_seq)
+                    if batch_seq is not None and batch_uid in seen_batch_ids:
                         continue
-                    seen_batch_ids.add(batch_seq)
+                    seen_batch_ids.add(batch_uid)
                     all_envelopes.append(envelope)
 
                 dev_evs.extend(batch_events)

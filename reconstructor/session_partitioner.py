@@ -22,42 +22,28 @@ import numpy as np
 
 from reconstructor.ap_localizer import MultiApLocalizer
 
-# Regex matching standard fleet partition hierarchy:
-# e.g., .../fleet/{device_id}/{env_id}/batch_0001.ndjson.gz
-# or fleet/{device_id}/{env_id}/batch_0001.jsonl
+# Regex strictly matching tiered fleet partition hierarchy:
+# e.g., .../fleet/{device_id}/{env_id}/hf/batch_0001.ndjson.gz
+# or fleet/{device_id}/{env_id}/lf/batch_0001.ndjson.gz
 FLEET_PARTITION_REGEX = re.compile(
-    r"(?:^|/)fleet/([^/]+)/([^/]+)/([^/]+\.(?:ndjson(?:\.gz)?|jsonl(?:\.gz)?))$"
+    r"(?:^|/)fleet/([^/]+)/([^/]+)/(hf|lf)/([^/]+\.(?:ndjson(?:\.gz)?|jsonl(?:\.gz)?))$"
 )
 
 # Standard transit naming conventions
 TRANSIT_KEYWORDS = {"transit", "commute", "travel", "driving", "subway", "bus", "train"}
 
 
-def parse_fleet_key(object_key: str) -> Optional[Tuple[str, str, str]]:
+def parse_fleet_key(object_key: str) -> Optional[Tuple[str, str, str, str]]:
     """
-    Parses a storage key or file path into (device_id, env_id, filename).
-    Handles:
-      - fleet/device_01/living_room/batch_001.ndjson.gz
-      - /data/blob_store/fleet/device_01/living_room/batch_001.ndjson.gz
-      - prefix/fleet/device_01/living_room/batch_001.ndjson.gz
+    Parses a storage key or file path into (device_id, env_id, tier, filename).
+    Strictly enforces:
+      - fleet/{device_id}/{env_id}/hf/batch_{seq}.ndjson.gz
+      - fleet/{device_id}/{env_id}/lf/batch_{seq}.ndjson.gz
     """
     normalized = object_key.replace("\\", "/")
     match = FLEET_PARTITION_REGEX.search(normalized)
     if match:
-        return match.group(1), match.group(2), match.group(3)
-
-    # Fallback to rfind /fleet/
-    idx = normalized.rfind("/fleet/")
-    if idx != -1:
-        sub = normalized[idx + len("/fleet/"):]
-        parts = sub.split("/")
-        if len(parts) >= 3:
-            return parts[0], parts[1], parts[-1]
-    elif normalized.startswith("fleet/"):
-        parts = normalized[len("fleet/"):].split("/")
-        if len(parts) >= 3:
-            return parts[0], parts[1], parts[-1]
-
+        return match.group(1), match.group(2), match.group(3), match.group(4)
     return None
 
 
@@ -251,14 +237,13 @@ class SessionPartitioner:
         for key in all_objects:
             parsed = parse_fleet_key(key)
             if parsed:
-                device_id, env_id, _ = parsed
+                device_id, env_id, tier, filename = parsed
                 partitions.setdefault(env_id, {}).setdefault(device_id, []).append(key)
             else:
-                # Flat session or non-fleet structure
-                # e.g., session_id/batch_001.ndjson.gz
+                # Standalone session with tier: e.g. session_id/(hf|lf)/batch_001.ndjson.gz
                 parts = key.replace("\\", "/").split("/")
-                if len(parts) >= 2:
-                    env_id = parts[-2]
+                if len(parts) >= 3 and parts[-2] in ("hf", "lf"):
+                    env_id = parts[-3]
                     partitions.setdefault(env_id, {}).setdefault("default_device", []).append(key)
 
         # Sort batch keys deterministically

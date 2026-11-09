@@ -571,8 +571,8 @@ def generate_interactive_html_viewer(
     }}
 
     function centerOnPhone() {{
-      const primaryKey = DEVICE_KEYS[0];
-      const pts = DEVICE_MAP[primaryKey];
+      const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
+      const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
       if (!pts || pts.length === 0) return;
       const pose = getInterpolatedPose(pts, playbackPct);
       if (!pose) return;
@@ -1310,14 +1310,15 @@ def generate_interactive_html_viewer(
 
     function initWebGL() {{
       if (gl) return;
-      gl = canvas3D.getContext('webgl', {{ antialias: true, alpha: false }}) ||
+      gl = canvas3D.getContext('webgl2', {{ antialias: true, alpha: false }}) ||
+           canvas3D.getContext('webgl', {{ antialias: true, alpha: false }}) ||
            canvas3D.getContext('experimental-webgl');
       if (!gl) {{
-        alert('WebGL is not supported in this browser.');
+        console.warn('WebGL is not supported in this browser.');
         return;
       }}
 
-      // Shaders
+      // Shaders - GLSL ES 1.00 compliant with explicit 3-component vector constructors
       const vsSource = `
         attribute vec3 aPosition;
         attribute vec3 aNormal;
@@ -1332,9 +1333,9 @@ def generate_interactive_html_viewer(
         void main() {{
           gl_Position = uProjection * uView * vec4(aPosition, 1.0);
           float diff = max(dot(aNormal, uLightDir), 0.0);
-          vec3 light = vec3(0.55) + vec3(0.45) * diff;
+          vec3 light = vec3(0.55, 0.55, 0.55) + vec3(0.45, 0.45, 0.45) * diff;
           if (length(aNormal) < 0.1) {{
-            light = vec3(1.0);
+            light = vec3(1.0, 1.0, 1.0);
           }}
           vColor = vec4(aColor.rgb * light, aColor.a);
         }}
@@ -1352,6 +1353,9 @@ def generate_interactive_html_viewer(
         const s = gl.createShader(type);
         gl.shaderSource(s, source);
         gl.compileShader(s);
+        if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {{
+          console.error('WebGL Shader Compile Error:', gl.getShaderInfoLog(s));
+        }}
         return s;
       }}
 
@@ -1361,6 +1365,9 @@ def generate_interactive_html_viewer(
       gl.attachShader(shaderProgram, vs);
       gl.attachShader(shaderProgram, fs);
       gl.linkProgram(shaderProgram);
+      if (!gl.getProgramParameter(shaderProgram, gl.LINK_STATUS)) {{
+        console.error('WebGL Program Link Error:', gl.getProgramInfoLog(shaderProgram));
+      }}
       gl.useProgram(shaderProgram);
 
       uProjectionLoc = gl.getUniformLocation(shaderProgram, 'uProjection');
@@ -1522,8 +1529,8 @@ def generate_interactive_html_viewer(
 
       // 5. Dynamic Phone Avatar & Heading Pointer
       if (document.getElementById('layer-phone').checked) {{
-        const primaryKey = DEVICE_KEYS[0];
-        const pts = DEVICE_MAP[primaryKey];
+        const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
+        const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
         if (pts && pts.length > 0) {{
           const pose = getInterpolatedPose(pts, playbackPct);
           if (pose) {{
@@ -1570,6 +1577,7 @@ def generate_interactive_html_viewer(
 
       gl.viewport(0, 0, w, h);
       gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+      gl.useProgram(shaderProgram);
 
       const projMatrix = Mat4.create();
       Mat4.perspective(projMatrix, 50 * Math.PI / 180, w / h, 0.1, 500);
@@ -1579,8 +1587,8 @@ def generate_interactive_html_viewer(
 
       if (viewMode === 'POV') {{
         // Snap camera directly to active phone pose looking forward at eye level (1.6m)
-        const primaryKey = DEVICE_KEYS[0];
-        const pts = DEVICE_MAP[primaryKey];
+        const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
+        const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
         const pose = (pts && pts.length > 0) ? getInterpolatedPose(pts, playbackPct) : null;
         let eye = [BBOX_CENTER.x, 1.6, BBOX_CENTER.y];
         let target = [BBOX_CENTER.x + 1.0, 1.55, BBOX_CENTER.y];
@@ -1800,8 +1808,8 @@ def generate_interactive_html_viewer(
 
         if (force || now - lastHudUpdate > 60) {{
           lastHudUpdate = now;
-          const primaryKey = DEVICE_KEYS[0];
-          const pts = DEVICE_MAP[primaryKey];
+          const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
+          const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
           if (pts && pts.length > 0) {{
             const pose = getInterpolatedPose(pts, playbackPct);
             if (!pose) return;
@@ -1904,8 +1912,8 @@ def generate_interactive_html_viewer(
           updateUI();
 
           if (followPhone && viewMode === 'CAD') {{
-            const primaryKey = DEVICE_KEYS[0];
-            const pts = DEVICE_MAP[primaryKey];
+            const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
+            const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
             if (pts && pts.length > 0) {{
               const pose = getInterpolatedPose(pts, playbackPct);
               if (pose) {{
