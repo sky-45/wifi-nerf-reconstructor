@@ -1,11 +1,15 @@
 """
-Interactive 2D & 2.5D Isometric HTML Floorplan Viewer & GeoJSON / SVG Exporter.
-Generates a standalone, beautiful HTML5 web application (no external server required)
-with dual-canvas performance optimization (60 FPS silky-smooth rendering),
-wall confidence & uncertainty filter slider, interactive wall inspector card,
-ray observability coverage map, layer toggles, 2.5D isometric extruded rooms,
-and an animated 3D Phone Location Tracker with proximity obstacle boundaries
-and dynamic laser rangefinder rays.
+Interactive 2D Architectural CAD Blueprint & Free 3D Orbital HTML Floorplan Viewer & GeoJSON Exporter.
+Features:
+- View Mode 1: 📐 Classic Top-Down Architectural CAD Blueprint (Navy #0c2340 background,
+  dimension witness lines with arrows, 90° door swing arcs, wall thickness ribbons,
+  room dimension tags, graphic scale ruler, and North compass rose). Default view.
+- View Mode 2: 🌐 Free 3D Orbital Navigation (Three.js WebGL with full 360° continuous rotation,
+  pitch/tilt, pan, zoom, extruded 3D walls with 0.15m thickness, lighting, and shadow drops).
+- View Mode 3: 🚶 First-Person Walkthrough ("Phone-Eye POV" inside rooms at eye level).
+- Dedicated Recenter & Framing Toolbar (🎯 Fit Building, 📱 Follow Phone, 🏠 Jump to Room).
+- Wall Certainty Filter Slider, Interactive Hover Wall Inspector Card, and Survey Ray Observability Map.
+- Offline-safe graceful fallback to Canvas orbital engine if WebGL/CDN is unavailable.
 """
 
 import json
@@ -85,9 +89,8 @@ def generate_interactive_html_viewer(
     ray_density_map: Optional[List[List[int]]] = None
 ) -> str:
     """
-    Renders a self-contained, responsive HTML5 dashboard with 2D blueprint,
-    2.5D Isometric 3D extruded rooms, animated 3D Phone Tracker with laser rangefinder,
-    and wall confidence/uncertainty inspection tools.
+    Renders an architectural-grade HTML5 dashboard with Classic Top-Down Blueprint CAD view,
+    Three.js Free 3D Orbital Navigation, First-Person Walkthrough, and camera recentering.
     """
     dims = floorplan_data.get("grid_dimensions", {"width_m": 10.0, "height_m": 8.0})
     walls_json = json.dumps(floorplan_data.get("walls", []))
@@ -104,42 +107,48 @@ def generate_interactive_html_viewer(
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Wi-Fi NeRF Floorplan Explorer - {session_id}</title>
+  <title>Wi-Fi NeRF Architectural Explorer - {session_id}</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <!-- Three.js & OrbitControls for Free 3D Navigation -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
   <style>
-    * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }}
-    body {{ background: #0f172a; color: #f8fafc; display: flex; height: 100vh; overflow: hidden; }}
-    #sidebar {{ width: 350px; background: #1e293b; border-right: 1px solid #334155; padding: 20px; overflow-y: auto; display: flex; flex-direction: column; gap: 16px; }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", sans-serif; }}
+    body {{ background: #0c2340; color: #f8fafc; display: flex; height: 100vh; overflow: hidden; }}
+    #sidebar {{ width: 350px; background: #0a192f; border-right: 1px solid #1e3a5f; padding: 18px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; z-index: 20; }}
     #viewport-container {{ flex: 1; display: flex; flex-direction: column; position: relative; }}
-    #top-bar {{ height: 56px; background: #1e293b; border-bottom: 1px solid #334155; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; }}
-    #canvas-container {{ flex: 1; position: relative; background: #0b0f19; overflow: hidden; }}
+    #top-bar {{ height: 56px; background: #0a192f; border-bottom: 1px solid #1e3a5f; display: flex; align-items: center; justify-content: space-between; padding: 0 18px; z-index: 20; gap: 12px; }}
+    #canvas-container {{ flex: 1; position: relative; background: #0c2340; overflow: hidden; }}
     canvas {{ display: block; position: absolute; top: 0; left: 0; width: 100%; height: 100%; }}
     #mapCanvasStatic {{ z-index: 1; pointer-events: none; }}
     #mapCanvasDynamic {{ z-index: 2; }}
-    .badge {{ display: inline-block; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 600; background: #38bdf8; color: #0f172a; }}
+    #threeContainer {{ position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 5; display: none; }}
+    .badge {{ display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; background: #38bdf8; color: #0a192f; }}
     .badge-grade {{ background: #22c55e; color: #052e16; }}
-    .card {{ background: #0f172a; border: 1px solid #334155; border-radius: 8px; padding: 14px; font-size: 13px; }}
-    .metric-row {{ display: flex; justify-content: space-between; margin-bottom: 6px; }}
+    .card {{ background: #0d2238; border: 1px solid #1e3a5f; border-radius: 8px; padding: 12px 14px; font-size: 13px; }}
+    .metric-row {{ display: flex; justify-content: space-between; margin-bottom: 5px; }}
     .metric-val {{ font-weight: 600; color: #38bdf8; }}
-    .toggle-row {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 8px; font-size: 13px; cursor: pointer; }}
+    .toggle-row {{ display: flex; align-items: center; justify-content: space-between; margin-bottom: 7px; font-size: 12.5px; cursor: pointer; }}
     .toggle-row input {{ cursor: pointer; }}
-    .btn {{ background: #38bdf8; color: #0f172a; border: none; padding: 8px 14px; border-radius: 6px; font-weight: 600; cursor: pointer; transition: 0.2s; }}
+    .btn {{ background: #38bdf8; color: #0a192f; border: none; padding: 7px 12px; border-radius: 6px; font-weight: 600; font-size: 12px; cursor: pointer; transition: 0.2s; display: inline-flex; align-items: center; gap: 5px; }}
     .btn:hover {{ background: #7dd3fc; }}
-    .btn-group {{ display: flex; gap: 8px; }}
-    #tooltip {{ position: absolute; background: rgba(15, 23, 42, 0.95); border: 1px solid #38bdf8; padding: 6px 10px; border-radius: 4px; font-size: 12px; pointer-events: none; display: none; z-index: 20; }}
+    .btn-secondary {{ background: #1e3a5f; color: #f8fafc; }}
+    .btn-secondary:hover {{ background: #2d5584; }}
+    .btn-group {{ display: flex; gap: 6px; align-items: center; }}
+    #tooltip {{ position: absolute; background: rgba(10, 25, 47, 0.95); border: 1px solid #38bdf8; padding: 6px 10px; border-radius: 4px; font-size: 12px; pointer-events: none; display: none; z-index: 30; }}
     #wall-inspector {{
       position: absolute;
       bottom: 20px;
       left: 20px;
       width: 320px;
-      background: rgba(15, 23, 42, 0.94);
+      background: rgba(10, 25, 47, 0.94);
       backdrop-filter: blur(10px);
       border: 1px solid #38bdf8;
       border-radius: 8px;
-      padding: 14px;
+      padding: 12px 14px;
       font-size: 12px;
       box-shadow: 0 8px 24px rgba(0, 0, 0, 0.6);
-      z-index: 15;
+      z-index: 25;
       display: none;
       pointer-events: none;
       animation: fadeIn 0.15s ease-out;
@@ -149,26 +158,35 @@ def generate_interactive_html_viewer(
       position: absolute;
       top: 14px;
       right: 14px;
-      z-index: 10;
+      z-index: 25;
       width: 270px;
-      background: rgba(15, 23, 42, 0.90);
+      background: rgba(10, 25, 47, 0.90);
       backdrop-filter: blur(8px);
       border: 1px solid #38bdf8;
       border-radius: 8px;
-      padding: 12px 14px;
+      padding: 10px 14px;
       font-size: 12px;
       box-shadow: 0 6px 24px rgba(0, 0, 0, 0.6);
       pointer-events: none;
     }}
     #playback-bar {{
-      height: 54px;
-      background: #1e293b;
-      border-top: 1px solid #334155;
+      height: 52px;
+      background: #0a192f;
+      border-top: 1px solid #1e3a5f;
       display: flex;
       align-items: center;
       padding: 0 16px;
       gap: 12px;
-      z-index: 10;
+      z-index: 20;
+    }}
+    select.btn {{
+      appearance: none;
+      -webkit-appearance: none;
+      padding-right: 20px;
+      background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='white' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
+      background-repeat: no-repeat;
+      background-position: right 6px center;
+      background-size: 12px;
     }}
   </style>
 </head>
@@ -176,15 +194,15 @@ def generate_interactive_html_viewer(
 
   <div id="sidebar">
     <div>
-      <h2 style="font-size: 18px; color: #38bdf8; margin-bottom: 4px;">Wi-Fi NeRF Floorplan</h2>
-      <span style="font-size: 12px; color: #94a3b8;">Session: {session_id}</span>
+      <h2 style="font-size: 17px; color: #38bdf8; margin-bottom: 2px;">Architectural Blueprint</h2>
+      <span style="font-size: 11px; color: #94a3b8;">Session: {session_id}</span>
     </div>
 
     <!-- Wall Certainty Filter Slider -->
     <div class="card">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
         <span style="font-weight: 600; color: #e2e8f0;">Wall Certainty Filter</span>
-        <span id="conf-val" class="badge" style="background: #38bdf8; color: #0f172a;">≥ 35%</span>
+        <span id="conf-val" class="badge">≥ 35%</span>
       </div>
       <input type="range" id="slider-wall-conf" min="5" max="90" value="35" step="5" style="width: 100%; cursor: pointer;" oninput="updateConfidenceFilter(this.value)">
       <div style="display: flex; justify-content: space-between; font-size: 11px; color: #94a3b8; margin-top: 4px;">
@@ -192,16 +210,16 @@ def generate_interactive_html_viewer(
         <span id="wall-count-badge" style="color: #38bdf8; font-weight: 600;">Walls: --</span>
         <span>Confirmed (70%+)</span>
       </div>
-      <div style="margin-top: 10px; font-size: 11px; line-height: 1.5; color: #cbd5e1; border-top: 1px solid #334155; padding-top: 8px;">
-        <div><strong style="color: #38bdf8;">― Solid Bold:</strong> Confirmed Structural (≥70%)</div>
-        <div><strong style="color: #f59e0b;">╌ Dashed Amber:</strong> Probable Partition (40–69%)</div>
-        <div><strong style="color: #94a3b8;">··· Dotted Gray:</strong> Speculative / Noise (&lt;40%)</div>
+      <div style="margin-top: 8px; font-size: 11px; line-height: 1.5; color: #cbd5e1; border-top: 1px solid #1e3a5f; padding-top: 6px;">
+        <div><strong style="color: #38bdf8;">― Solid Ribbon:</strong> Confirmed Structural (≥70%)</div>
+        <div><strong style="color: #f59e0b;">╌ Dashed Line:</strong> Probable Partition (40–69%)</div>
+        <div><strong style="color: #94a3b8;">··· Dotted Thin:</strong> Speculative Noise (&lt;40%)</div>
       </div>
     </div>
 
     <!-- Evaluation Metrics Card -->
     <div class="card">
-      <div style="font-weight: 600; margin-bottom: 8px; color: #e2e8f0;">Reconstruction Metrics</div>
+      <div style="font-weight: 600; margin-bottom: 6px; color: #e2e8f0;">Reconstruction Metrics</div>
       <div class="metric-row">
         <span>Quality Grade:</span>
         <span class="badge badge-grade" id="m-grade">{eval_metrics.get('quality_grade', 'GRADE C').split()[0]}</span>
@@ -222,53 +240,67 @@ def generate_interactive_html_viewer(
 
     <!-- Display Layer Toggles -->
     <div class="card">
-      <div style="font-weight: 600; margin-bottom: 8px; color: #e2e8f0;">Display Layers</div>
-      <label class="toggle-row"><input type="checkbox" id="layer-walls" checked onchange="drawStaticScene()"> <span>CAD Vector Walls</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-labels" checked onchange="drawStaticScene()"> <span>Room & Wall Labels</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-doors" checked onchange="drawStaticScene()"> <span>Doorway Openings</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-rooms" checked onchange="drawStaticScene()"> <span>Room Zones & Colors</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-aps" checked onchange="drawStaticScene()"> <span>Pinned Access Points</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-coverage" onchange="drawStaticScene()"> <span>Survey Ray Coverage (Observability)</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-phone" checked onchange="drawDynamicScene()"> <span>3D Phone Avatar & Beam</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-proximity" checked onchange="drawDynamicScene()"> <span>Proximity Halo & Range Rays</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-slam" checked onchange="drawStaticScene()"> <span>SLAM Corrected Path</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-raw" onchange="drawStaticScene()"> <span>Raw Drifted IMU Path</span></label>
-      <label class="toggle-row"><input type="checkbox" id="layer-heatmap" onchange="drawStaticScene()"> <span>RF Voxel Density Heatmap</span></label>
+      <div style="font-weight: 600; margin-bottom: 6px; color: #e2e8f0;">Architectural Layers</div>
+      <label class="toggle-row"><input type="checkbox" id="layer-walls" checked onchange="onLayerChange()"> <span>Structural Walls</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-labels" checked onchange="onLayerChange()"> <span>Dimensions & Room Names</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-doors" checked onchange="onLayerChange()"> <span>90° Door Swing Arcs</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-rooms" checked onchange="onLayerChange()"> <span>Room Zone Polygons</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-aps" checked onchange="onLayerChange()"> <span>Pinned Access Points</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-coverage" onchange="onLayerChange()"> <span>Survey Observability Heatmap</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-phone" checked onchange="onLayerChange()"> <span>Phone Avatar & Cone</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-proximity" checked onchange="onLayerChange()"> <span>Proximity Halo & Laser Rays</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-slam" checked onchange="onLayerChange()"> <span>SLAM Corrected Path</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-raw" onchange="onLayerChange()"> <span>Raw Drifted IMU Path</span></label>
+      <label class="toggle-row"><input type="checkbox" id="layer-heatmap" onchange="onLayerChange()"> <span>RF Voxel Density Heatmap</span></label>
     </div>
 
     <!-- Detected Rooms Card -->
     <div class="card">
-      <div style="font-weight: 600; margin-bottom: 8px; color: #e2e8f0;">Detected Rooms ({len(floorplan_data.get('rooms', []))})</div>
+      <div style="font-weight: 600; margin-bottom: 6px; color: #e2e8f0;">Rooms ({len(floorplan_data.get('rooms', []))})</div>
       <div id="room-list" style="font-size: 12px; color: #94a3b8; display: flex; flex-direction: column; gap: 4px;">
       </div>
     </div>
 
     <div style="margin-top: auto;">
-      <button class="btn" style="width: 100%;" onclick="downloadGeoJSON()">Export GeoJSON (with Confidence)</button>
+      <button class="btn" style="width: 100%; justify-content: center;" onclick="downloadGeoJSON()">Export GeoJSON</button>
     </div>
   </div>
 
   <div id="viewport-container">
+    <!-- Top Navigation & Recenter Bar -->
     <div id="top-bar">
       <div class="btn-group">
-        <button class="btn" id="btn-2d" onclick="setViewMode('2D')">2D Blueprint</button>
-        <button class="btn" style="background: #334155; color: #f8fafc;" id="btn-3d" onclick="setViewMode('3D')">2.5D Isometric 3D</button>
+        <button class="btn" id="btn-cad" onclick="setViewMode('CAD')">📐 Top Blueprint</button>
+        <button class="btn btn-secondary" id="btn-3d" onclick="setViewMode('3D')">🌐 Free 3D Orbit</button>
+        <button class="btn btn-secondary" id="btn-pov" onclick="setViewMode('POV')">🚶 Walkthrough</button>
       </div>
-      <div style="font-size: 13px; color: #94a3b8;">
-        Hover walls for certainty breakdown | Mouse Wheel: Zoom | Left Click & Drag: Pan
+
+      <div class="btn-group">
+        <button class="btn btn-secondary" onclick="recenterBuilding()" title="Fit entire floorplan to screen">🎯 Recenter</button>
+        <button class="btn btn-secondary" onclick="centerOnPhone()" title="Center camera on phone">📱 Follow</button>
+        <select id="room-jump-select" class="btn btn-secondary" onchange="jumpToRoom(this.value)">
+          <option value="">🏠 Jump to Room...</option>
+        </select>
+      </div>
+
+      <div style="font-size: 12px; color: #94a3b8; display: flex; align-items: center; gap: 10px;">
+        <span id="nav-hint">Left Drag: Pan | Wheel: Zoom | Space: Play</span>
       </div>
     </div>
 
     <div id="canvas-container">
-      <!-- Dual-Canvas Architecture -->
+      <!-- 2D Canvas Stack (Classic Blueprint CAD) -->
       <canvas id="mapCanvasStatic"></canvas>
       <canvas id="mapCanvasDynamic"></canvas>
 
+      <!-- Three.js WebGL Container (Free 3D Orbit & POV) -->
+      <div id="threeContainer"></div>
+
       <!-- Real-Time Telemetry HUD -->
       <div id="telemetry-hud">
-        <div style="font-weight: 700; color: #38bdf8; font-size: 12px; margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between;">
+        <div style="font-weight: 700; color: #38bdf8; font-size: 12px; margin-bottom: 4px; display: flex; align-items: center; justify-content: space-between;">
           <span>📍 Phone & Clearance HUD</span>
-          <span id="hud-status" class="badge" style="font-size: 10px; background: #22c55e; color: #052e16;">CLEAR</span>
+          <span id="hud-status" class="badge" style="background: #22c55e; color: #052e16;">CLEAR</span>
         </div>
         <div class="metric-row"><span>Device:</span><span class="metric-val" id="hud-device">Phone 1</span></div>
         <div class="metric-row"><span>Position (X, Y, Z):</span><span class="metric-val" id="hud-coords">0.0m, 0.0m, 1.1m</span></div>
@@ -280,7 +312,7 @@ def generate_interactive_html_viewer(
 
       <!-- Interactive Wall Inspector Card -->
       <div id="wall-inspector">
-        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
           <strong id="wi-title" style="color: #38bdf8; font-size: 13px;">Wall Inspector</strong>
           <span id="wi-badge" class="badge">Confirmed</span>
         </div>
@@ -297,10 +329,10 @@ def generate_interactive_html_viewer(
 
     <!-- Interactive Playback Toolbar -->
     <div id="playback-bar">
-      <button id="btn-play" class="btn" style="padding: 6px 14px; font-size: 12px; display: flex; align-items: center; gap: 6px;" onclick="togglePlayback()">
+      <button id="btn-play" class="btn" style="padding: 6px 14px; font-size: 12px;" onclick="togglePlayback()">
         <span id="play-icon">▶</span> <span id="play-text">Play</span>
       </button>
-      <select id="speed-select" class="btn" style="background: #334155; color: #f8fafc; padding: 5px 8px; font-size: 12px;" onchange="setPlaybackSpeed(this.value)">
+      <select id="speed-select" class="btn btn-secondary" style="padding: 5px 8px; font-size: 12px;" onchange="setPlaybackSpeed(this.value)">
         <option value="0.5">0.5x</option>
         <option value="1.0" selected>1.0x</option>
         <option value="2.0">2.0x</option>
@@ -314,7 +346,7 @@ def generate_interactive_html_viewer(
         <span style="font-size: 12px;">Follow Phone</span>
       </label>
       <label style="display: flex; align-items: center; gap: 6px; cursor: pointer; color: #cbd5e1;">
-        <input type="checkbox" id="chk-full-trail" checked onchange="drawStaticScene(); drawDynamicScene();">
+        <input type="checkbox" id="chk-full-trail" checked onchange="onLayerChange()">
         <span style="font-size: 12px;">Full Trail</span>
       </label>
     </div>
@@ -332,12 +364,27 @@ def generate_interactive_html_viewer(
     const RAY_COVERAGE = {ray_density_json};
     const METRICS = {metrics_json};
 
-    // Precomputed Isometric Constants
-    const COS_30 = 0.86602540378;
-    const SIN_30 = 0.5;
+    // Calculate Bounding Box of all walls for auto-framing
+    let BBOX = {{ minX: 0, maxX: DIMS.width_m, minY: 0, maxY: DIMS.height_m }};
+    if (WALLS.length > 0) {{
+      const xs = WALLS.flatMap(w => [w.x1, w.x2]);
+      const ys = WALLS.flatMap(w => [w.y1, w.y2]);
+      BBOX = {{
+        minX: Math.min(...xs),
+        maxX: Math.max(...xs),
+        minY: Math.min(...ys),
+        maxY: Math.max(...ys)
+      }};
+    }}
+    const BBOX_CENTER = {{
+      x: (BBOX.minX + BBOX.maxX) / 2.0,
+      y: (BBOX.minY + BBOX.maxY) / 2.0
+    }};
+    const BBOX_SPAN = Math.max(4.0, Math.max(BBOX.maxX - BBOX.minX, BBOX.maxY - BBOX.minY));
 
-    let viewMode = '3D';
-    let zoom = 40;
+    // View mode: 'CAD' (Default 2D Top Blueprint), '3D' (Three.js Free Orbit), 'POV' (First-Person Walkthrough)
+    let viewMode = 'CAD';
+    let zoom = 45; // pixels per meter in CAD
     let panX = 100;
     let panY = 100;
     let isDragging = false;
@@ -417,7 +464,23 @@ def generate_interactive_html_viewer(
     const staticCtx = canvasStatic.getContext('2d');
     const canvasDynamic = document.getElementById('mapCanvasDynamic');
     const dynamicCtx = canvasDynamic.getContext('2d');
+    const threeContainer = document.getElementById('threeContainer');
     const wallInspector = document.getElementById('wall-inspector');
+
+    // Populate rooms list & room jump dropdown
+    const roomListEl = document.getElementById('room-list');
+    const roomSelectEl = document.getElementById('room-jump-select');
+    ROOMS.forEach(r => {{
+      const d = document.createElement('div');
+      const dimsStr = r.dimensions_m ? ` (${{r.dimensions_m}})` : '';
+      d.innerHTML = `<strong>${{r.name}}</strong>${{dimsStr}}: <span style="color:#38bdf8;">${{r.area_m2}} m²</span>`;
+      roomListEl.appendChild(d);
+
+      const opt = document.createElement('option');
+      opt.value = r.name;
+      opt.textContent = `${{r.name}} (${{r.area_m2}} m²)`;
+      roomSelectEl.appendChild(opt);
+    }});
 
     function formatTime(ms) {{
       const totalSec = Math.floor(ms / 1000);
@@ -433,37 +496,917 @@ def generate_interactive_html_viewer(
       canvasStatic.height = h;
       canvasDynamic.width = w;
       canvasDynamic.height = h;
+
+      if (threeRenderer && threeCamera) {{
+        threeRenderer.setSize(w, h);
+        threeCamera.aspect = w / h;
+        threeCamera.updateProjectionMatrix();
+      }}
+
       drawStaticScene();
       drawDynamicScene();
     }}
     window.addEventListener('resize', resize);
-
-    // Populate rooms sidebar
-    const roomListEl = document.getElementById('room-list');
-    ROOMS.forEach(r => {{
-      const d = document.createElement('div');
-      const dimsStr = r.dimensions_m ? ` (${{r.dimensions_m}})` : '';
-      d.innerHTML = `<strong>${{r.name}}</strong>${{dimsStr}}: <span style="color:#38bdf8;">${{r.area_m2}} m²</span>`;
-      roomListEl.appendChild(d);
-    }});
 
     function updateConfidenceFilter(val) {{
       minConfidence = val / 100.0;
       document.getElementById('conf-val').textContent = `≥ ${{val}}%`;
       drawStaticScene();
       drawDynamicScene();
+      if (threeScene) updateThreeWalls();
     }}
 
-    function setViewMode(mode) {{
-      viewMode = mode;
-      document.getElementById('btn-2d').style.background = (mode === '2D') ? '#38bdf8' : '#334155';
-      document.getElementById('btn-2d').style.color = (mode === '2D') ? '#0f172a' : '#f8fafc';
-      document.getElementById('btn-3d').style.background = (mode === '3D') ? '#38bdf8' : '#334155';
-      document.getElementById('btn-3d').style.color = (mode === '3D') ? '#0f172a' : '#f8fafc';
+    function onLayerChange() {{
       drawStaticScene();
       drawDynamicScene();
+      if (threeScene) updateThreeVisibility();
     }}
 
+    // =========================================================================
+    // VIEW MODE SWITCHER & RECENTERING ENGINE
+    // =========================================================================
+    function setViewMode(mode) {{
+      viewMode = mode;
+      document.getElementById('btn-cad').className = (mode === 'CAD') ? 'btn' : 'btn btn-secondary';
+      document.getElementById('btn-3d').className = (mode === '3D') ? 'btn' : 'btn btn-secondary';
+      document.getElementById('btn-pov').className = (mode === 'POV') ? 'btn' : 'btn btn-secondary';
+
+      const hintEl = document.getElementById('nav-hint');
+      if (mode === 'CAD') {{
+        threeContainer.style.display = 'none';
+        canvasStatic.style.display = 'block';
+        canvasDynamic.style.display = 'block';
+        hintEl.textContent = 'Left Drag: Pan Blueprint | Wheel: Zoom | Click Wall: Inspect';
+        drawStaticScene();
+        drawDynamicScene();
+      }} else if (mode === '3D') {{
+        initThreeJS();
+        threeContainer.style.display = 'block';
+        canvasStatic.style.display = 'none';
+        canvasDynamic.style.display = 'none';
+        threeControls.enabled = true;
+        hintEl.textContent = 'Left Drag: Orbit 360° | Right Drag: Pan | Wheel: Zoom';
+      }} else if (mode === 'POV') {{
+        initThreeJS();
+        threeContainer.style.display = 'block';
+        canvasStatic.style.display = 'none';
+        canvasDynamic.style.display = 'none';
+        threeControls.enabled = false;
+        hintEl.textContent = 'Walkthrough POV: Camera rides phone avatar at eye level';
+      }}
+    }}
+
+    function recenterBuilding() {{
+      if (viewMode === 'CAD') {{
+        const w = canvasDynamic.width;
+        const h = canvasDynamic.height;
+        zoom = Math.min((w * 0.75) / BBOX_SPAN, (h * 0.75) / BBOX_SPAN);
+        zoom = Math.max(20, Math.min(100, zoom));
+        panX = w / 2.0 - (BBOX_CENTER.x * zoom);
+        panY = h / 2.0 - (BBOX_CENTER.y * zoom);
+        drawStaticScene();
+        drawDynamicScene();
+      }} else if (threeCamera && threeControls) {{
+        threeControls.target.set(BBOX_CENTER.x, 0.5, BBOX_CENTER.y);
+        threeCamera.position.set(BBOX_CENTER.x, BBOX_SPAN * 1.5, BBOX_CENTER.y + BBOX_SPAN * 1.3);
+        threeControls.update();
+      }}
+    }}
+
+    function centerOnPhone() {{
+      const primaryKey = DEVICE_KEYS[0];
+      const pts = DEVICE_MAP[primaryKey];
+      if (!pts || pts.length === 0) return;
+      const pose = getInterpolatedPose(pts, playbackPct);
+      if (!pose) return;
+
+      if (viewMode === 'CAD') {{
+        panX = canvasDynamic.width / 2.0 - (pose.x * zoom);
+        panY = canvasDynamic.height / 2.0 - (pose.y * zoom);
+        drawStaticScene();
+        drawDynamicScene();
+      }} else if (threeCamera && threeControls) {{
+        threeControls.target.set(pose.x, 0.5, pose.y);
+        threeCamera.position.set(pose.x, 8.0, pose.y + 8.0);
+        threeControls.update();
+      }}
+    }}
+
+    function jumpToRoom(roomName) {{
+      if (!roomName) return;
+      const r = ROOMS.find(item => item.name === roomName);
+      if (!r) return;
+
+      if (viewMode === 'CAD') {{
+        panX = canvasDynamic.width / 2.0 - (r.centroid_x * zoom);
+        panY = canvasDynamic.height / 2.0 - (r.centroid_y * zoom);
+        drawStaticScene();
+        drawDynamicScene();
+      }} else if (threeCamera && threeControls) {{
+        threeControls.target.set(r.centroid_x, 0.5, r.centroid_y);
+        threeCamera.position.set(r.centroid_x, 7.0, r.centroid_y + 7.0);
+        threeControls.update();
+      }}
+      document.getElementById('room-jump-select').value = '';
+    }}
+
+    // =========================================================================
+    // 2D ARCHITECTURAL CAD BLUEPRINT (Classic Navy Blueprint Engine)
+    // =========================================================================
+    function cadWorldToScreen(wx, wy) {{
+      return {{
+        x: panX + wx * zoom,
+        y: canvasDynamic.height - (panY + wy * zoom)
+      }};
+    }}
+
+    function distToSegment(px, py, x1, y1, x2, y2) {{
+      const l2 = (x2 - x1)**2 + (y2 - y1)**2;
+      if (l2 === 0) return {{ dist: Math.hypot(px - x1, py - y1), cx: x1, cy: y1 }};
+      let t = ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / l2;
+      t = Math.max(0, Math.min(1, t));
+      const cx = x1 + t * (x2 - x1);
+      const cy = y1 + t * (y2 - y1);
+      return {{ dist: Math.hypot(px - cx, py - cy), cx, cy }};
+    }}
+
+    function drawStaticScene() {{
+      if (viewMode !== 'CAD') return;
+      staticCtx.clearRect(0, 0, canvasStatic.width, canvasStatic.height);
+
+      // 1. Classic Blueprint Grid Paper Background (#0c2340)
+      drawBlueprintGrid(staticCtx);
+
+      // 2. Layer: Survey Ray Coverage (Observability)
+      if (document.getElementById('layer-coverage').checked && RAY_COVERAGE.length > 0) {{
+        drawRayCoverage(staticCtx);
+      }}
+
+      // 3. Layer: RF Density Heatmap
+      if (document.getElementById('layer-heatmap').checked && HEATMAP.length > 0) {{
+        drawHeatmap(staticCtx);
+      }}
+
+      // 4. Layer: Room Zone Fills
+      if (document.getElementById('layer-rooms').checked) {{
+        drawRoomZones(staticCtx);
+      }}
+
+      // 5. Layer: Static Trajectories
+      const isFull = document.getElementById('chk-full-trail').checked;
+      if (document.getElementById('layer-raw').checked && DISPLAY_RAW_POINTS.length > 0) {{
+        drawCADTrajectory(staticCtx, DISPLAY_RAW_POINTS, '#ef4444', true, isFull ? 1.0 : playbackPct);
+      }}
+      if (document.getElementById('layer-slam').checked && DISPLAY_SLAM_POINTS.length > 0) {{
+        drawCADTrajectory(staticCtx, DISPLAY_SLAM_POINTS, '#38bdf8', false, isFull ? 1.0 : playbackPct);
+      }}
+
+      // 6. Layer: Architectural CAD Walls & Dimensions
+      if (document.getElementById('layer-walls').checked) {{
+        drawCADWalls(staticCtx);
+      }}
+
+      // 7. Layer: 90° Door Swing Arcs
+      if (document.getElementById('layer-doors').checked) {{
+        drawCADDoorways(staticCtx);
+      }}
+
+      // 8. Layer: Access Points
+      if (document.getElementById('layer-aps').checked) {{
+        drawCADAccessPoints(staticCtx);
+      }}
+
+      // 9. Architectural Scale Bar & North Compass
+      drawScaleBarAndCompass(staticCtx);
+    }}
+
+    function drawBlueprintGrid(ctx) {{
+      const w = canvasStatic.width;
+      const h = canvasStatic.height;
+
+      // Dark Blueprint Blue fill
+      ctx.fillStyle = '#0c2340';
+      ctx.fillRect(0, 0, w, h);
+
+      // Fine grid (1 meter)
+      ctx.strokeStyle = 'rgba(255, 255, 255, 0.08)';
+      ctx.lineWidth = 1;
+      const step = zoom;
+      const startXGrid = panX % step;
+      const startYGrid = (h - panY) % step;
+
+      for (let x = startXGrid; x < w; x += step) {{
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+      }}
+      for (let y = startYGrid; y < h; y += step) {{
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+      }}
+
+      // Major grid (5 meters)
+      ctx.strokeStyle = 'rgba(56, 189, 248, 0.20)';
+      ctx.lineWidth = 1.5;
+      const majorStep = step * 5;
+      const majorStartX = panX % majorStep;
+      const majorStartY = (h - panY) % majorStep;
+
+      for (let x = majorStartX; x < w; x += majorStep) {{
+        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, h); ctx.stroke();
+      }}
+      for (let y = majorStartY; y < h; y += majorStep) {{
+        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(w, y); ctx.stroke();
+      }}
+    }}
+
+    function drawCADWalls(ctx) {{
+      let visibleCount = 0;
+      const showLabels = document.getElementById('layer-labels').checked;
+
+      WALLS.forEach(w => {{
+        const conf = w.confidence !== undefined ? w.confidence : 0.75;
+        if (conf < minConfidence) return;
+        visibleCount++;
+
+        const isHovered = hoveredWall && hoveredWall.wall_id === w.wall_id;
+        const p1 = cadWorldToScreen(w.x1, w.y1);
+        const p2 = cadWorldToScreen(w.x2, w.y2);
+
+        ctx.save();
+
+        if (conf >= 0.70) {{
+          // Confirmed Structural Wall: 0.15m ribbon with solid cyan outline and core
+          ctx.strokeStyle = isHovered ? '#ffffff' : '#38bdf8';
+          ctx.lineWidth = isHovered ? 7 : 5;
+          ctx.lineCap = 'square';
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.stroke();
+
+          // Core blueprint centerline
+          ctx.strokeStyle = '#0c2340';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }} else if (conf >= 0.40) {{
+          // Probable Partition: Dashed Amber
+          ctx.strokeStyle = isHovered ? '#fef08a' : '#f59e0b';
+          ctx.lineWidth = isHovered ? 5 : 3.5;
+          ctx.setLineDash([8, 4]);
+          ctx.lineCap = 'butt';
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.stroke();
+        }} else {{
+          // Speculative Noise: Dotted Gray
+          ctx.strokeStyle = 'rgba(148, 163, 184, 0.50)';
+          ctx.lineWidth = 2.0;
+          ctx.setLineDash([3, 3]);
+          ctx.beginPath();
+          ctx.moveTo(p1.x, p1.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.stroke();
+        }}
+
+        // Architectural Dimension Witness Lines & Arrows (|<- 3.40 m ->|)
+        if (showLabels && conf >= 0.40 && (w.length_m || 0) >= 0.8) {{
+          const dx = p2.x - p1.x;
+          const dy = p2.y - p1.y;
+          const len = Math.hypot(dx, dy);
+          if (len > 30) {{
+            const nx = -dy / len;
+            const ny = dx / len;
+            const offset = 18; // px offset for witness line
+
+            const d1x = p1.x + nx * offset;
+            const d1y = p1.y + ny * offset;
+            const d2x = p2.x + nx * offset;
+            const d2y = p2.y + ny * offset;
+
+            ctx.setLineDash([]);
+            ctx.strokeStyle = 'rgba(255, 255, 255, 0.45)';
+            ctx.lineWidth = 1;
+
+            // Witness extension lines
+            ctx.beginPath();
+            ctx.moveTo(p1.x, p1.y); ctx.lineTo(d1x + nx * 4, d1y + ny * 4);
+            ctx.moveTo(p2.x, p2.y); ctx.lineTo(d2x + nx * 4, d2y + ny * 4);
+            ctx.stroke();
+
+            // Dimension line
+            ctx.beginPath();
+            ctx.moveTo(d1x, d1y); ctx.lineTo(d2x, d2y);
+            ctx.stroke();
+
+            // Arrows / Tics at endpoints
+            drawTic(ctx, d1x, d1y, nx, ny);
+            drawTic(ctx, d2x, d2y, nx, ny);
+
+            // Centered dimension text
+            const midX = (d1x + d2x) / 2.0;
+            const midY = (d1y + d2y) / 2.0;
+            ctx.fillStyle = '#ffffff';
+            ctx.font = '10px -apple-system, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(`${{w.length_m}} m`, midX, midY - 6);
+          }}
+        }}
+
+        ctx.restore();
+      }});
+
+      document.getElementById('wall-count-badge').textContent = `Walls: ${{visibleCount}} / ${{WALLS.length}}`;
+    }}
+
+    function drawTic(ctx, x, y, nx, ny) {{
+      const s = 4;
+      ctx.beginPath();
+      ctx.moveTo(x - ny * s - nx * s, y + nx * s - ny * s);
+      ctx.lineTo(x + ny * s + nx * s, y - nx * s + ny * s);
+      ctx.stroke();
+    }}
+
+    function drawCADDoorways(ctx) {{
+      DOORS.forEach(d => {{
+        const p = cadWorldToScreen(d.x, d.y);
+        ctx.save();
+
+        // Door swing arc (90 degrees, radius = 0.85m door leaf)
+        const doorRadiusPx = 0.85 * zoom;
+        ctx.strokeStyle = 'rgba(245, 158, 11, 0.85)';
+        ctx.lineWidth = 1.5;
+        ctx.setLineDash([3, 3]);
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, doorRadiusPx, 0, Math.PI / 2.0);
+        ctx.stroke();
+
+        // Door leaf (line)
+        ctx.setLineDash([]);
+        ctx.strokeStyle = '#f59e0b';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(p.x + doorRadiusPx, p.y);
+        ctx.stroke();
+
+        // Hinge puck
+        ctx.fillStyle = '#f59e0b';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 4, 0, Math.PI * 2);
+        ctx.fill();
+
+        ctx.restore();
+      }});
+    }}
+
+    function drawRoomZones(ctx) {{
+      const showLabels = document.getElementById('layer-labels').checked;
+      ROOMS.forEach(r => {{
+        const p = cadWorldToScreen(r.centroid_x, r.centroid_y);
+
+        if (showLabels) {{
+          ctx.save();
+          ctx.textAlign = 'center';
+          ctx.fillStyle = '#ffffff';
+          ctx.font = 'bold 13px -apple-system, sans-serif';
+          ctx.fillText(r.name.toUpperCase(), p.x, p.y - 8);
+
+          ctx.fillStyle = '#38bdf8';
+          ctx.font = '11px -apple-system, sans-serif';
+          const dimTxt = r.dimensions_m ? `${{r.dimensions_m}}` : '';
+          ctx.fillText(`${{dimTxt}} (${{r.area_m2}} m²)`, p.x, p.y + 8);
+          ctx.restore();
+        }}
+      }});
+    }}
+
+    function drawCADAccessPoints(ctx) {{
+      APS.forEach(ap => {{
+        const p = cadWorldToScreen(ap.x, ap.y);
+        ctx.save();
+        ctx.fillStyle = '#22c55e';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#ffffff';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+
+        ctx.fillStyle = '#ffffff';
+        ctx.font = '10px -apple-system, sans-serif';
+        ctx.fillText(`AP [${{ap.ap_group_id.slice(-6)}}]`, p.x + 10, p.y + 4);
+        ctx.restore();
+      }});
+    }}
+
+    function drawCADTrajectory(ctx, pts, color, isDashed, pct) {{
+      if (!pts || pts.length === 0) return;
+      const cutIdx = Math.floor(pct * (pts.length - 1));
+
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.lineWidth = isDashed ? 2 : 3;
+      if (isDashed) ctx.setLineDash([4, 4]);
+      ctx.beginPath();
+      for (let i = 0; i <= cutIdx && i < pts.length; i++) {{
+        const p = cadWorldToScreen(pts[i].x, pts[i].y);
+        if (i === 0) ctx.moveTo(p.x, p.y);
+        else ctx.lineTo(p.x, p.y);
+      }}
+      ctx.stroke();
+      ctx.restore();
+    }}
+
+    function drawRayCoverage(ctx) {{
+      const ny = RAY_COVERAGE.length;
+      const nx = RAY_COVERAGE[0].length;
+      const cellW = DIMS.width_m / nx;
+      const cellH = DIMS.height_m / ny;
+
+      for (let iy = 0; iy < ny; iy++) {{
+        for (let ix = 0; ix < nx; ix++) {{
+          const rays = RAY_COVERAGE[iy][ix];
+          if (rays > 0) {{
+            const p = cadWorldToScreen(ix * cellW, (iy + 1) * cellH);
+            let fillCol;
+            if (rays >= 15) fillCol = 'rgba(245, 158, 11, 0.35)';
+            else if (rays >= 5) fillCol = 'rgba(16, 185, 129, 0.25)';
+            else fillCol = 'rgba(56, 189, 248, 0.14)';
+            ctx.fillStyle = fillCol;
+            ctx.fillRect(p.x, p.y, cellW * zoom, cellH * zoom);
+          }}
+        }}
+      }}
+    }}
+
+    function drawHeatmap(ctx) {{
+      const ny = HEATMAP.length;
+      const nx = HEATMAP[0].length;
+      const cellW = DIMS.width_m / nx;
+      const cellH = DIMS.height_m / ny;
+
+      for (let iy = 0; iy < ny; iy++) {{
+        for (let ix = 0; ix < nx; ix++) {{
+          const val = HEATMAP[iy][ix];
+          if (val > 0.5) {{
+            const p = cadWorldToScreen(ix * cellW, (iy + 1) * cellH);
+            const alpha = Math.min(val / 10.0, 0.65);
+            ctx.fillStyle = `rgba(239, 68, 68, ${{alpha}})`;
+            ctx.fillRect(p.x, p.y, cellW * zoom, cellH * zoom);
+          }}
+        }}
+      }}
+    }}
+
+    function drawScaleBarAndCompass(ctx) {{
+      const h = canvasStatic.height;
+
+      // 1. Metric Graphic Scale Bar in Bottom-Left
+      ctx.save();
+      const barX = 24;
+      const barY = h - 24;
+      const barLen1m = 1.0 * zoom;
+      const barLen5m = 5.0 * zoom;
+
+      ctx.fillStyle = '#ffffff';
+      ctx.strokeStyle = '#ffffff';
+      ctx.lineWidth = 2;
+
+      // Main ruler line (5 meters)
+      ctx.beginPath();
+      ctx.moveTo(barX, barY);
+      ctx.lineTo(barX + barLen5m, barY);
+      ctx.moveTo(barX, barY - 6); ctx.lineTo(barX, barY + 6);
+      ctx.moveTo(barX + barLen1m, barY - 4); ctx.lineTo(barX + barLen1m, barY + 4);
+      ctx.moveTo(barX + barLen5m, barY - 6); ctx.lineTo(barX + barLen5m, barY + 6);
+      ctx.stroke();
+
+      ctx.font = '10px -apple-system, sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('0', barX, barY - 9);
+      ctx.fillText('1m', barX + barLen1m, barY - 9);
+      ctx.fillText('5m', barX + barLen5m, barY - 9);
+      ctx.fillText('SCALE 1:METRIC', barX + barLen5m / 2, barY + 16);
+
+      // 2. North Compass Arrow in Top-Left
+      const compX = 40;
+      const compY = 80;
+      ctx.strokeStyle = '#38bdf8';
+      ctx.fillStyle = '#38bdf8';
+      ctx.lineWidth = 2;
+
+      ctx.beginPath();
+      ctx.moveTo(compX, compY - 18);
+      ctx.lineTo(compX - 6, compY + 8);
+      ctx.lineTo(compX, compY + 3);
+      ctx.lineTo(compX + 6, compY + 8);
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillText('N', compX, compY - 22);
+
+      ctx.restore();
+    }}
+
+    // =========================================================================
+    // DYNAMIC FOREGROUND (Live 60 FPS Phone, Proximity Halo, Laser Rays in CAD)
+    // =========================================================================
+    function drawDynamicScene() {{
+      if (viewMode !== 'CAD') return;
+      dynamicCtx.clearRect(0, 0, canvasDynamic.width, canvasDynamic.height);
+
+      if (!document.getElementById('layer-phone').checked) return;
+
+      DEVICE_KEYS.forEach((devKey, dIdx) => {{
+        const pts = DEVICE_MAP[devKey];
+        if (!pts || pts.length === 0) return;
+        const color = DEVICE_COLORS[dIdx % DEVICE_COLORS.length];
+        const pose = getInterpolatedPose(pts, playbackPct);
+        if (!pose) return;
+
+        const phoneP = cadWorldToScreen(pose.x, pose.y);
+
+        // 1. Proximity Halo & Dynamic Lasers
+        if (document.getElementById('layer-proximity').checked) {{
+          const wallDistances = [];
+          WALLS.forEach((w, wIdx) => {{
+            if ((w.confidence || 0.7) >= minConfidence) {{
+              const res = distToSegment(pose.x, pose.y, w.x1, w.y1, w.x2, w.y2);
+              wallDistances.push({{ wall: w, dist: res.dist, cx: res.cx, cy: res.cy, idx: wIdx }});
+            }}
+          }});
+          wallDistances.sort((a, b) => a.dist - b.dist);
+          const nearest = wallDistances[0];
+
+          // Clearance Halo (0.35m radius body buffer)
+          dynamicCtx.save();
+          const haloRadius = 0.35 * zoom;
+          dynamicCtx.beginPath();
+          dynamicCtx.arc(phoneP.x, phoneP.y, haloRadius, 0, Math.PI * 2);
+
+          let haloColor = 'rgba(6, 182, 212, 0.25)';
+          let haloStroke = '#06b6d4';
+          if (nearest && nearest.dist <= 0.35) {{
+            haloColor = 'rgba(239, 68, 68, 0.40)';
+            haloStroke = '#ef4444';
+          }} else if (nearest && nearest.dist <= 0.80) {{
+            haloColor = 'rgba(245, 158, 11, 0.30)';
+            haloStroke = '#f59e0b';
+          }}
+          dynamicCtx.fillStyle = haloColor;
+          dynamicCtx.strokeStyle = haloStroke;
+          dynamicCtx.lineWidth = 2;
+          dynamicCtx.fill();
+          dynamicCtx.stroke();
+          dynamicCtx.restore();
+
+          // Laser Rangefinder Rays to closest walls within 3.0m
+          dynamicCtx.save();
+          const candidateWalls = wallDistances.slice(0, 4).filter(item => item.dist <= 3.0);
+          candidateWalls.forEach(item => {{
+            const wallPt = cadWorldToScreen(item.cx, item.cy);
+
+            dynamicCtx.strokeStyle = item.dist <= 0.35 ? '#ef4444' : (item.dist <= 0.80 ? '#f59e0b' : '#38bdf8');
+            dynamicCtx.lineWidth = item.dist <= 0.35 ? 2.5 : 1.5;
+            dynamicCtx.setLineDash([4, 4]);
+            dynamicCtx.beginPath();
+            dynamicCtx.moveTo(phoneP.x, phoneP.y);
+            dynamicCtx.lineTo(wallPt.x, wallPt.y);
+            dynamicCtx.stroke();
+
+            // Contact dot
+            dynamicCtx.fillStyle = '#ffffff';
+            dynamicCtx.beginPath();
+            dynamicCtx.arc(wallPt.x, wallPt.y, 3, 0, Math.PI * 2);
+            dynamicCtx.fill();
+
+            // Floating meter badge
+            const midX = (phoneP.x + wallPt.x) / 2.0;
+            const midY = (phoneP.y + wallPt.y) / 2.0;
+            dynamicCtx.fillStyle = 'rgba(10, 25, 47, 0.88)';
+            dynamicCtx.fillRect(midX - 18, midY - 9, 36, 18);
+            dynamicCtx.fillStyle = '#ffffff';
+            dynamicCtx.font = '10px -apple-system, sans-serif';
+            dynamicCtx.textAlign = 'center';
+            dynamicCtx.textBaseline = 'middle';
+            dynamicCtx.fillText(`${{item.dist.toFixed(2)}}m`, midX, midY);
+          }});
+          dynamicCtx.restore();
+        }}
+
+        // Phone FOV Orientation Cone
+        dynamicCtx.save();
+        dynamicCtx.translate(phoneP.x, phoneP.y);
+        dynamicCtx.rotate(pose.yaw);
+
+        const coneLen = 42;
+        const halfFov = 0.45;
+        const grad = dynamicCtx.createRadialGradient(0, 0, 5, 0, 0, coneLen);
+        grad.addColorStop(0, 'rgba(56, 189, 248, 0.45)');
+        grad.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
+        dynamicCtx.fillStyle = grad;
+        dynamicCtx.beginPath();
+        dynamicCtx.moveTo(0, 0);
+        dynamicCtx.arc(0, 0, coneLen, -halfFov, halfFov);
+        dynamicCtx.closePath();
+        dynamicCtx.fill();
+        dynamicCtx.restore();
+
+        // Pulsing RF ring
+        dynamicCtx.save();
+        dynamicCtx.strokeStyle = color;
+        dynamicCtx.lineWidth = 1.5;
+        dynamicCtx.globalAlpha = Math.max(0, 1 - pulseAnim);
+        dynamicCtx.beginPath();
+        dynamicCtx.arc(phoneP.x, phoneP.y, 8 + pulseAnim * 20, 0, Math.PI * 2);
+        dynamicCtx.stroke();
+        dynamicCtx.restore();
+
+        // Direction Puck
+        dynamicCtx.save();
+        dynamicCtx.fillStyle = color;
+        dynamicCtx.beginPath();
+        dynamicCtx.arc(phoneP.x, phoneP.y, 8, 0, Math.PI * 2);
+        dynamicCtx.fill();
+        dynamicCtx.strokeStyle = '#ffffff';
+        dynamicCtx.lineWidth = 2;
+        dynamicCtx.stroke();
+
+        // Direction Arrow
+        dynamicCtx.fillStyle = '#ffffff';
+        dynamicCtx.beginPath();
+        const arrLen = 14;
+        const ax = phoneP.x + arrLen * Math.cos(pose.yaw);
+        const ay = phoneP.y + arrLen * Math.sin(pose.yaw);
+        dynamicCtx.moveTo(ax, ay);
+        dynamicCtx.lineTo(phoneP.x + 5 * Math.cos(pose.yaw + 2.5), phoneP.y + 5 * Math.sin(pose.yaw + 2.5));
+        dynamicCtx.lineTo(phoneP.x + 5 * Math.cos(pose.yaw - 2.5), phoneP.y + 5 * Math.sin(pose.yaw - 2.5));
+        dynamicCtx.closePath();
+        dynamicCtx.fill();
+
+        // Badge
+        dynamicCtx.font = '10px -apple-system, sans-serif';
+        dynamicCtx.fillStyle = '#ffffff';
+        dynamicCtx.fillText(`📱 ${{devKey}}`, phoneP.x + 12, phoneP.y - 6);
+        dynamicCtx.restore();
+      }});
+    }}
+
+    // =========================================================================
+    // THREE.JS FREE 3D ORBITAL & POV WALKTHROUGH ENGINE
+    // =========================================================================
+    let threeRenderer, threeScene, threeCamera, threeControls;
+    let threeWallGroup, threeApGroup, threePhoneMesh, threeLaserLines = [];
+
+    function initThreeJS() {{
+      if (threeScene || typeof THREE === 'undefined') return;
+
+      const w = canvasDynamic.parentElement.clientWidth;
+      const h = canvasDynamic.parentElement.clientHeight;
+
+      // 1. Scene, Camera, Renderer
+      threeScene = new THREE.Scene();
+      threeScene.background = new THREE.Color(0x0a192f);
+      threeScene.fog = new THREE.FogExp2(0x0a192f, 0.015);
+
+      threeCamera = new THREE.PerspectiveCamera(50, w / h, 0.1, 500);
+      threeRenderer = new THREE.WebGLRenderer({{ antialias: true }});
+      threeRenderer.setSize(w, h);
+      threeRenderer.shadowMap.enabled = true;
+      threeRenderer.shadowMap.type = THREE.PCFSoftShadowMap;
+
+      threeContainer.innerHTML = '';
+      threeContainer.appendChild(threeRenderer.domElement);
+
+      // 2. OrbitControls (Full 360° Free Navigation)
+      threeControls = new THREE.OrbitControls(threeCamera, threeRenderer.domElement);
+      threeControls.enableDamping = true;
+      threeControls.dampingFactor = 0.08;
+      threeControls.maxPolarAngle = Math.PI / 2.05; // Don't flip under floor
+
+      // 3. Lighting
+      const ambientLight = new THREE.AmbientLight(0xffffff, 0.6);
+      threeScene.add(ambientLight);
+
+      const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+      dirLight.position.set(BBOX_CENTER.x + 10, 20, BBOX_CENTER.y + 15);
+      dirLight.castShadow = true;
+      threeScene.add(dirLight);
+
+      // 4. Floor Grid Plane
+      const floorGeo = new THREE.PlaneGeometry(BBOX_SPAN * 2.5, BBOX_SPAN * 2.5);
+      const floorMat = new THREE.MeshStandardMaterial({{ color: 0x0c2340, roughness: 0.8 }});
+      const floorMesh = new THREE.Mesh(floorGeo, floorMat);
+      floorMesh.rotation.x = -Math.PI / 2;
+      floorMesh.position.set(BBOX_CENTER.x, 0, BBOX_CENTER.y);
+      floorMesh.receiveShadow = true;
+      threeScene.add(floorMesh);
+
+      const gridHelper = new THREE.GridHelper(BBOX_SPAN * 2.5, Math.round(BBOX_SPAN * 2.5), 0x1e3a5f, 0x142b47);
+      gridHelper.position.set(BBOX_CENTER.x, 0.01, BBOX_CENTER.y);
+      threeScene.add(gridHelper);
+
+      // 5. Extruded 3D Wall Group
+      threeWallGroup = new THREE.Group();
+      threeScene.add(threeWallGroup);
+      buildThreeWalls();
+
+      // 6. AP Router Models
+      threeApGroup = new THREE.Group();
+      threeScene.add(threeApGroup);
+      buildThreeAPs();
+
+      // 7. 3D Animated Phone Avatar
+      const phoneGeo = new THREE.BoxGeometry(0.3, 0.05, 0.6);
+      const phoneMat = new THREE.MeshStandardMaterial({{ color: 0x38bdf8, metalness: 0.5, roughness: 0.2 }});
+      threePhoneMesh = new THREE.Mesh(phoneGeo, phoneMat);
+      threePhoneMesh.castShadow = true;
+      threeScene.add(threePhoneMesh);
+
+      // Set initial camera to framed overview
+      recenterBuilding();
+    }}
+
+    function buildThreeWalls() {{
+      if (!threeWallGroup) return;
+      threeWallGroup.clear();
+
+      const wallHeight = 2.4;
+      const wallThickness = 0.15;
+
+      WALLS.forEach(w => {{
+        const conf = w.confidence !== undefined ? w.confidence : 0.75;
+        if (conf < minConfidence) return;
+
+        const dx = w.x2 - w.x1;
+        const dy = w.y2 - w.y1;
+        const length = Math.hypot(dx, dy);
+        if (length < 0.2) return;
+
+        const mx = (w.x1 + w.x2) / 2.0;
+        const mz = (w.y1 + w.y2) / 2.0;
+        const angle = -Math.atan2(dy, dx);
+
+        const geo = new THREE.BoxGeometry(length, wallHeight, wallThickness);
+        let color = 0x38bdf8;
+        let opacity = 0.85;
+        if (conf < 0.40) {{ color = 0x64748b; opacity = 0.35; }}
+        else if (conf < 0.70) {{ color = 0xf59e0b; opacity = 0.65; }}
+
+        const mat = new THREE.MeshStandardMaterial({{
+          color,
+          transparent: true,
+          opacity,
+          roughness: 0.4
+        }});
+
+        const mesh = new THREE.Mesh(geo, mat);
+        mesh.position.set(mx, wallHeight / 2.0, mz);
+        mesh.rotation.y = angle;
+        mesh.castShadow = true;
+        mesh.receiveShadow = true;
+        mesh.userData = w;
+        threeWallGroup.add(mesh);
+      }});
+    }}
+
+    function buildThreeAPs() {{
+      if (!threeApGroup) return;
+      threeApGroup.clear();
+
+      APS.forEach(ap => {{
+        const cyl = new THREE.CylinderGeometry(0.18, 0.18, 0.08, 16);
+        const mat = new THREE.MeshStandardMaterial({{ color: 0x22c55e, roughness: 0.3 }});
+        const mesh = new THREE.Mesh(cyl, mat);
+        mesh.position.set(ap.x, 2.2, ap.y);
+        threeApGroup.add(mesh);
+      }});
+    }}
+
+    function updateThreeWalls() {{
+      if (threeScene) buildThreeWalls();
+    }}
+
+    function updateThreeVisibility() {{
+      if (!threeScene) return;
+      threeWallGroup.visible = document.getElementById('layer-walls').checked;
+      threeApGroup.visible = document.getElementById('layer-aps').checked;
+      threePhoneMesh.visible = document.getElementById('layer-phone').checked;
+    }}
+
+    function updateThreePhone() {{
+      if (!threeScene || !threePhoneMesh) return;
+
+      const primaryKey = DEVICE_KEYS[0];
+      const pts = DEVICE_MAP[primaryKey];
+      if (!pts || pts.length === 0) return;
+      const pose = getInterpolatedPose(pts, playbackPct);
+      if (!pose) return;
+
+      threePhoneMesh.position.set(pose.x, pose.z || 1.1, pose.y);
+      threePhoneMesh.rotation.y = -pose.yaw;
+
+      if (viewMode === 'POV') {{
+        // Snap camera directly to phone avatar at eye level looking forward
+        threeCamera.position.set(pose.x, 1.6, pose.y);
+        const lookDist = 5.0;
+        const targetX = pose.x + lookDist * Math.cos(pose.yaw);
+        const targetZ = pose.y - lookDist * Math.sin(pose.yaw);
+        threeCamera.lookAt(targetX, 1.5, targetZ);
+      }} else if (followPhone && isPlaying) {{
+        threeControls.target.lerp(new THREE.Vector3(pose.x, 0.5, pose.y), 0.08);
+      }}
+    }}
+
+    // =========================================================================
+    // MOUSE & TOUCH CONTROLS (CAD Mode)
+    // =========================================================================
+    canvasDynamic.addEventListener('mousedown', e => {{
+      isDragging = true;
+      startX = e.clientX - panX;
+      startY = e.clientY - panY;
+    }});
+    window.addEventListener('mouseup', () => isDragging = false);
+
+    canvasDynamic.addEventListener('mousemove', e => {{
+      if (isDragging) {{
+        panX = e.clientX - startX;
+        panY = e.clientY - startY;
+        drawStaticScene();
+        drawDynamicScene();
+        wallInspector.style.display = 'none';
+        return;
+      }}
+
+      // Hover hit-testing on walls in CAD
+      const rect = canvasDynamic.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+
+      let closestWall = null;
+      let minPixelDist = 14;
+
+      WALLS.forEach(w => {{
+        if ((w.confidence || 0.7) >= minConfidence) {{
+          const p1 = cadWorldToScreen(w.x1, w.y1);
+          const p2 = cadWorldToScreen(w.x2, w.y2);
+          const res = distToSegment(mx, my, p1.x, p1.y, p2.x, p2.y);
+          if (res.dist < minPixelDist) {{
+            minPixelDist = res.dist;
+            closestWall = w;
+          }}
+        }}
+      }});
+
+      if (closestWall !== hoveredWall) {{
+        hoveredWall = closestWall;
+        drawStaticScene();
+      }}
+
+      if (closestWall) {{
+        const conf = closestWall.confidence !== undefined ? closestWall.confidence : 0.75;
+        const badge = document.getElementById('wi-badge');
+        if (conf >= 0.70) {{
+          badge.textContent = 'Confirmed Structural';
+          badge.style.background = '#22c55e';
+          badge.style.color = '#052e16';
+        }} else if (conf >= 0.40) {{
+          badge.textContent = 'Probable Partition';
+          badge.style.background = '#f59e0b';
+          badge.style.color = '#0a192f';
+        }} else {{
+          badge.textContent = 'Speculative Noise';
+          badge.style.background = '#64748b';
+          badge.style.color = '#ffffff';
+        }}
+
+        document.getElementById('wi-title').textContent = closestWall.wall_id ? `🧱 ${{closestWall.wall_id}}` : '🧱 Wall Segment';
+        document.getElementById('wi-conf').textContent = `${{Math.round(conf * 100)}}%`;
+        document.getElementById('wi-length').textContent = `${{closestWall.length_m || '--'}} m`;
+        document.getElementById('wi-atten').textContent = `${{closestWall.avg_attenuation_db || '--'}} dB/m`;
+        document.getElementById('wi-mat').textContent = closestWall.material_guess || 'Drywall';
+        document.getElementById('wi-rays').textContent = `${{closestWall.ray_hits || 0}} rays`;
+        document.getElementById('wi-spread').textContent = `${{closestWall.angular_diversity_deg || 0}}°`;
+        wallInspector.style.display = 'block';
+      }} else {{
+        wallInspector.style.display = 'none';
+      }}
+    }});
+
+    canvasDynamic.addEventListener('wheel', e => {{
+      e.preventDefault();
+      const factor = e.deltaY < 0 ? 1.15 : 0.87;
+      zoom = Math.max(15, Math.min(160, zoom * factor));
+      drawStaticScene();
+      drawDynamicScene();
+    }});
+
+    // =========================================================================
+    // VCR PLAYBACK & TELEMETRY TICKER
+    // =========================================================================
     function togglePlayback() {{
       isPlaying = !isPlaying;
       document.getElementById('play-icon').textContent = isPlaying ? '⏸' : '▶';
@@ -492,76 +1435,6 @@ def generate_interactive_html_viewer(
         togglePlayback();
       }}
     }});
-
-    function worldToScreen(wx, wy, wz = 0) {{
-      if (viewMode === '2D') {{
-        return {{ x: panX + wx * zoom, y: canvasDynamic.height - (panY + wy * zoom) }};
-      }} else {{
-        const isoX = (wx - wy) * COS_30;
-        const isoY = (wx + wy) * SIN_30 - (wz * 0.85);
-        return {{
-          x: panX + isoX * zoom + canvasDynamic.width / 2.3,
-          y: panY + isoY * zoom + canvasDynamic.height / 3.0
-        }};
-      }}
-    }}
-
-    function getInterpolatedPose(pts, pct) {{
-      if (!pts || pts.length === 0) return null;
-      if (pts.length === 1 || pct <= 0) return pts[0];
-      if (pct >= 1.0) return pts[pts.length - 1];
-
-      const idxF = pct * (pts.length - 1);
-      const i0 = Math.floor(idxF);
-      const i1 = Math.min(pts.length - 1, i0 + 1);
-      const t = idxF - i0;
-
-      const p0 = pts[i0];
-      const p1 = pts[i1];
-
-      const x = p0.x + (p1.x - p0.x) * t;
-      const y = p0.y + (p1.y - p0.y) * t;
-      const z = p0.z + (p1.z - p0.z) * t;
-
-      let dyaw = p1.yaw - p0.yaw;
-      while (dyaw > Math.PI) dyaw -= 2 * Math.PI;
-      while (dyaw < -Math.PI) dyaw += 2 * Math.PI;
-      const yaw = p0.yaw + dyaw * t;
-
-      const dtSec = Math.max(0.01, (p1.ts - p0.ts) / 1000);
-      const speed = Math.hypot(p1.x - p0.x, p1.y - p0.y) / dtSec;
-
-      return {{ x, y, z, yaw, speed, ts: p0.ts + (p1.ts - p0.ts) * t, device: p0.device }};
-    }}
-
-    function centerCameraOnActivePhone() {{
-      const primaryKey = DEVICE_KEYS[0];
-      const pts = DEVICE_MAP[primaryKey];
-      if (!pts || pts.length === 0) return;
-      const pose = getInterpolatedPose(pts, playbackPct);
-      if (!pose) return;
-
-      if (viewMode === '2D') {{
-        panX = canvasDynamic.width / 2.0 - (pose.x * zoom);
-        panY = canvasDynamic.height / 2.0 - (canvasDynamic.height - (pose.y * zoom));
-      }} else {{
-        const isoX = (pose.x - pose.y) * COS_30;
-        const isoY = (pose.x + pose.y) * SIN_30 - (pose.z * 0.85);
-        panX = canvasDynamic.width / 2.0 - (isoX * zoom + canvasDynamic.width / 2.3);
-        panY = canvasDynamic.height / 2.0 - (isoY * zoom + canvasDynamic.height / 3.0);
-      }}
-      drawStaticScene();
-    }}
-
-    function distToSegment(px, py, x1, y1, x2, y2) {{
-      const l2 = (x2 - x1)**2 + (y2 - y1)**2;
-      if (l2 === 0) return {{ dist: Math.hypot(px - x1, py - y1), cx: x1, cy: y1 }};
-      let t = ((px - x1) * (x2 - x1) + (py - y1) * (y2 - y1)) / l2;
-      t = Math.max(0, Math.min(1, t));
-      const cx = x1 + t * (x2 - x1);
-      const cy = y1 + t * (y2 - y1);
-      return {{ dist: Math.hypot(px - cx, py - cy), cx, cy }};
-    }}
 
     let lastHudUpdate = 0;
     function updateUI(force = false) {{
@@ -608,7 +1481,7 @@ def generate_interactive_html_viewer(
             }} else if (minD <= 0.80) {{
               statusEl.textContent = 'NEAR WALL';
               statusEl.style.background = '#f59e0b';
-              statusEl.style.color = '#0f172a';
+              statusEl.style.color = '#0a192f';
             }} else {{
               statusEl.textContent = 'CLEAR';
               statusEl.style.background = '#22c55e';
@@ -624,515 +1497,6 @@ def generate_interactive_html_viewer(
       }}
     }}
 
-    // =========================================================================
-    // LAYER 1: STATIC SCENE (Cached Background Canvas)
-    // =========================================================================
-    function drawStaticScene() {{
-      staticCtx.clearRect(0, 0, canvasStatic.width, canvasStatic.height);
-
-      // 1. Grid background
-      drawGrid(staticCtx);
-
-      // 2. Layer: Survey Ray Coverage (Observability)
-      if (document.getElementById('layer-coverage').checked && RAY_COVERAGE.length > 0) {{
-        drawRayCoverage(staticCtx);
-      }}
-
-      // 3. Layer: RF Density Heatmap
-      if (document.getElementById('layer-heatmap').checked && HEATMAP.length > 0) {{
-        drawHeatmap(staticCtx);
-      }}
-
-      // 4. Layer: Room Zones
-      if (document.getElementById('layer-rooms').checked) {{
-        drawRooms(staticCtx);
-      }}
-
-      // 5. Layer: Static Trajectories
-      const isFull = document.getElementById('chk-full-trail').checked;
-      if (document.getElementById('layer-raw').checked && DISPLAY_RAW_POINTS.length > 0) {{
-        drawTrajectory(staticCtx, DISPLAY_RAW_POINTS, '#ef4444', true, isFull ? 1.0 : playbackPct);
-      }}
-      if (document.getElementById('layer-slam').checked && DISPLAY_SLAM_POINTS.length > 0) {{
-        drawTrajectory(staticCtx, DISPLAY_SLAM_POINTS, '#06b6d4', false, isFull ? 1.0 : playbackPct);
-      }}
-
-      // 6. Layer: CAD Walls (Confidence-Filtered & Styled)
-      if (document.getElementById('layer-walls').checked) {{
-        drawWalls(staticCtx);
-      }}
-
-      // 7. Layer: Doorways
-      if (document.getElementById('layer-doors').checked) {{
-        drawDoorways(staticCtx);
-      }}
-
-      // 8. Layer: Access Points
-      if (document.getElementById('layer-aps').checked) {{
-        drawAPs(staticCtx);
-      }}
-    }}
-
-    function drawGrid(ctx) {{
-      ctx.strokeStyle = '#1e293b';
-      ctx.lineWidth = 1;
-      const step = zoom;
-      for (let x = 0; x < canvasStatic.width; x += step) {{
-        ctx.beginPath(); ctx.moveTo(x, 0); ctx.lineTo(x, canvasStatic.height); ctx.stroke();
-      }}
-      for (let y = 0; y < canvasStatic.height; y += step) {{
-        ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(canvasStatic.width, y); ctx.stroke();
-      }}
-    }}
-
-    function drawRayCoverage(ctx) {{
-      const ny = RAY_COVERAGE.length;
-      const nx = RAY_COVERAGE[0].length;
-      const cellW = DIMS.width_m / nx;
-      const cellH = DIMS.height_m / ny;
-
-      for (let iy = 0; iy < ny; iy++) {{
-        for (let ix = 0; ix < nx; ix++) {{
-          const rays = RAY_COVERAGE[iy][ix];
-          if (rays > 0) {{
-            const p = worldToScreen(ix * cellW, iy * cellH, 0);
-            let fillCol;
-            if (rays >= 15) fillCol = 'rgba(245, 158, 11, 0.40)'; // Dense gold
-            else if (rays >= 5) fillCol = 'rgba(16, 185, 129, 0.30)'; // Solid emerald
-            else fillCol = 'rgba(56, 189, 248, 0.16)'; // Low cyan
-            ctx.fillStyle = fillCol;
-            ctx.fillRect(p.x, p.y, cellW * zoom, cellH * zoom);
-          }}
-        }}
-      }}
-    }}
-
-    function drawTrajectory(ctx, pts, color, isDashed, pct) {{
-      if (!pts || pts.length === 0) return;
-      const cutIdx = Math.floor(pct * (pts.length - 1));
-
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = isDashed ? 2 : 3;
-      if (isDashed) ctx.setLineDash([4, 4]);
-      ctx.beginPath();
-      for (let i = 0; i <= cutIdx && i < pts.length; i++) {{
-        const p = worldToScreen(pts[i].x, pts[i].y, 0);
-        if (i === 0) ctx.moveTo(p.x, p.y);
-        else ctx.lineTo(p.x, p.y);
-      }}
-      ctx.stroke();
-      ctx.restore();
-    }}
-
-    function drawWalls(ctx) {{
-      let visibleCount = 0;
-      const showLabels = document.getElementById('layer-labels').checked;
-
-      WALLS.forEach((w, wIdx) => {{
-        const conf = w.confidence !== undefined ? w.confidence : 0.75;
-        if (conf < minConfidence) return;
-        visibleCount++;
-
-        const isHovered = hoveredWall && hoveredWall.wall_id === w.wall_id;
-
-        // Styling based on confidence tier
-        let strokeColor, lineWidth, isDashed, fill3D;
-        if (conf >= 0.70) {{
-          strokeColor = isHovered ? '#ffffff' : '#38bdf8';
-          lineWidth = isHovered ? 6 : 4.5;
-          isDashed = false;
-          fill3D = isHovered ? 'rgba(56, 189, 248, 0.45)' : 'rgba(56, 189, 248, 0.28)';
-        }} else if (conf >= 0.40) {{
-          strokeColor = isHovered ? '#fef08a' : '#f59e0b';
-          lineWidth = isHovered ? 4.5 : 3.0;
-          isDashed = true;
-          fill3D = 'rgba(245, 158, 11, 0.18)';
-        }} else {{
-          strokeColor = isHovered ? '#e2e8f0' : 'rgba(148, 163, 184, 0.50)';
-          lineWidth = 2.0;
-          isDashed = true;
-          fill3D = 'rgba(148, 163, 184, 0.10)';
-        }}
-
-        ctx.save();
-        ctx.strokeStyle = strokeColor;
-        ctx.lineWidth = lineWidth;
-        if (isDashed) {{
-          ctx.setLineDash(conf < 0.40 ? [3, 3] : [8, 4]);
-        }}
-        ctx.lineCap = 'round';
-
-        if (viewMode === '2D') {{
-          const p1 = worldToScreen(w.x1, w.y1);
-          const p2 = worldToScreen(w.x2, w.y2);
-
-          if (conf >= 0.70) {{
-            ctx.shadowColor = 'rgba(56, 189, 248, 0.5)';
-            ctx.shadowBlur = isHovered ? 12 : 5;
-          }}
-
-          ctx.beginPath();
-          ctx.moveTo(p1.x, p1.y);
-          ctx.lineTo(p2.x, p2.y);
-          ctx.stroke();
-
-          // Midpoint confidence pill
-          if (showLabels && conf >= 0.40) {{
-            const mx = (p1.x + p2.x) / 2.0;
-            const my = (p1.y + p2.y) / 2.0;
-            ctx.shadowBlur = 0;
-            ctx.fillStyle = conf >= 0.70 ? '#0284c7' : '#d97706';
-            ctx.fillRect(mx - 14, my - 8, 28, 15);
-            ctx.fillStyle = '#ffffff';
-            ctx.font = 'bold 9px sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(`${{Math.round(conf * 100)}}%`, mx, my);
-          }}
-        }} else {{
-          // 2.5D Extruded wall
-          const wallHeightM = 2.4;
-          const b1 = worldToScreen(w.x1, w.y1, 0);
-          const b2 = worldToScreen(w.x2, w.y2, 0);
-          const t1 = worldToScreen(w.x1, w.y1, wallHeightM);
-          const t2 = worldToScreen(w.x2, w.y2, wallHeightM);
-
-          ctx.fillStyle = fill3D;
-          ctx.beginPath();
-          ctx.moveTo(b1.x, b1.y);
-          ctx.lineTo(b2.x, b2.y);
-          ctx.lineTo(t2.x, t2.y);
-          ctx.lineTo(t1.x, t1.y);
-          ctx.closePath();
-          ctx.fill();
-          ctx.stroke();
-        }}
-        ctx.restore();
-      }});
-
-      document.getElementById('wall-count-badge').textContent = `Walls: ${{visibleCount}} / ${{WALLS.length}}`;
-    }}
-
-    function drawDoorways(ctx) {{
-      DOORS.forEach(d => {{
-        const p = worldToScreen(d.x, d.y, 0);
-        ctx.strokeStyle = '#f59e0b';
-        ctx.lineWidth = 2.5;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 8, 0, Math.PI * 2);
-        ctx.stroke();
-      }});
-    }}
-
-    function drawRooms(ctx) {{
-      const showLabels = document.getElementById('layer-labels').checked;
-      ROOMS.forEach(r => {{
-        const p = worldToScreen(r.centroid_x, r.centroid_y, 0);
-        if (showLabels) {{
-          ctx.save();
-          ctx.textAlign = 'center';
-          ctx.fillStyle = '#ffffff';
-          ctx.font = 'bold 12px sans-serif';
-          ctx.fillText(r.name, p.x, p.y - 10);
-
-          ctx.fillStyle = '#38bdf8';
-          ctx.font = '11px sans-serif';
-          const dimTxt = r.dimensions_m ? `${{r.dimensions_m}} (${{r.area_m2}} m²)` : `${{r.area_m2}} m²`;
-          ctx.fillText(dimTxt, p.x, p.y + 6);
-          ctx.restore();
-        }}
-      }});
-    }}
-
-    function drawAPs(ctx) {{
-      APS.forEach(ap => {{
-        const p = worldToScreen(ap.x, ap.y, 0);
-        ctx.fillStyle = '#22c55e';
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 7, 0, Math.PI * 2);
-        ctx.fill();
-        ctx.fillStyle = '#ffffff';
-        ctx.font = '10px sans-serif';
-        ctx.fillText("AP (" + ap.ap_group_id.slice(-5) + ")", p.x + 10, p.y + 4);
-      }});
-    }}
-
-    function drawHeatmap(ctx) {{
-      const ny = HEATMAP.length;
-      const nx = HEATMAP[0].length;
-      const cellW = DIMS.width_m / nx;
-      const cellH = DIMS.height_m / ny;
-
-      for (let iy = 0; iy < ny; iy++) {{
-        for (let ix = 0; ix < nx; ix++) {{
-          const val = HEATMAP[iy][ix];
-          if (val > 0.5) {{
-            const p = worldToScreen(ix * cellW, iy * cellH, 0);
-            const alpha = Math.min(val / 10.0, 0.7);
-            ctx.fillStyle = `rgba(239, 68, 68, ${{alpha}})`;
-            ctx.fillRect(p.x, p.y, cellW * zoom, cellH * zoom);
-          }}
-        }}
-      }}
-    }}
-
-    // =========================================================================
-    // LAYER 2: DYNAMIC FOREGROUND (Live 60 FPS Phone, Proximity Rays & Halo)
-    // =========================================================================
-    function drawDynamicScene() {{
-      dynamicCtx.clearRect(0, 0, canvasDynamic.width, canvasDynamic.height);
-
-      if (!document.getElementById('layer-phone').checked) return;
-
-      DEVICE_KEYS.forEach((devKey, dIdx) => {{
-        const pts = DEVICE_MAP[devKey];
-        if (!pts || pts.length === 0) return;
-        const color = DEVICE_COLORS[dIdx % DEVICE_COLORS.length];
-        const pose = getInterpolatedPose(pts, playbackPct);
-        if (!pose) return;
-
-        const floorP = worldToScreen(pose.x, pose.y, 0);
-        const phoneP = worldToScreen(pose.x, pose.y, pose.z);
-
-        // -------------------------------------------------------------
-        // FEATURE: Proximity Clearance Halo & Wall Rangefinder Rays
-        // -------------------------------------------------------------
-        if (document.getElementById('layer-proximity').checked) {{
-          const wallDistances = [];
-          WALLS.forEach((w, wIdx) => {{
-            if ((w.confidence || 0.7) >= minConfidence) {{
-              const res = distToSegment(pose.x, pose.y, w.x1, w.y1, w.x2, w.y2);
-              wallDistances.push({{
-                wall: w,
-                dist: res.dist,
-                cx: res.cx,
-                cy: res.cy,
-                idx: wIdx
-              }});
-            }}
-          }});
-          wallDistances.sort((a, b) => a.dist - b.dist);
-          const nearest = wallDistances[0];
-
-          // 2. Proximity Clearance Halo on Floor (0.35m radius body buffer)
-          dynamicCtx.save();
-          const haloRadius = 0.35 * zoom;
-          dynamicCtx.beginPath();
-          if (viewMode === '3D') {{
-            dynamicCtx.ellipse(floorP.x, floorP.y, haloRadius * 1.4, haloRadius * 0.7, 0, 0, Math.PI * 2);
-          }} else {{
-            dynamicCtx.arc(floorP.x, floorP.y, haloRadius, 0, Math.PI * 2);
-          }}
-
-          let haloColor = 'rgba(6, 182, 212, 0.25)';
-          let haloStroke = '#06b6d4';
-          if (nearest && nearest.dist <= 0.35) {{
-            haloColor = 'rgba(239, 68, 68, 0.40)';
-            haloStroke = '#ef4444';
-          }} else if (nearest && nearest.dist <= 0.80) {{
-            haloColor = 'rgba(245, 158, 11, 0.30)';
-            haloStroke = '#f59e0b';
-          }}
-          dynamicCtx.fillStyle = haloColor;
-          dynamicCtx.strokeStyle = haloStroke;
-          dynamicCtx.lineWidth = 2;
-          dynamicCtx.fill();
-          dynamicCtx.stroke();
-          dynamicCtx.restore();
-
-          // 3. Dynamic Laser Rangefinder Rays to nearby walls (within 3.0m)
-          dynamicCtx.save();
-          const candidateWalls = wallDistances.slice(0, 4).filter(item => item.dist <= 3.0);
-          candidateWalls.forEach(item => {{
-            const wallPt = worldToScreen(item.cx, item.cy, 0);
-
-            // Laser line
-            dynamicCtx.strokeStyle = item.dist <= 0.35 ? '#ef4444' : (item.dist <= 0.80 ? '#f59e0b' : '#38bdf8');
-            dynamicCtx.lineWidth = item.dist <= 0.35 ? 2.5 : 1.5;
-            dynamicCtx.setLineDash([4, 4]);
-            dynamicCtx.beginPath();
-            dynamicCtx.moveTo(floorP.x, floorP.y);
-            dynamicCtx.lineTo(wallPt.x, wallPt.y);
-            dynamicCtx.stroke();
-
-            // Contact puck
-            dynamicCtx.fillStyle = '#ffffff';
-            dynamicCtx.beginPath();
-            dynamicCtx.arc(wallPt.x, wallPt.y, 3, 0, Math.PI * 2);
-            dynamicCtx.fill();
-
-            // Distance meter tag
-            const midX = (floorP.x + wallPt.x) / 2.0;
-            const midY = (floorP.y + wallPt.y) / 2.0;
-            dynamicCtx.fillStyle = 'rgba(15, 23, 42, 0.85)';
-            dynamicCtx.fillRect(midX - 18, midY - 9, 36, 18);
-            dynamicCtx.fillStyle = '#ffffff';
-            dynamicCtx.font = '10px -apple-system, sans-serif';
-            dynamicCtx.textAlign = 'center';
-            dynamicCtx.textBaseline = 'middle';
-            dynamicCtx.fillText(`${{item.dist.toFixed(2)}}m`, midX, midY);
-          }});
-          dynamicCtx.restore();
-        }}
-
-        // Phone drop tether (3D only)
-        if (viewMode === '3D') {{
-          dynamicCtx.save();
-          dynamicCtx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
-          dynamicCtx.lineWidth = 1;
-          dynamicCtx.setLineDash([2, 3]);
-          dynamicCtx.beginPath();
-          dynamicCtx.moveTo(floorP.x, floorP.y);
-          dynamicCtx.lineTo(phoneP.x, phoneP.y);
-          dynamicCtx.stroke();
-          dynamicCtx.restore();
-        }}
-
-        // Flashlight FOV Cone
-        dynamicCtx.save();
-        dynamicCtx.translate(phoneP.x, phoneP.y);
-        const coneAngle = viewMode === '2D' ? pose.yaw : pose.yaw - Math.PI / 4;
-        dynamicCtx.rotate(coneAngle);
-
-        const coneLen = 40;
-        const halfFov = 0.45;
-        const grad = dynamicCtx.createRadialGradient(0, 0, 5, 0, 0, coneLen);
-        grad.addColorStop(0, 'rgba(56, 189, 248, 0.45)');
-        grad.addColorStop(1, 'rgba(56, 189, 248, 0.0)');
-        dynamicCtx.fillStyle = grad;
-        dynamicCtx.beginPath();
-        dynamicCtx.moveTo(0, 0);
-        dynamicCtx.arc(0, 0, coneLen, -halfFov, halfFov);
-        dynamicCtx.closePath();
-        dynamicCtx.fill();
-        dynamicCtx.restore();
-
-        // Pulsing RF ring
-        dynamicCtx.save();
-        dynamicCtx.strokeStyle = color;
-        dynamicCtx.lineWidth = 1.5;
-        dynamicCtx.globalAlpha = Math.max(0, 1 - pulseAnim);
-        dynamicCtx.beginPath();
-        dynamicCtx.arc(phoneP.x, phoneP.y, 8 + pulseAnim * 20, 0, Math.PI * 2);
-        dynamicCtx.stroke();
-        dynamicCtx.restore();
-
-        // Direction Puck
-        dynamicCtx.save();
-        dynamicCtx.fillStyle = color;
-        dynamicCtx.beginPath();
-        dynamicCtx.arc(phoneP.x, phoneP.y, 8, 0, Math.PI * 2);
-        dynamicCtx.fill();
-        dynamicCtx.strokeStyle = '#ffffff';
-        dynamicCtx.lineWidth = 2;
-        dynamicCtx.stroke();
-
-        // Direction Arrow
-        dynamicCtx.fillStyle = '#ffffff';
-        dynamicCtx.beginPath();
-        const arrLen = 14;
-        const ax = phoneP.x + arrLen * Math.cos(pose.yaw);
-        const ay = phoneP.y - arrLen * Math.sin(pose.yaw);
-        dynamicCtx.moveTo(ax, ay);
-        dynamicCtx.lineTo(phoneP.x + 5 * Math.cos(pose.yaw + 2.5), phoneP.y - 5 * Math.sin(pose.yaw + 2.5));
-        dynamicCtx.lineTo(phoneP.x + 5 * Math.cos(pose.yaw - 2.5), phoneP.y - 5 * Math.sin(pose.yaw - 2.5));
-        dynamicCtx.closePath();
-        dynamicCtx.fill();
-        dynamicCtx.restore();
-
-        // Badge
-        dynamicCtx.save();
-        dynamicCtx.font = '10px -apple-system, sans-serif';
-        dynamicCtx.fillStyle = '#ffffff';
-        dynamicCtx.fillText(`📱 ${{devKey}}`, phoneP.x + 12, phoneP.y - 6);
-        dynamicCtx.restore();
-      }});
-    }}
-
-    // =========================================================================
-    // MOUSE & TOUCH CONTROLS WITH WALL INSPECTOR
-    // =========================================================================
-    canvasDynamic.addEventListener('mousedown', e => {{
-      isDragging = true;
-      startX = e.clientX - panX;
-      startY = e.clientY - panY;
-    }});
-    window.addEventListener('mouseup', () => isDragging = false);
-
-    canvasDynamic.addEventListener('mousemove', e => {{
-      if (isDragging) {{
-        panX = e.clientX - startX;
-        panY = e.clientY - startY;
-        drawStaticScene();
-        drawDynamicScene();
-        wallInspector.style.display = 'none';
-        return;
-      }}
-
-      // Hover hit-testing on walls
-      const rect = canvasDynamic.getBoundingClientRect();
-      const mx = e.clientX - rect.left;
-      const my = e.clientY - rect.top;
-
-      let closestWall = null;
-      let minPixelDist = 14;
-
-      WALLS.forEach(w => {{
-        if ((w.confidence || 0.7) >= minConfidence) {{
-          const p1 = worldToScreen(w.x1, w.y1, 0);
-          const p2 = worldToScreen(w.x2, w.y2, 0);
-          const res = distToSegment(mx, my, p1.x, p1.y, p2.x, p2.y);
-          if (res.dist < minPixelDist) {{
-            minPixelDist = res.dist;
-            closestWall = w;
-          }}
-        }}
-      }});
-
-      if (closestWall !== hoveredWall) {{
-        hoveredWall = closestWall;
-        drawStaticScene();
-      }}
-
-      if (closestWall) {{
-        const conf = closestWall.confidence !== undefined ? closestWall.confidence : 0.75;
-        const badge = document.getElementById('wi-badge');
-        if (conf >= 0.70) {{
-          badge.textContent = 'Confirmed Structural';
-          badge.style.background = '#22c55e';
-          badge.style.color = '#052e16';
-        }} else if (conf >= 0.40) {{
-          badge.textContent = 'Probable Partition';
-          badge.style.background = '#f59e0b';
-          badge.style.color = '#0f172a';
-        }} else {{
-          badge.textContent = 'Speculative Noise';
-          badge.style.background = '#64748b';
-          badge.style.color = '#ffffff';
-        }}
-
-        document.getElementById('wi-title').textContent = closestWall.wall_id ? `🧱 ${{closestWall.wall_id}}` : '🧱 Wall Segment';
-        document.getElementById('wi-conf').textContent = `${{Math.round(conf * 100)}}%`;
-        document.getElementById('wi-length').textContent = `${{closestWall.length_m || '--'}} m`;
-        document.getElementById('wi-atten').textContent = `${{closestWall.avg_attenuation_db || '--'}} dB/m`;
-        document.getElementById('wi-mat').textContent = closestWall.material_guess || 'Drywall';
-        document.getElementById('wi-rays').textContent = `${{closestWall.ray_hits || 0}} rays`;
-        document.getElementById('wi-spread').textContent = `${{closestWall.angular_diversity_deg || 0}}°`;
-        wallInspector.style.display = 'block';
-      }} else {{
-        wallInspector.style.display = 'none';
-      }}
-    }});
-
-    canvasDynamic.addEventListener('wheel', e => {{
-      e.preventDefault();
-      const factor = e.deltaY < 0 ? 1.15 : 0.87;
-      zoom = Math.max(15, Math.min(120, zoom * factor));
-      drawStaticScene();
-      drawDynamicScene();
-    }});
-
     function downloadGeoJSON() {{
       const geojsonStr = {json.dumps(export_geojson(floorplan_data, localized_aps))};
       const blob = new Blob([geojsonStr], {{ type: 'application/json' }});
@@ -1144,7 +1508,7 @@ def generate_interactive_html_viewer(
     }}
 
     // =========================================================================
-    // 60 FPS ANIMATION LOOP
+    // 60 FPS TICKER
     // =========================================================================
     let lastTickTime = performance.now();
     function animLoop(now) {{
@@ -1163,20 +1527,38 @@ def generate_interactive_html_viewer(
         }}
         document.getElementById('time-slider').value = Math.round(playbackPct * 1000);
         updateUI();
-        if (followPhone) {{
-          centerCameraOnActivePhone();
+        if (followPhone && viewMode === 'CAD') {{
+          const primaryKey = DEVICE_KEYS[0];
+          const pts = DEVICE_MAP[primaryKey];
+          if (pts && pts.length > 0) {{
+            const pose = getInterpolatedPose(pts, playbackPct);
+            if (pose) {{
+              panX = canvasDynamic.width / 2.0 - (pose.x * zoom);
+              panY = canvasDynamic.height / 2.0 - (pose.y * zoom);
+              drawStaticScene();
+            }}
+          }}
         }}
       }} else {{
         updateUI();
       }}
 
-      drawDynamicScene();
+      if (viewMode === 'CAD') {{
+        drawDynamicScene();
+      }} else if (threeRenderer && threeScene) {{
+        updateThreePhone();
+        if (threeControls && threeControls.enabled) threeControls.update();
+        threeRenderer.render(threeScene, threeCamera);
+      }}
+
       requestAnimationFrame(animLoop);
     }}
 
+    // Boot into Classic CAD Blueprint Mode & Recenter Building
     resize();
+    recenterBuilding();
     updateUI(true);
-    setViewMode('3D');
+    setViewMode('CAD');
     requestAnimationFrame(animLoop);
   </script>
 </body>

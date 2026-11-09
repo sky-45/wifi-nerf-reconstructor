@@ -349,33 +349,44 @@ python3 reconstructor/tune_hyperparameters.py \
 
 ---
 
-## Dual-Canvas High-Performance HTML Viewer
+## 2D Top CAD Blueprint & Free 3D WebGL HTML Viewer
 
-The interactive browser dashboard (`output/viewer_*.html`) uses a zero-lag **Dual-Canvas Architecture**:
-1. **Static Canvas (`mapCanvasStatic`)**: Renders isometric grid, room polygons, CAD walls, and RF heatmap only on zoom/pan/resize.
-2. **Dynamic Canvas (`mapCanvasDynamic`)**: Runs at 60 FPS rendering only foreground entities:
-   - **Animated 3D Phone Tracker**: Displays interpolated phone position, orientation flashlight cone, and altitude drop tether.
-   - **Dynamic Laser Rangefinder Rays**: Casts real-time dashed rays to the 4 nearest CAD walls within 3.0 meters with floating distance tags (e.g. `0.78m`).
-   - **Proximity Clearance Halo**: 0.35m radial safety buffer color-coded green (`> 0.8m`), amber (`0.4 - 0.8m`), and red (`<= 0.35m`).
-   - **Real-Time HUD**: Displays coordinates, nearest wall clearance, compass heading, and walking speed throttled to 16 Hz.
-3. **Wall Certainty Filter Slider**:
-   - Live range slider in sidebar (`≥ 35%` default): adjusts the minimum confidence threshold in real time to filter out phantom artifacts and speculative noise.
-   - **Visual Wall Tiers**:
-     - **― Solid Bold Cyan (≥ 70%)**: Confirmed structural wall supported by multiple high-angle cross-cutting rays.
-     - **╌ Dashed Amber (40–69%)**: Probable drywall partition or interior barrier.
-     - **··· Dotted Gray (< 40%)**: Speculative shadow or RF diffraction artifact.
-4. **Interactive Wall Inspector Card**:
-   - Hovering or clicking any wall displays an instant floating inspector card detailing:
-     - Certainty Score (e.g. `88%`) & Classification Badge
-     - Wall Length ($m$) and Attenuation ($\text{dB/m}$)
-     - Material Classification (Drywall, Single/Double Gypsum, Brick/Concrete)
-     - Intersecting Ray Count & Angular Diversity ($^\circ$)
-5. **Survey Ray Coverage (Observability) Layer**:
-   - Toggleable density map showing where the phone surveyed thoroughly (emerald/amber) vs unobserved blind spots (dark blue/black).
-6. **Automated Output Cleanup**:
-   - Automatically unlinks and replaces prior `.html`, `.geojson`, `.json`, and `.npy` artifacts for target sessions before generating fresh runs:
-     ```bash
-     python3 -m reconstructor.pipeline --env-id cluster_env_79f11c4a701db8a1 --clean
-     # Or purge all previous output files:
-     python3 -m reconstructor.pipeline --env-id cluster_env_79f11c4a701db8a1 --clean-all
-     ```
+The interactive browser dashboard (`output/viewer_*.html`) combines a **Dual-Canvas 2D Blueprint Architecture** with a **Three.js WebGL 3D Navigation Engine**:
+
+### Three Distinct Visual Modes
+1. **📐 Top CAD Blueprint (`viewMode = 'CAD'`, Startup Default)**:
+   - **Classic Blueprint Styling**: Navy blue `#0c2340` graph-paper background with fine white grid lines ($1.0\text{ m}$ major, $0.2\text{ m}$ minor).
+   - **Architectural Wall Thickness Ribbons**: Renders physical wall core lines flanked by parallel outer boundary stroke lines with subtle fill.
+   - **Dimension Witness Lines & Arrows**: Precise dimension annotations (`|← 3.40 m →|`) offset perpendicular to walls with end tic marks.
+   - **90° Circular Door Swing Arcs**: Standard architectural door symbols showing clearance radius and swing direction.
+   - **Room Zone Labels & Area Tags**: Room polygon tags displaying bounding width $\times$ length and area ($m^2$).
+   - **Metric Graphic Scale Bar & North Compass Arrow**: Real-time scale bar (`SCALE 1:METRIC`) adapting to zoom and architectural compass rose.
+
+2. **🌐 Free 3D Orbit (`viewMode = '3D'`)**:
+   - **Three.js WebGL Scene with `OrbitControls`**: Full continuous 360° orbital rotation, pitch/tilt angles, free panning, and distance zoom via mouse/touch.
+   - **Extruded 3D Wall Geometry**: Architectural walls extruded to realistic ceiling height ($2.4\text{ m}$) with physical thickness ($0.15\text{ m}$) and doorway cutouts.
+   - **Dynamic 3D Phone Avatar & Laser Rangefinder**: 3D phone model with direction cone, drop tether, and real-time dashed 3D laser rays cast to nearest walls.
+   - **Pulsing AP Routers**: 3D access points with antenna mast and glowing RF radiation rings.
+
+3. **🚶 First-Person Walkthrough (`viewMode = 'POV'`)**:
+   - Phone-eye camera perspective attached to the device at eye level ($1.6\text{ m}$) looking forward, gliding smoothly through the rooms during survey playback.
+
+### Camera Navigation & Recenter Controls
+- **`[🎯 Recenter]` (`recenterBuilding()`)**: Computes the full $[X_{\min}, X_{\max}] \times [Y_{\min}, Y_{\max}]$ bounding box of the reconstructed building, auto-centering and fitting the floorplan with optimal margins in both 2D CAD and 3D Orbit modes.
+- **`[📱 Follow]` (`centerOnPhone()`)**: Locks and centers the camera on the active phone survey pose.
+- **`[🏠 Jump to Room...]` (`jumpToRoom(name)`)**: Instant camera focus transition to any detected room polygon.
+
+### Wall Confidence & Interactive Features
+- **Wall Certainty Filter Slider (`#slider-wall-conf`)**: Live slider (`≥ 35%` default) to filter phantom artifacts in real time.
+  - **― Solid Bold Cyan (≥ 70%)**: Confirmed structural wall supported by multiple high-angle cross-cutting rays.
+  - **╌ Dashed Amber (40–69%)**: Probable drywall partition or interior barrier.
+  - **··· Dotted Gray (< 40%)**: Speculative shadow or RF diffraction artifact.
+- **Interactive Wall Inspector Card (`#wall-inspector`)**: Hovering over or clicking any wall reveals certainty score, length, attenuation ($\text{dB/m}$), material type, ray hit count, and angular diversity.
+- **Survey Observability Heatmap (`#layer-coverage`)**: Green/amber ray density overlay highlighting thoroughly surveyed corridors vs blind spots.
+- **Automated Output Cleanup**:
+  - Automatically unlinks and replaces prior `.html`, `.geojson`, `.json`, and `.npy` artifacts for target sessions before generating fresh runs:
+    ```bash
+    python3 -m reconstructor.pipeline --env-id cluster_env_79f11c4a701db8a1 --clean
+    # Or purge all previous output files:
+    python3 -m reconstructor.pipeline --env-id cluster_env_79f11c4a701db8a1 --clean-all
+    ```
