@@ -147,43 +147,90 @@ class BlobStoreAdapter:
         else:
             raise ValueError(f"Unsupported storage scheme: {scheme}")
 
-    def _list_all_http_par_objects(self, prefix: str = "") -> List[str]:
-        """Lists objects via an HTTP/HTTPS Pre-Authenticated Request (PAR) endpoint."""
-        import urllib.request
-        base = self.base_uri.rstrip("/")
-        list_url = f"{base}/" if not base.endswith("/o") else f"{base}"
-        query_char = "&" if "?" in list_url else "?"
-        if prefix:
-            list_url = f"{list_url}{query_char}prefix={prefix}"
+    @staticmethod
+    def _split_http_par_uri(uri: str) -> Tuple[str, str]:
+        """
+        Splits an OCI Pre-Authenticated Request (PAR) URI into:
+          (par_root_url, subpath_prefix)
+        where par_root_url always ends with '/o/' and subpath_prefix is any path
+        appended after '/o/' (e.g. 'batches').
+        """
+        trimmed = uri.strip()
+        marker = "/o/"
+        idx = trimmed.find(marker)
+        if idx != -1:
+            par_root = trimmed[:idx + len(marker)]
+            subpath = trimmed[idx + len(marker):].strip("/")
+            return par_root, subpath
+        if trimmed.endswith("/o"):
+            return trimmed + "/", ""
+        return trimmed.rstrip("/") + "/", ""
 
-        req = urllib.request.Request(list_url, headers={"User-Agent": "WifiNerfReconstructor/1.0"})
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                items = []
-                if isinstance(data, dict) and "objects" in data:
-                    for obj in data["objects"]:
-                        name = obj.get("name", "")
-                        if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
-                            items.append(name)
-                elif isinstance(data, list):
-                    for item in data:
-                        name = item if isinstance(item, str) else item.get("name", "")
-                        if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
-                            items.append(name)
-                return sorted(items)
-        except Exception as e:
-            print(f"[BlobStore] Warning: Failed to list objects via HTTP/HTTPS PAR: {e}")
-            return []
+    def _list_all_http_par_objects(self, prefix: str = "") -> List[str]:
+        """Lists objects via an HTTP/HTTPS Pre-Authenticated Request (PAR) endpoint with pagination."""
+        import urllib.request
+        from urllib.parse import quote
+
+        par_root, subpath = self._split_http_par_uri(self.base_uri)
+        combined_prefix = "/".join(p for p in (subpath, prefix.strip("/")) if p)
+
+        items = []
+        next_start = None
+
+        while True:
+            params = []
+            if combined_prefix:
+                params.append(f"prefix={quote(combined_prefix, safe='/')}")
+            if next_start:
+                params.append(f"start={quote(next_start, safe='/')}")
+            query_str = ("?" + "&".join(params)) if params else ""
+            list_url = f"{par_root}{query_str}"
+
+            req = urllib.request.Request(list_url, headers={"User-Agent": "WifiNerfReconstructor/1.0"})
+            try:
+                with urllib.request.urlopen(req, timeout=20) as resp:
+                    raw = resp.read()
+                    if raw[:2] == b"\x1f\x8b":
+                        raw = gzip.decompress(raw)
+                    data = json.loads(raw.decode("utf-8"))
+                    if isinstance(data, dict) and "objects" in data:
+                        for obj in data["objects"]:
+                            name = obj.get("name", "")
+                            if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
+                                items.append(name)
+                        next_start = data.get("nextStartWith")
+                        if not next_start:
+                            break
+                    elif isinstance(data, list):
+                        for item in data:
+                            name = item if isinstance(item, str) else item.get("name", "")
+                            if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
+                                items.append(name)
+                        break
+                    else:
+                        break
+            except Exception as e:
+                print(
+                    f"[BlobStore] Warning: Failed to list objects via HTTP/HTTPS PAR ({list_url}): {e}\n"
+                    f"            Ensure your OCI PAR URL is valid and created with 'Permit object reads and writes' + 'Enable object listing'."
+                )
+                break
+
+        return sorted(set(items))
 
     def _read_http_par_bytes(self, object_key: str) -> bytes:
         """Fetches raw object bytes via an HTTP/HTTPS Pre-Authenticated Request (PAR) endpoint."""
         import urllib.request
-        base = self.base_uri.rstrip("/")
+        from urllib.parse import quote
+
         if object_key.startswith("http://") or object_key.startswith("https://"):
             url = object_key
         else:
-            url = f"{base}/{object_key.lstrip('/')}"
+            par_root, subpath = self._split_http_par_uri(self.base_uri)
+            clean_key = object_key.lstrip("/")
+            if subpath and not clean_key.startswith(f"{subpath}/"):
+                clean_key = f"{subpath}/{clean_key}"
+            url = f"{par_root}{quote(clean_key, safe='/')}"
 
         req = urllib.request.Request(url, headers={"User-Agent": "WifiNerfReconstructor/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
@@ -302,7 +349,7 @@ class SessionAssembler:
         self.aligner = MultiDeviceAligner()
 
     def _parse_batch_bytes(self, raw_bytes: bytes, key: str = "") -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
-        if key.endswith(".gz") or raw_bytes[:2] == b"\x1f\x8b":
+        if raw_bytes[:2] == b"\x1f\x8b":
             try:
                 decompressed = gzip.decompress(raw_bytes)
             except Exception as e:
@@ -444,9 +491,11 @@ class SessionAssembler:
         """Removes mobile hotspots (iPhone, AndroidAP) and ephemeral randomized MACs."""
         hotspot_regex = re.compile(r"(iphone|androidap|galaxy|pixel|hotspot|portable)", re.IGNORECASE)
         bssid_counts = {}
+        scan_batch_count = 0
 
         for ev in events:
             if ev.get("event_type") == "wifi_scan_batch":
+                scan_batch_count += 1
                 for scan in ev.get("scans", []):
                     bssid = scan["bssid"]
                     ssid = scan.get("ssid", "")
@@ -454,8 +503,9 @@ class SessionAssembler:
                         continue
                     bssid_counts[bssid] = bssid_counts.get(bssid, 0) + 1
 
-        # Keep BSSIDs that appear in at least 2 distinct scans
-        valid_bssids = {b for b, count in bssid_counts.items() if count >= 2}
+        # Keep BSSIDs that appear in at least 2 distinct scans (or >= 1 if short test session)
+        min_count = 2 if scan_batch_count >= 3 else 1
+        valid_bssids = {b for b, count in bssid_counts.items() if count >= min_count}
 
         filtered = []
         for ev in events:

@@ -278,30 +278,40 @@ class SessionPartitioner:
         """
         Detects if an environment partition is a transit session (car, bus, outdoor walk)
         based on:
-        1. Explicit naming tags ('transit', 'commute', 'driving', 'subway')
-        2. Insufficient stationary scans
+        1. Explicit naming tags ('transit', 'commute', 'driving', 'subway', 'uninitialized')
+        2. Insufficient stationary scans / connected probes
         3. Low recurring AP ratio (in transit, APs flash by and are never seen >=2 times)
         """
         # 1. Semantic Check
         env_lower = env_id.lower()
-        for kw in TRANSIT_KEYWORDS:
+        for kw in TRANSIT_KEYWORDS | {"uninitialized"}:
             if kw in env_lower:
-                return True, f"Explicit transit naming detected in environment_id ('{env_id}')"
+                return True, f"Explicit transit/uninitialized naming detected in environment_id ('{env_id}')"
+
+        total_batches = sum(len(k) for k in device_batches.values())
+        scheme = getattr(getattr(self.adapter, "parsed", None), "scheme", "")
+        is_remote = scheme in ("http", "https", "oci", "s3")
+
+        # Fast-path for remote cloud buckets with multiple batches in the same RF cluster
+        if is_remote and total_batches >= 2:
+            return False, f"Stationary indoor RF cluster verified ({total_batches} batches)"
 
         # 2. Inspect Batch Data & Heuristics
         total_scans = 0
+        total_probes = 0
         bssid_counts: Dict[str, int] = {}
         has_transit_flag = False
 
-        # Sample up to first 3 batches to evaluate
+        # Sample up to first 4 batches per device (or 1 on remote)
+        max_samples = 1 if is_remote else 4
         sample_keys = []
         for dev_id, keys in device_batches.items():
-            sample_keys.extend(keys[:2])
+            sample_keys.extend(keys[:max_samples])
 
         for key in sample_keys:
             try:
                 raw_bytes = self.adapter.read_object_bytes(key)
-                if key.endswith(".gz") or raw_bytes[:2] == b"\x1f\x8b":
+                if raw_bytes[:2] == b"\x1f\x8b":
                     decompressed = gzip.decompress(raw_bytes)
                 else:
                     decompressed = raw_bytes
@@ -310,7 +320,7 @@ class SessionPartitioner:
                     if not line.strip():
                         continue
                     obj = json.loads(line)
-                    ev_type = obj.get("event_type")
+                    ev_type = obj.get("event_type") or obj.get("type")
 
                     if ev_type == "batch_envelope":
                         if obj.get("is_transit", False) or obj.get("environment_type") == "transit":
@@ -324,6 +334,12 @@ class SessionPartitioner:
                             if b:
                                 bssid_counts[b] = bssid_counts.get(b, 0) + 1
 
+                    elif ev_type == "connected_probe":
+                        total_probes += 1
+                        b = obj.get("bssid")
+                        if b and b != "02:00:00:00:00:00":
+                            bssid_counts[b] = bssid_counts.get(b, 0) + 1
+
                 if has_transit_flag:
                     break
             except Exception:
@@ -332,15 +348,15 @@ class SessionPartitioner:
         if has_transit_flag:
             return True, "Batch envelope explicitly flagged as transit (is_transit=True)"
 
-        if total_scans < min_scans_threshold:
-            return True, f"Insufficient dwell time/scans ({total_scans} < {min_scans_threshold})"
+        if total_scans < min_scans_threshold and total_probes < min_scans_threshold:
+            return True, f"Insufficient dwell time/scans (scans={total_scans}, probes={total_probes} < {min_scans_threshold})"
 
         # 3. AP Recurrence Ratio
         total_unique_aps = len(bssid_counts)
         recurring_aps = sum(1 for cnt in bssid_counts.values() if cnt >= 2)
         ratio = (recurring_aps / max(total_unique_aps, 1))
 
-        if total_unique_aps > 10 and ratio < min_ap_recurrence_ratio:
+        if total_unique_aps > 10 and ratio < min_ap_recurrence_ratio and total_probes == 0:
             return True, f"Low AP recurrence ratio ({ratio:.1%} < {min_ap_recurrence_ratio:.1%}, highway/outdoor transit signature)"
 
         return False, "Stationary indoor environment verified"

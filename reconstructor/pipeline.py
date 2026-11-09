@@ -16,7 +16,7 @@ import json
 import math
 import os
 import sys
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 import numpy as np
 
@@ -29,23 +29,73 @@ from reconstructor.floorplan_vectorizer import FloorplanVectorizer
 from reconstructor.unlabeled_evaluator import UnlabeledEvaluator
 from viewer.viewer_generator import generate_interactive_html_viewer, export_geojson
 
+def _normalize_spatial_bounds(
+    events: List[Dict[str, Any]],
+    raw_traj: List[List[float]],
+    room_width_m: float,
+    room_height_m: float,
+    margin_m: float = 2.0
+) -> Tuple[List[Dict[str, Any]], List[List[float]], float, float]:
+    """
+    Ensures all trajectory poses fit within [margin_m, width - margin_m] x [margin_m, height - margin_m].
+    If real phone dead-reckoning starts at (0, 0) or moves into negative coordinates, shifts and
+    expands the reconstruction grid automatically.
+    """
+    xs = [ev["pose"]["x"] for ev in events if ev.get("pose")]
+    ys = [ev["pose"]["y"] for ev in events if ev.get("pose")]
+    if not xs or not ys:
+        return events, raw_traj, room_width_m, room_height_m
+
+    min_x, max_x = min(xs), max(xs)
+    min_y, max_y = min(ys), max(ys)
+
+    needs_shift = (min_x < 0.5 or min_y < 0.5 or max_x > room_width_m - 0.5 or max_y > room_height_m - 0.5)
+    if not needs_shift:
+        return events, raw_traj, room_width_m, room_height_m
+
+    dx = (margin_m - min_x) if min_x < margin_m else 0.0
+    dy = (margin_m - min_y) if min_y < margin_m else 0.0
+
+    new_width = max(room_width_m, round((max_x + dx) + margin_m, 1))
+    new_height = max(room_height_m, round((max_y + dy) + margin_m, 1))
+
+    shifted_events = []
+    for ev in events:
+        ev_copy = dict(ev)
+        pose = ev.get("pose")
+        if pose:
+            p_copy = dict(pose)
+            p_copy["x"] = round(p_copy["x"] + dx, 4)
+            p_copy["y"] = round(p_copy["y"] + dy, 4)
+            ev_copy["pose"] = p_copy
+        if "scans" in ev_copy:
+            new_scans = []
+            for s in ev_copy["scans"]:
+                sc = dict(s)
+                if sc.get("pose"):
+                    sp = dict(sc["pose"])
+                    sp["x"] = round(sp["x"] + dx, 4)
+                    sp["y"] = round(sp["y"] + dy, 4)
+                    sc["pose"] = sp
+                new_scans.append(sc)
+            ev_copy["scans"] = new_scans
+        shifted_events.append(ev_copy)
+
+    shifted_raw = [[round(pt[0] + dx, 4), round(pt[1] + dy, 4)] for pt in raw_traj]
+    return shifted_events, shifted_raw, new_width, new_height
+
+
 def run_reconstruction_pipeline(
     blob_uri: str,
     session_id: Optional[str] = None,
     env_id: Optional[str] = None,
-    output_dir: str = "./reconstruction_output",
+    output_dir: str = "./output",
     room_width_m: float = 10.0,
     room_height_m: float = 8.0,
     resolution_m: float = 0.20,
     device_ids: Optional[List[str]] = None
 ) -> Dict[str, Any]:
     os.makedirs(output_dir, exist_ok=True)
-    target_id = env_id or session_id or "demo_apartment_01"
-
-    print("=" * 75)
-    print(f"[*] Starting Cloud Floorplan Reconstruction: Target={target_id}")
-    print(f"[*] Blob Storage URI: {blob_uri}")
-    print("=" * 75)
 
     # -------------------------------------------------------------------------
     # Stage 0: Ingestion, Partitioning & Multi-Device Assembly
@@ -54,16 +104,30 @@ def run_reconstruction_pipeline(
     assembler = SessionAssembler(adapter)
     partitioner = SessionPartitioner(adapter)
 
-    # Check if target is a partitioned multi-device environment
     partitions = partitioner.scan_fleet_partitions()
-    if env_id:
-        session_data = assembler.assemble_environment(env_id, device_ids=device_ids, align_coordinates=True)
-        print(f"[Stage 0] Multi-Device Fleet Ingestion for environment '{env_id}':")
-        print(f"          Contributing devices ({len(session_data['device_ids'])}): {session_data['device_ids']}")
-        print(f"          Device event breakdown: {session_data['device_stats']}")
-        print(f"          Rigid alignment transforms: {session_data.get('alignment_transforms')}")
-        print(f"          Consolidated {session_data['total_events']} events across {session_data['batch_count']} batches.")
-    elif target_id in partitions and len(partitions[target_id]) > 1:
+    target_id = env_id or session_id
+
+    if not target_id:
+        if "demo_apartment_01" in partitions:
+            target_id = "demo_apartment_01"
+        elif partitions:
+            valid_envs, _ = partitioner.filter_transit_partitions(partitions)
+            candidate_pool = valid_envs if valid_envs else partitions
+            # Select environment with the highest total batch count
+            target_id = max(
+                candidate_pool.keys(),
+                key=lambda e: sum(len(k) for k in candidate_pool[e].values())
+            )
+            env_id = target_id
+        else:
+            target_id = "demo_apartment_01"
+
+    print("=" * 75)
+    print(f"[*] Starting Cloud Floorplan Reconstruction: Target={target_id}")
+    print(f"[*] Blob Storage URI: {blob_uri}")
+    print("=" * 75)
+
+    if env_id or (target_id in partitions):
         session_data = assembler.assemble_environment(target_id, device_ids=device_ids, align_coordinates=True)
         print(f"[Stage 0] Multi-Device Fleet Ingestion for environment '{target_id}':")
         print(f"          Contributing devices ({len(session_data['device_ids'])}): {session_data['device_ids']}")
@@ -83,6 +147,9 @@ def run_reconstruction_pipeline(
     print("[Stage 1] Running Pose-Graph SLAM (IMU Odometry + Wi-Fi Loop Closures)...")
     slam = PoseGraphSLAM(keyframe_dt_s=1.0)
     slam_events = slam.optimize_trajectory(raw_events)
+    slam_events, raw_traj, room_width_m, room_height_m = _normalize_spatial_bounds(
+        slam_events, raw_traj, room_width_m, room_height_m
+    )
     slam_traj = [[ev["pose"]["x"], ev["pose"]["y"]] for ev in slam_events if ev.get("pose")]
 
     print("[Stage 1] Carving Walkable Free-Space & Doorway Bottlenecks...")
@@ -119,9 +186,13 @@ def run_reconstruction_pipeline(
         else:
             train_events.append(ev)
 
-    for ev in train_events:
-        if ev.get("event_type") == "wifi_scan_batch":
-            pose = ev["pose"]
+    probe_step = max(1, len(train_events) // 250)
+    for idx, ev in enumerate(train_events):
+        pose = ev.get("pose")
+        if not pose:
+            continue
+        ev_type = ev.get("event_type") or ev.get("type")
+        if ev_type == "wifi_scan_batch":
             # 1. Multi-band differential wall loss
             for pair in ev.get("multiband_pairs", []):
                 gid = pair.get("ap_group_id")
@@ -139,6 +210,20 @@ def run_reconstruction_pipeline(
                     fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d)
                     excess = max(0.0, fs_loss - float(s["rssi_dbm"]))
                     ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
+        elif ev_type == "connected_probe" and (idx % probe_step == 0):
+            bssid = ev.get("bssid", "")
+            prefix = bssid[:14].lower() if len(bssid) >= 14 else bssid.lower()
+            ap_info = localized_aps.get((bssid[:15] + "xx") if len(bssid) == 17 else bssid)
+            if not ap_info and prefix:
+                for k, v in localized_aps.items():
+                    if k.lower().startswith(prefix):
+                        ap_info = v
+                        break
+            if ap_info:
+                d = max(0.4, math.hypot(pose["x"] - ap_info["x"], pose["y"] - ap_info["y"]))
+                fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d)
+                excess = max(0.0, fs_loss - float(ev.get("rssi_dbm", -70)))
+                ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
 
     print(f"[Stage 3A] Solving Fast FISTA + TV Sparse Tomography ({len(ray_data)} rays)...")
     nerf_engine = NeRFMapEngine(room_width_m, room_height_m, resolution_m)
@@ -546,13 +631,14 @@ if __name__ == "__main__":
     load_env()
     default_blob = os.getenv("BLOB_URI") or os.getenv("OCI_PAR_URL") or "./blob_store"
     default_env = os.getenv("ENV_ID") or None
+    default_out = os.getenv("OUTPUT_DIR") or "./output"
 
     parser = argparse.ArgumentParser(description="Wi-Fi NeRF Floorplan Reconstructor CLI")
     parser.add_argument("--blob-uri", type=str, default=default_blob, help="URI or path to Blob Storage bucket (file://, oci://, s3://, or https:// OCI PAR)")
     parser.add_argument("--session-id", type=str, default=None, help="Session ID to reconstruct (single-session mode)")
     parser.add_argument("--env-id", type=str, default=default_env, help="Environment ID to reconstruct across fleet devices (multi-device mode)")
     parser.add_argument("--devices", nargs="+", default=None, help="Optional filter of device IDs to include for multi-device reconstruction")
-    parser.add_argument("--output-dir", type=str, default="./reconstruction_output", help="Directory for output floorplan, GeoJSON, and HTML viewer")
+    parser.add_argument("--output-dir", type=str, default=default_out, help="Directory for output floorplan, GeoJSON, and HTML viewer")
     parser.add_argument("--list-partitions", action="store_true", help="Scan storage and list discovered environments and transit quarantines")
     parser.add_argument("--demo", action="store_true", help="Generate synthetic multi-room blob data and run reconstruction end-to-end")
 

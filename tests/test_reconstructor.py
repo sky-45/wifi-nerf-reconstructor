@@ -3,7 +3,7 @@ import math
 import os
 import sys
 
-sys.path.insert(0, "/home/antigravity/wifi_nerf_reconstructor")
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np
 from reconstructor.blob_loader import BlobStoreAdapter, SessionAssembler
@@ -138,6 +138,32 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         self.assertTrue(os.path.exists(res["geojson_path"]))
         self.assertIn("quality_grade", res["metrics"])
         self.assertEqual(len(res["session_data"]["device_ids"]), 2)
+
+    def test_10_oci_par_url_splitting_and_magic_gzip(self):
+        # 1. Verify OCI PAR URL splitting with and without subpath after /o/
+        root1, sub1 = BlobStoreAdapter._split_http_par_uri(
+            "https://objectstorage.us-ashburn-1.oraclecloud.com/p/TOKEN/n/NS/b/BUCKET/o"
+        )
+        self.assertEqual(root1, "https://objectstorage.us-ashburn-1.oraclecloud.com/p/TOKEN/n/NS/b/BUCKET/o/")
+        self.assertEqual(sub1, "")
+
+        root2, sub2 = BlobStoreAdapter._split_http_par_uri(
+            "https://objectstorage.us-ashburn-1.oraclecloud.com/p/TOKEN/n/NS/b/BUCKET/o/batches/"
+        )
+        self.assertEqual(root2, "https://objectstorage.us-ashburn-1.oraclecloud.com/p/TOKEN/n/NS/b/BUCKET/o/")
+        self.assertEqual(sub2, "batches")
+
+        # 2. Verify _parse_batch_bytes handles plain NDJSON even when key ends in .ndjson.gz
+        adapter = BlobStoreAdapter(self.demo_dir)
+        assembler = SessionAssembler(adapter)
+        plain_ndjson = (
+            b'{"event_type":"batch_envelope","batch_seq":1,"timestamp_ns":100}\n'
+            b'{"event_type":"connected_probe","bssid":"aa:bb:cc:dd:ee:01","rssi_dbm":-55,"timestamp_ns":101,"pose":{"x":-2.5,"y":-1.5}}\n'
+        )
+        env, evs = assembler._parse_batch_bytes(plain_ndjson, key="batches/fleet/dev1/env1/batch_1.ndjson.gz")
+        self.assertIsNotNone(env)
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["event_type"], "connected_probe")
 
 if __name__ == "__main__":
     unittest.main()

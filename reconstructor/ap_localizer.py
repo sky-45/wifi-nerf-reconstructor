@@ -15,6 +15,19 @@ class MultiApLocalizer:
     """
 
     def localize_all_aps(self, events: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+        # First pass: map BSSID and 5-octet BSSID prefix to canonical ap_group_id from scan batches
+        bssid_to_gid: Dict[str, str] = {}
+        prefix_to_gid: Dict[str, str] = {}
+        for ev in events:
+            if (ev.get("event_type") or ev.get("type")) == "wifi_scan_batch":
+                for s in ev.get("scans", []):
+                    bssid = s.get("bssid", "")
+                    gid = s.get("ap_group_id", bssid)
+                    if bssid and gid:
+                        bssid_to_gid[bssid] = gid
+                        if len(bssid) >= 14:
+                            prefix_to_gid[bssid[:14].lower()] = gid
+
         # Group measurements by physical AP Group or BSSID
         ap_obs = {}
 
@@ -23,21 +36,39 @@ class MultiApLocalizer:
             if not pose:
                 continue
             px, py = pose["x"], pose["y"]
+            ev_type = ev.get("event_type") or ev.get("type")
 
-            if ev.get("event_type") == "wifi_scan_batch":
+            if ev_type == "wifi_scan_batch":
                 for s in ev.get("scans", []):
                     gid = s.get("ap_group_id", s["bssid"])
                     rssi = float(s["rssi_dbm"])
                     ap_obs.setdefault(gid, []).append((px, py, rssi, s["bssid"], s["freq_mhz"]))
+            elif ev_type == "connected_probe":
+                bssid = ev.get("bssid", "")
+                if bssid and bssid != "02:00:00:00:00:00":
+                    gid = (
+                        bssid_to_gid.get(bssid)
+                        or prefix_to_gid.get(bssid[:14].lower())
+                        or ((bssid[:15] + "xx") if len(bssid) == 17 else bssid)
+                    )
+                    rssi = float(ev.get("rssi_dbm", -70))
+                    freq = int(ev.get("freq_mhz", 5180))
+                    ap_obs.setdefault(gid, []).append((px, py, rssi, bssid, freq))
+
+        if not ap_obs:
+            return {}
+
+        max_obs = max(len(v) for v in ap_obs.values())
+        min_obs = 4 if max_obs >= 4 else 1
 
         results = {}
         for gid, obs in ap_obs.items():
-            if len(obs) < 4:
+            if len(obs) < min_obs:
                 continue
 
             # Sort by RSSI descending and take top 25% (highest probability of LoS)
             obs_sorted = sorted(obs, key=lambda x: x[2], reverse=True)
-            los_candidates = obs_sorted[:max(4, len(obs_sorted) // 4)]
+            los_candidates = obs_sorted[:max(min_obs, len(obs_sorted) // 4)]
 
             # Weighted centroid as initial guess
             weights = [10.0 ** (item[2] / 20.0) for item in los_candidates]
@@ -50,7 +81,7 @@ class MultiApLocalizer:
 
             # Classify as internal (inside mapped rooms) vs external neighbor
             max_rssi = obs_sorted[0][2]
-            is_internal = (max_rssi > -52.0)
+            is_internal = (max_rssi > -62.0)
 
             results[gid] = {
                 "ap_group_id": gid,
@@ -86,6 +117,13 @@ class MultiApLocalizer:
 
             x -= (lr * grad_x / len(obs))
             y -= (lr * grad_y / len(obs))
+
+            # Regularize within a realistic indoor radius of the initial weighted centroid
+            offset = math.hypot(x - init_x, y - init_y)
+            if offset > 8.0:
+                scale = 8.0 / offset
+                x = init_x + (x - init_x) * scale
+                y = init_y + (y - init_y) * scale
 
         # Re-estimate P0 with final position
         p0_est = np.median([rssi + 20.0 * math.log10(max(0.4, math.hypot(px - x, py - y))) for px, py, rssi, _, _ in obs])
