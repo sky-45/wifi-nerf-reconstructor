@@ -81,8 +81,52 @@ def _normalize_spatial_bounds(
             ev_copy["scans"] = new_scans
         shifted_events.append(ev_copy)
 
-    shifted_raw = [[round(pt[0] + dx, 4), round(pt[1] + dy, 4)] for pt in raw_traj]
+    shifted_raw = []
+    for pt in raw_traj:
+        if isinstance(pt, dict):
+            p = dict(pt)
+            p["x"] = round(p["x"] + dx, 4)
+            p["y"] = round(p["y"] + dy, 4)
+            shifted_raw.append(p)
+        elif isinstance(pt, (list, tuple)):
+            shifted_raw.append([round(pt[0] + dx, 4), round(pt[1] + dy, 4), *pt[2:]])
+        else:
+            shifted_raw.append(pt)
     return shifted_events, shifted_raw, new_width, new_height
+
+
+def _extract_rich_trajectory(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Extracts 3D pose points with elevation (z), heading (yaw), timestamp, and device ID."""
+    traj = []
+    for ev in events:
+        pose = ev.get("pose")
+        if not pose:
+            continue
+        qx = pose.get("qx", 0.0)
+        qy = pose.get("qy", 0.0)
+        qz = pose.get("qz", 0.0)
+        qw = pose.get("qw", 1.0)
+        # Compute yaw from orientation quaternion
+        yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        traj.append({
+            "x": round(float(pose["x"]), 3),
+            "y": round(float(pose["y"]), 3),
+            "z": round(float(pose.get("z", 1.1)), 3),
+            "yaw": round(float(yaw), 3),
+            "ts": ev.get("ts_ms") or ev.get("timestamp") or 0,
+            "device": ev.get("device_id", "phone_1")
+        })
+    # If yaw was uncalibrated (0.0), compute heading tangent from consecutive points
+    for i in range(len(traj)):
+        if traj[i]["yaw"] == 0.0:
+            if i + 1 < len(traj):
+                dx = traj[i + 1]["x"] - traj[i]["x"]
+                dy = traj[i + 1]["y"] - traj[i]["y"]
+                if math.hypot(dx, dy) > 0.03:
+                    traj[i]["yaw"] = round(math.atan2(dy, dx), 3)
+            elif i > 0:
+                traj[i]["yaw"] = traj[i - 1]["yaw"]
+    return traj
 
 
 def run_reconstruction_pipeline(
@@ -139,7 +183,7 @@ def run_reconstruction_pipeline(
         print(f"[Stage 0] Ingested {session_data['total_events']} events across {session_data['batch_count']} batches.")
 
     raw_events = session_data["events"]
-    raw_traj = [[ev["pose"]["x"], ev["pose"]["y"]] for ev in raw_events if ev.get("pose")]
+    raw_traj = _extract_rich_trajectory(raw_events)
 
     # -------------------------------------------------------------------------
     # Stage 1: Pose-Graph SLAM & Free-Space Carving
@@ -150,7 +194,7 @@ def run_reconstruction_pipeline(
     slam_events, raw_traj, room_width_m, room_height_m = _normalize_spatial_bounds(
         slam_events, raw_traj, room_width_m, room_height_m
     )
-    slam_traj = [[ev["pose"]["x"], ev["pose"]["y"]] for ev in slam_events if ev.get("pose")]
+    slam_traj = _extract_rich_trajectory(slam_events)
 
     print("[Stage 1] Carving Walkable Free-Space & Doorway Bottlenecks...")
     carver = FreeSpaceCarver(room_width_m, room_height_m, resolution_m)
