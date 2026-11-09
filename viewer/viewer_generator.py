@@ -204,7 +204,7 @@ def generate_interactive_html_viewer(
       </div>
       <div style="display: flex; gap: 6px;">
         <button class="btn btn-secondary" style="flex:1;" onclick="recenterBuilding()" title="Fit building to screen">🎯 Recenter</button>
-        <button class="btn btn-secondary" style="flex:1;" onclick="centerOnPhone()" title="Follow active phone">📱 Follow</button>
+        <button class="btn btn-secondary" id="btn-follow" style="flex:1;" onclick="toggleFollowPhone()" title="Toggle follow active phone">📱 Follow</button>
       </div>
     </div>
 
@@ -280,7 +280,7 @@ def generate_interactive_html_viewer(
           <option value="2.0">2.0s</option>
           <option value="5.0">5.0s</option>
         </select>
-        <span id="live-badge" class="badge" style="background:#052e16; color:#22c55e; border:1px solid #22c55e; font-size:10px;">● LIVE</span>
+        <span id="live-badge" class="badge" style="background:#052e16; color:#22c55e; border:1px solid #22c55e; font-size:10px; cursor:pointer;" onclick="returnToLiveMode()" title="Click to resume real-time live mode">● LIVE</span>
         <select id="room-jump-select" style="background:#0d2238; color:#cbd5e1; border:1px solid #1e3a5f; padding:4px 8px; border-radius:4px; font-size:11px;" onchange="jumpToRoom(this.value)">
           <option value="">🏠 Jump to Room...</option>
         </select>
@@ -423,8 +423,33 @@ def generate_interactive_html_viewer(
     let isPlaying = false;
     let playbackPct = 1.0;
     let playbackSpeed = 1.0;
-    let followPhone = true;
+    let followPhone = false;
+    let isLiveMode = true;
     let pulseAnim = 0;
+
+    let currentPhonePos = {{
+      x: BBOX_CENTER.x,
+      y: BBOX_CENTER.y,
+      z: 1.1,
+      yaw: 0,
+      speed: 0,
+      device: DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : 'phone_1'
+    }};
+    let targetPhonePos = {{ ...currentPhonePos }};
+    let isTargetPoseInitialized = false;
+    if (FULL_SLAM_POINTS.length > 0) {{
+      const lastPt = FULL_SLAM_POINTS[FULL_SLAM_POINTS.length - 1];
+      currentPhonePos = {{
+        x: lastPt.x,
+        y: lastPt.y,
+        z: typeof lastPt.z === 'number' ? lastPt.z : 1.1,
+        yaw: lastPt.yaw || 0,
+        speed: lastPt.speed || 0,
+        device: lastPt.device || 'phone_1'
+      }};
+      targetPhonePos = {{ ...currentPhonePos }};
+      isTargetPoseInitialized = true;
+    }}
 
     const minTs = FULL_SLAM_POINTS.length > 0 ? FULL_SLAM_POINTS[0].ts : 0;
     const maxTs = FULL_SLAM_POINTS.length > 0 ? FULL_SLAM_POINTS[FULL_SLAM_POINTS.length - 1].ts : 1000;
@@ -581,12 +606,35 @@ def generate_interactive_html_viewer(
       }}
     }}
 
+    function toggleFollowPhone() {{
+      followPhone = !followPhone;
+      const btn = document.getElementById('btn-follow');
+      if (btn) {{
+        if (followPhone) {{
+          btn.style.background = '#0284c7';
+          btn.style.borderColor = '#38bdf8';
+        }} else {{
+          btn.style.background = '';
+          btn.style.borderColor = '';
+        }}
+      }}
+      if (followPhone) {{
+        centerOnPhone();
+      }}
+    }}
+
     function centerOnPhone() {{
-      const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
-      const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
-      if (!pts || pts.length === 0) return;
-      const pose = getInterpolatedPose(pts, playbackPct);
-      if (!pose) return;
+      let pose = null;
+      if (isLiveMode) {{
+        pose = currentPhonePos;
+      }} else {{
+        const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
+        const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
+        if (pts && pts.length > 0) {{
+          pose = getInterpolatedPose(pts, playbackPct);
+        }}
+      }}
+      if (!pose || typeof pose.x !== 'number') return;
 
       if (viewMode === 'CAD') {{
         panX = canvasDynamic.width / 2.0 - (pose.x * zoom);
@@ -1152,13 +1200,30 @@ def generate_interactive_html_viewer(
 
       if (!document.getElementById('layer-phone').checked) return;
 
-      DEVICE_KEYS.forEach((devKey, dIdx) => {{
-        const pts = DEVICE_MAP[devKey];
-        if (!pts || pts.length === 0) return;
-        const color = DEVICE_COLORS[dIdx % DEVICE_COLORS.length];
-        const pose = getInterpolatedPose(pts, playbackPct);
-        if (!pose) return;
+      const activePoses = [];
+      if (isLiveMode) {{
+        if (typeof currentPhonePos.x === 'number') {{
+          activePoses.push({{
+            ...currentPhonePos,
+            color: DEVICE_COLORS[0]
+          }});
+        }}
+      }} else {{
+        DEVICE_KEYS.forEach((devKey, dIdx) => {{
+          const pts = DEVICE_MAP[devKey];
+          if (!pts || pts.length === 0) return;
+          const pose = getInterpolatedPose(pts, playbackPct);
+          if (pose) {{
+            activePoses.push({{
+              ...pose,
+              color: DEVICE_COLORS[dIdx % DEVICE_COLORS.length]
+            }});
+          }}
+        }});
+      }}
 
+      activePoses.forEach(pose => {{
+        const color = pose.color || DEVICE_COLORS[0];
         const phoneP = cadWorldToScreen(pose.x, pose.y);
 
         // 1. Proximity Halo & Dynamic Lasers
@@ -1540,21 +1605,26 @@ def generate_interactive_html_viewer(
 
       // 5. Dynamic Phone Avatar & Heading Pointer
       if (document.getElementById('layer-phone').checked) {{
-        const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
-        const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
-        if (pts && pts.length > 0) {{
-          const pose = getInterpolatedPose(pts, playbackPct);
-          if (pose) {{
-            // Phone body at 1.1m elevation
-            addBox(pose.x, 1.1, pose.y, 0.18, 0.04, 0.36, -pose.yaw, [0.93, 0.28, 0.6, 1.0]);
-            // Screen display
-            addBox(pose.x, 1.125, pose.y, 0.14, 0.01, 0.30, -pose.yaw, [0.22, 0.74, 0.97, 1.0]);
-            // Forward heading pointer
-            const hLen = 0.9;
-            const hx = pose.x + Math.cos(pose.yaw) * (hLen / 2);
-            const hz = pose.y + Math.sin(pose.yaw) * (hLen / 2);
-            addBox(hx, 1.1, hz, 0.05, 0.02, hLen, -pose.yaw + Math.PI / 2, [0.96, 0.62, 0.07, 0.9]);
+        let pose = null;
+        if (isLiveMode) {{
+          pose = currentPhonePos;
+        }} else {{
+          const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
+          const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
+          if (pts && pts.length > 0) {{
+            pose = getInterpolatedPose(pts, playbackPct);
           }}
+        }}
+        if (pose && typeof pose.x === 'number') {{
+          // Phone body at 1.1m elevation
+          addBox(pose.x, 1.1, pose.y, 0.18, 0.04, 0.36, -pose.yaw, [0.93, 0.28, 0.6, 1.0]);
+          // Screen display
+          addBox(pose.x, 1.125, pose.y, 0.14, 0.01, 0.30, -pose.yaw, [0.22, 0.74, 0.97, 1.0]);
+          // Forward heading pointer
+          const hLen = 0.9;
+          const hx = pose.x + Math.cos(pose.yaw) * (hLen / 2);
+          const hz = pose.y + Math.sin(pose.yaw) * (hLen / 2);
+          addBox(hx, 1.1, hz, 0.05, 0.02, hLen, -pose.yaw + Math.PI / 2, [0.96, 0.62, 0.07, 0.9]);
         }}
       }}
 
@@ -1598,12 +1668,19 @@ def generate_interactive_html_viewer(
 
       if (viewMode === 'POV') {{
         // Snap camera directly to active phone pose looking forward at eye level (1.6m)
-        const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
-        const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
-        const pose = (pts && pts.length > 0) ? getInterpolatedPose(pts, playbackPct) : null;
+        let pose = null;
+        if (isLiveMode) {{
+          pose = currentPhonePos;
+        }} else {{
+          const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
+          const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
+          if (pts && pts.length > 0) {{
+            pose = getInterpolatedPose(pts, playbackPct);
+          }}
+        }}
         let eye = [BBOX_CENTER.x, 1.6, BBOX_CENTER.y];
         let target = [BBOX_CENTER.x + 1.0, 1.55, BBOX_CENTER.y];
-        if (pose) {{
+        if (pose && typeof pose.x === 'number') {{
           eye = [pose.x, 1.6, pose.y];
           const lookX = Math.cos(pose.yaw || 0);
           const lookZ = Math.sin(pose.yaw || 0);
@@ -1782,6 +1859,16 @@ def generate_interactive_html_viewer(
     // =========================================================================
     function togglePlayback() {{
       isPlaying = !isPlaying;
+      if (isPlaying) {{
+        isLiveMode = false;
+        const liveBadge = document.getElementById('live-badge');
+        if (liveBadge) {{
+          liveBadge.textContent = '⏸ VCR REPLAY';
+          liveBadge.style.background = '#3b1d06';
+          liveBadge.style.color = '#f59e0b';
+          liveBadge.style.borderColor = '#f59e0b';
+        }}
+      }}
       document.getElementById('play-icon').textContent = isPlaying ? '⏸' : '▶';
       document.getElementById('play-text').textContent = isPlaying ? 'Pause' : 'Play';
       if (isPlaying && playbackPct >= 0.999) {{
@@ -1794,8 +1881,16 @@ def generate_interactive_html_viewer(
     }}
 
     function onTimeSlider(val) {{
+      isLiveMode = false;
+      const liveBadge = document.getElementById('live-badge');
+      if (liveBadge) {{
+        liveBadge.textContent = '⏸ VCR REPLAY';
+        liveBadge.style.background = '#3b1d06';
+        liveBadge.style.color = '#f59e0b';
+        liveBadge.style.borderColor = '#f59e0b';
+      }}
       playbackPct = parseInt(val) / 1000.0;
-      updateUI();
+      updateUI(true);
       if (viewMode === 'CAD') {{
         drawDynamicScene();
       }} else {{
@@ -1806,8 +1901,72 @@ def generate_interactive_html_viewer(
       }}
     }}
 
+    function returnToLiveMode() {{
+      isLiveMode = true;
+      isPlaying = false;
+      const playIcon = document.getElementById('play-icon');
+      const playText = document.getElementById('play-text');
+      if (playIcon) playIcon.textContent = '▶';
+      if (playText) playText.textContent = 'Play';
+      const liveBadge = document.getElementById('live-badge');
+      if (liveBadge) {{
+        liveBadge.textContent = '● LIVE';
+        liveBadge.style.background = '#052e16';
+        liveBadge.style.color = '#22c55e';
+        liveBadge.style.borderColor = '#22c55e';
+      }}
+      pollLivePose();
+    }}
+
+    function initOrUpdateClearanceHUD(x, y, devName) {{
+      try {{
+        const devEl = document.getElementById('hud-device');
+        if (devEl && devName) devEl.textContent = devName;
+
+        let minD = 999.0;
+        WALLS.forEach(w => {{
+          if ((w.confidence || 0.7) >= minConfidence) {{
+            const res = distToSegment(x, y, w.x1, w.y1, w.x2, w.y2);
+            if (res.dist < minD) minD = res.dist;
+          }}
+        }});
+
+        const statusEl = document.getElementById('hud-status');
+        const nearEl = document.getElementById('hud-nearest');
+        const pctEl = document.getElementById('hud-pct');
+        if (pctEl) pctEl.textContent = isLiveMode ? 'Live' : `${{Math.round(playbackPct * 100)}}%`;
+
+        if (nearEl && statusEl) {{
+          if (minD < 900.0) {{
+            nearEl.textContent = `${{minD.toFixed(2)}} m`;
+            if (minD <= 0.35) {{
+              statusEl.textContent = 'PROXIMITY ALERT';
+              statusEl.style.background = '#ef4444';
+              statusEl.style.color = '#ffffff';
+            }} else if (minD <= 0.80) {{
+              statusEl.textContent = 'NEAR WALL';
+              statusEl.style.background = '#f59e0b';
+              statusEl.style.color = '#0a192f';
+            }} else {{
+              statusEl.textContent = 'CLEAR';
+              statusEl.style.background = '#22c55e';
+              statusEl.style.color = '#052e16';
+            }}
+          }} else {{
+            nearEl.textContent = 'Open Space';
+            statusEl.textContent = 'CLEAR';
+            statusEl.style.background = '#22c55e';
+            statusEl.style.color = '#052e16';
+          }}
+        }}
+      }} catch (err) {{
+        console.warn('HUD clearance error:', err);
+      }}
+    }}
+
     let lastHudUpdate = 0;
     function updateUI(force = false) {{
+      if (isLiveMode && !force) return;
       try {{
         const now = performance.now();
         const currentMs = minTs + playbackPct * totalDurationMs;
@@ -1848,38 +2007,7 @@ def generate_interactive_html_viewer(
             const pctEl = document.getElementById('hud-pct');
             if (pctEl) pctEl.textContent = `${{Math.round(playbackPct * 100)}}%`;
 
-            let minD = 999.0;
-            WALLS.forEach(w => {{
-              if ((w.confidence || 0.7) >= minConfidence) {{
-                const res = distToSegment(pose.x, pose.y, w.x1, w.y1, w.x2, w.y2);
-                if (res.dist < minD) minD = res.dist;
-              }}
-            }});
-            const statusEl = document.getElementById('hud-status');
-            const nearEl = document.getElementById('hud-nearest');
-            if (nearEl && statusEl) {{
-              if (minD < 900.0) {{
-                nearEl.textContent = `${{minD.toFixed(2)}} m`;
-                if (minD <= 0.35) {{
-                  statusEl.textContent = 'PROXIMITY ALERT';
-                  statusEl.style.background = '#ef4444';
-                  statusEl.style.color = '#ffffff';
-                }} else if (minD <= 0.80) {{
-                  statusEl.textContent = 'NEAR WALL';
-                  statusEl.style.background = '#f59e0b';
-                  statusEl.style.color = '#0a192f';
-                }} else {{
-                  statusEl.textContent = 'CLEAR';
-                  statusEl.style.background = '#22c55e';
-                  statusEl.style.color = '#052e16';
-                }}
-              }} else {{
-                nearEl.textContent = 'Open Space';
-                statusEl.textContent = 'CLEAR';
-                statusEl.style.background = '#22c55e';
-                statusEl.style.color = '#052e16';
-              }}
-            }}
+            initOrUpdateClearanceHUD(pose.x, pose.y, pose.device);
           }}
         }}
       }} catch (err) {{
@@ -1907,7 +2035,24 @@ def generate_interactive_html_viewer(
         lastTickTime = now;
         pulseAnim = (pulseAnim + dt * 2.0) % 1.0;
 
-        if (isPlaying && FULL_SLAM_POINTS.length > 1) {{
+        if (isLiveMode) {{
+          // Smooth 60 FPS lerp interpolation towards target pose
+          const lerpPos = 0.20;
+          currentPhonePos.x += (targetPhonePos.x - currentPhonePos.x) * lerpPos;
+          currentPhonePos.y += (targetPhonePos.y - currentPhonePos.y) * lerpPos;
+          currentPhonePos.z += (targetPhonePos.z - currentPhonePos.z) * lerpPos;
+          currentPhonePos.speed += (targetPhonePos.speed - currentPhonePos.speed) * lerpPos;
+          let dyaw = targetPhonePos.yaw - currentPhonePos.yaw;
+          while (dyaw < -Math.PI) dyaw += 2 * Math.PI;
+          while (dyaw > Math.PI) dyaw -= 2 * Math.PI;
+          currentPhonePos.yaw += dyaw * lerpPos;
+
+          if (followPhone && viewMode === 'CAD') {{
+            panX = canvasDynamic.width / 2.0 - (currentPhonePos.x * zoom);
+            panY = canvasDynamic.height / 2.0 + (currentPhonePos.y * zoom);
+            drawStaticScene();
+          }}
+        }} else if (isPlaying && FULL_SLAM_POINTS.length > 1) {{
           const step = (dt * playbackSpeed * 1000) / totalDurationMs;
           playbackPct += step;
           if (playbackPct >= 1.0) {{
@@ -1938,8 +2083,6 @@ def generate_interactive_html_viewer(
           if (viewMode !== 'CAD' && gl) {{
             rebuild3DScene();
           }}
-        }} else {{
-          updateUI();
         }}
 
         if (viewMode === 'CAD') {{
@@ -2019,60 +2162,59 @@ def generate_interactive_html_viewer(
     }}
 
     function applyLivePose(pose) {{
-      const devKey = pose.device_id || 'live_phone';
-      DEVICE_MAP[devKey] = [pose];
-      if (!DEVICE_KEYS.includes(devKey)) {{
-        DEVICE_KEYS.unshift(devKey);
+      if (!pose || typeof pose.x !== 'number') return;
+      isLiveMode = true;
+
+      targetPhonePos.x = pose.x;
+      targetPhonePos.y = pose.y;
+      targetPhonePos.z = typeof pose.z === 'number' ? pose.z : 1.1;
+      targetPhonePos.yaw = (Number(pose.yaw_deg) || 0) * Math.PI / 180.0;
+      targetPhonePos.speed = Number(pose.speed_mps) || 0.0;
+      if (pose.device_id) targetPhonePos.device = pose.device_id;
+
+      if (!isTargetPoseInitialized) {{
+        currentPhonePos.x = targetPhonePos.x;
+        currentPhonePos.y = targetPhonePos.y;
+        currentPhonePos.z = targetPhonePos.z;
+        currentPhonePos.yaw = targetPhonePos.yaw;
+        currentPhonePos.speed = targetPhonePos.speed;
+        currentPhonePos.device = targetPhonePos.device;
+        isTargetPoseInitialized = true;
+        initOrUpdateClearanceHUD(currentPhonePos.x, currentPhonePos.y, currentPhonePos.device);
       }}
+
+      // Directly update ONLY position-related DOM nodes:
+      const coordsEl = document.getElementById('hud-coords');
+      if (coordsEl) coordsEl.textContent = `${{targetPhonePos.x.toFixed(2)}}m, ${{targetPhonePos.y.toFixed(2)}}m, ${{targetPhonePos.z.toFixed(2)}}m`;
+
+      const yawEl = document.getElementById('hud-yaw');
+      if (yawEl) {{
+        let deg = Math.round(Number(pose.yaw_deg) || 0) % 360;
+        if (deg < 0) deg += 360;
+        const cardinals = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'];
+        const cardIdx = Math.round(deg / 45) % 8;
+        yawEl.textContent = `${{deg}}° (${{cardinals[cardIdx]}})`;
+      }}
+
+      const speedEl = document.getElementById('hud-speed');
+      if (speedEl) speedEl.textContent = `${{targetPhonePos.speed.toFixed(2)}} m/s`;
 
       const devEl = document.getElementById('hud-device');
-      if (devEl) devEl.textContent = devKey;
-      const coordsEl = document.getElementById('hud-coords');
-      if (coordsEl) coordsEl.textContent = `${{pose.x.toFixed(2)}}m, ${{pose.y.toFixed(2)}}m, ${{pose.z.toFixed(2)}}m`;
-      const speedEl = document.getElementById('hud-speed');
-      if (speedEl) speedEl.textContent = `${{(pose.speed_mps || 0).toFixed(2)}} m/s`;
-      const yawEl = document.getElementById('hud-yaw');
-      if (yawEl) yawEl.textContent = `${{Math.round(pose.yaw_deg || 0)}}°`;
+      if (devEl) devEl.textContent = targetPhonePos.device;
 
-      const statusEl = document.getElementById('hud-status');
-      const nearEl = document.getElementById('hud-nearest');
-      if (nearEl && statusEl) {{
-        if (typeof pose.nearest_wall_m === 'number') {{
-          nearEl.textContent = `${{pose.nearest_wall_m.toFixed(2)}} m (${{pose.nearest_wall_id || ''}})`;
-          if (pose.status === 'PROXIMITY_ALERT') {{
-            statusEl.textContent = 'PROXIMITY ALERT';
-            statusEl.style.background = '#ef4444';
-            statusEl.style.color = '#ffffff';
-          }} else if (pose.status === 'NEAR_WALL') {{
-            statusEl.textContent = 'NEAR WALL';
-            statusEl.style.background = '#f59e0b';
-            statusEl.style.color = '#0a192f';
-          }} else {{
-            statusEl.textContent = 'CLEAR';
-            statusEl.style.background = '#22c55e';
-            statusEl.style.color = '#052e16';
-          }}
-        }}
-      }}
+      // NOTE: hud-status, hud-nearest, hud-pct are kept completely stable and not touched during live ticks!
 
-      if (viewMode === 'CAD') {{
-        if (followPhone) {{
-          panX = canvasDynamic.width / 2.0 - (pose.x * zoom);
-          panY = canvasDynamic.height / 2.0 + (pose.y * zoom);
-          drawStaticScene();
-        }}
-        drawDynamicScene();
-      }} else {{
-        if (gl) {{
-          rebuild3DScene();
-          render3DScene();
-        }}
+      if (followPhone && viewMode === 'CAD') {{
+        panX = canvasDynamic.width / 2.0 - (targetPhonePos.x * zoom);
+        panY = canvasDynamic.height / 2.0 + (targetPhonePos.y * zoom);
+        drawStaticScene();
       }}
     }}
 
     async function onEnvironmentSelected(newEnv) {{
       if (!newEnv || newEnv === activeEnvId) return;
       activeEnvId = newEnv;
+      isTargetPoseInitialized = false;
       fetch('/api/settings', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
@@ -2100,6 +2242,14 @@ def generate_interactive_html_viewer(
             }}
             BBOX_CENTER = {{ x: (BBOX.minX + BBOX.maxX) / 2.0, y: (BBOX.minY + BBOX.maxY) / 2.0 }};
             BBOX_SPAN = Math.max(4.0, Math.max(BBOX.maxX - BBOX.minX, BBOX.maxY - BBOX.minY));
+
+            currentPhonePos.x = BBOX_CENTER.x;
+            currentPhonePos.y = BBOX_CENTER.y;
+            targetPhonePos.x = BBOX_CENTER.x;
+            targetPhonePos.y = BBOX_CENTER.y;
+
+            // Recalculate baseline clearance once for the new environment
+            initOrUpdateClearanceHUD(currentPhonePos.x, currentPhonePos.y, targetPhonePos.device);
 
             recenterBuilding();
             if (gl) {{
@@ -2166,6 +2316,7 @@ def generate_interactive_html_viewer(
     // Boot into Classic CAD Blueprint Mode & Recenter Building
     resize();
     recenterBuilding();
+    initOrUpdateClearanceHUD(currentPhonePos.x, currentPhonePos.y, currentPhonePos.device);
     updateUI(true);
     setViewMode('CAD');
     requestAnimationFrame(animLoop);
