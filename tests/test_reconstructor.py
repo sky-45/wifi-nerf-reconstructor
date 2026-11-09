@@ -496,5 +496,75 @@ class TestWifiNerfReconstructor(unittest.TestCase):
             self.assertEqual(pose_bob["x"], 6.8)
             self.assertEqual(pose_bob["z"], 9.0)
 
+    def test_20_3d_multi_floor_ap_localization(self):
+        from reconstructor.ap_localizer import MultiApLocalizer
+        localizer = MultiApLocalizer()
+
+        # Synthetic observations of a router directly underneath the apartment (z = -3.0m, x = 5.0, y = 5.0)
+        # User walks on Floor 0 (z = 0.0) from x = 2.0 to 8.0, y = 5.0
+        # P0 = -40 dBm, 1 floor slab loss = 18 dB -> Peff = -58 dBm
+        obs_downstairs = []
+        for x in np.linspace(2.0, 8.0, 25):
+            d3d = math.hypot(x - 5.0, 3.0)
+            rssi = -58.0 - 20.0 * math.log10(d3d)
+            obs_downstairs.append((float(x), 5.0, float(rssi), "c6:ed:dc:c3:01:bf", 5180))
+
+        fit = localizer._fit_ap_position_3d(obs_downstairs, init_x=5.0, init_y=5.0)
+        # Check that horizontal position is accurate within 0.25m (not repelled to 8m!)
+        self.assertAlmostEqual(fit["x"], 5.0, delta=0.25)
+        self.assertAlmostEqual(fit["y"], 5.0, delta=0.25)
+        # Check that it identifies the router as off-floor (relative_floor = -1 or -2)
+        self.assertFalse(fit["is_same_floor"])
+        self.assertLess(fit["relative_floor"], 0)
+        self.assertGreaterEqual(fit["floor_loss_db"], 18.0)
+
+    def test_21_hardware_mac_stem_grouping(self):
+        from reconstructor.ap_localizer import MultiApLocalizer
+        localizer = MultiApLocalizer()
+
+        # Virtual BSSIDs on same physical router
+        stem1 = localizer._extract_hardware_stem("d4:61:95:5f:dd:3e")
+        stem2 = localizer._extract_hardware_stem("d6:61:95:9f:dd:3e")
+        self.assertEqual(stem1, stem2)
+
+        stem_oc1 = localizer._extract_hardware_stem("c6:b4:22:f0:a1:be")
+        stem_oc2 = localizer._extract_hardware_stem("c8:b4:22:f0:a1:be")
+        self.assertEqual(stem_oc1, stem_oc2)
+
+    def test_22_clock_domain_reconciliation(self):
+        from reconstructor.blob_loader import SessionAssembler
+        # Simulate PDR in nanoTime (14h ~ 50,000s) and Wi-Fi in elapsedRealtimeNanos (32h ~ 115,000s)
+        events = [
+            {"event_type": "mag_baro_pdr", "timestamp_ns": 50_000_000_000_000, "pose": {"x": 1.0, "y": 2.0}},
+            {"event_type": "mag_baro_pdr", "timestamp_ns": 50_001_000_000_000, "pose": {"x": 1.5, "y": 2.0}},
+            {"event_type": "connected_probe", "timestamp_ns": 115_000_000_000_000, "rssi_dbm": -55},
+            {"event_type": "connected_probe", "timestamp_ns": 115_001_000_000_000, "rssi_dbm": -56},
+        ]
+        aligned = SessionAssembler._reconcile_stream_clocks(events)
+        pdr_ts = [e["timestamp_ns"] for e in aligned if e["event_type"] == "mag_baro_pdr"]
+        wifi_ts = [e["timestamp_ns"] for e in aligned if e["event_type"] == "connected_probe"]
+        # Discrepancy should now be less than 5 seconds
+        self.assertLess(abs(pdr_ts[0] - wifi_ts[0]), 5_000_000_000)
+
+    def test_23_straight_line_trajectory_preservation(self):
+        from reconstructor.pose_graph_slam import PoseGraphSLAM
+        slam = PoseGraphSLAM(keyframe_dt_s=0.5)
+
+        # Straight walk along y = 3.0 from x = 1.0 to x = 8.0
+        events = []
+        for i, x in enumerate(np.linspace(1.0, 8.0, 30)):
+            t_ns = 1_000_000_000 + i * 500_000_000
+            wobble = 0.04 * math.sin(i * 1.5)
+            events.append({
+                "timestamp_ns": t_ns,
+                "event_type": "mag_baro_pdr",
+                "pose": {"x": float(x), "y": 3.0 + wobble, "qx": 0.0, "qy": 0.0, "qz": 0.0, "qw": 1.0}
+            })
+
+        corrected = slam.optimize_trajectory(events)
+        corrected_ys = [e["pose"]["y"] for e in corrected if e.get("pose")]
+        max_dev = max(abs(y - 3.0) for y in corrected_ys)
+        self.assertLess(max_dev, 0.15)
+
 if __name__ == "__main__":
     unittest.main()

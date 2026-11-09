@@ -489,7 +489,8 @@ class NeRFMapEngine:
                 if model_type == "hashgrid":
                     # Instant-NGP two-group optimizer: higher lr for hash tables, regular lr for MLP trunk
                     table_params = list(mlp.encoder.parameters())
-                    trunk_params = list(mlp.trunk.parameters())
+                    trunk_net = mlp.trunk if hasattr(mlp, "trunk") else mlp.mlp
+                    trunk_params = list(trunk_net.parameters())
                     if antenna_net:
                         trunk_params.extend(list(antenna_net.parameters()))
                     optimizer = torch.optim.Adam([

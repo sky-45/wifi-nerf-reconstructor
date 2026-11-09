@@ -41,18 +41,44 @@ class PoseGraphSLAM:
     def _extract_keyframes(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         keyframes = []
         last_t = 0
+        latest_rssi: Dict[str, Tuple[float, int]] = {}
+
         for ev in events:
             t = ev.get("timestamp_ns", 0)
+            ev_type = ev.get("event_type") or ev.get("type")
+
+            # Continuously maintain rolling window of latest RSSIs per BSSID
+            if ev_type == "wifi_scan_batch":
+                for s in ev.get("scans", []):
+                    bssid = s.get("bssid", "")
+                    if bssid:
+                        val = float(s.get("rssi_dbm", s.get("rssiDbm", -80)))
+                        latest_rssi[bssid] = (val, t)
+            elif ev_type == "connected_probe":
+                bssid = ev.get("bssid", "")
+                if bssid and bssid != "02:00:00:00:00:00":
+                    val = float(ev.get("rssi_dbm", -70))
+                    latest_rssi[bssid] = (val, t)
+
             pose = ev.get("pose")
             if not pose:
                 continue
+
             if t - last_t >= self.keyframe_dt_ns or not keyframes:
+                # Retain APs observed within the last 6.0 seconds
+                active_vector = {
+                    b: rssi for b, (rssi, ts) in latest_rssi.items()
+                    if abs(t - ts) <= 6_000_000_000
+                }
+                yaw = self._quaternion_to_yaw(
+                    pose.get("qx", 0), pose.get("qy", 0), pose.get("qz", 0), pose.get("qw", 1)
+                )
                 keyframes.append({
                     "timestamp_ns": t,
-                    "x": pose["x"],
-                    "y": pose["y"],
-                    "yaw": self._quaternion_to_yaw(pose.get("qx", 0), pose.get("qy", 0), pose.get("qz", 0), pose.get("qw", 1)),
-                    "rssi_vector": self._extract_rssi_vector(ev, events, t),
+                    "x": float(pose["x"]),
+                    "y": float(pose["y"]),
+                    "yaw": yaw,
+                    "rssi_vector": active_vector,
                     "mag_norm": ev.get("mag_norm_ut", 45.0)
                 })
                 last_t = t
@@ -67,67 +93,100 @@ class PoseGraphSLAM:
                 vector[s["bssid"]] = float(val)
         return vector
 
-    def _detect_loop_closures(self, keyframes: List[Dict[str, Any]], sim_threshold: float = 0.88, min_time_sep_ns: int = 15_000_000_000) -> List[Tuple[int, int]]:
+    def _detect_loop_closures(
+        self,
+        keyframes: List[Dict[str, Any]],
+        max_mae_db: float = 4.5,
+        min_common_aps: int = 3,
+        min_time_sep_ns: int = 15_000_000_000,
+        min_node_separation: int = 12
+    ) -> List[Tuple[int, int]]:
+        """
+        Detects topological loop closures using common-AP Mean Absolute Error (MAE in dB)
+        with temporal Non-Maximum Suppression (NMS) to prevent crumpling straight trajectories.
+        """
         loops = []
+        last_matched_j = -100
+
         for i in range(len(keyframes)):
             v_i = keyframes[i]["rssi_vector"]
-            if not v_i:
+            if len(v_i) < min_common_aps:
                 continue
-            for j in range(i + 1, len(keyframes)):
+            for j in range(i + min_node_separation, len(keyframes)):
                 dt = abs(keyframes[j]["timestamp_ns"] - keyframes[i]["timestamp_ns"])
                 if dt < min_time_sep_ns:
                     continue
 
-                v_j = keyframes[j]["rssi_vector"]
-                if not v_j:
+                if abs(j - last_matched_j) < 8:
                     continue
 
-                sim = self._compute_rssi_similarity(v_i, v_j)
-                if sim >= sim_threshold:
+                v_j = keyframes[j]["rssi_vector"]
+                if len(v_j) < min_common_aps:
+                    continue
+
+                common = set(v_i.keys()) & set(v_j.keys())
+                if len(common) < min_common_aps:
+                    continue
+
+                mae_db = sum(abs(v_i[b] - v_j[b]) for b in common) / len(common)
+                if mae_db <= max_mae_db:
                     loops.append((i, j))
+                    last_matched_j = j
+
         return loops
 
     def _compute_rssi_similarity(self, v1: Dict[str, float], v2: Dict[str, float]) -> float:
         common_keys = set(v1.keys()) & set(v2.keys())
         if len(common_keys) < 2:
             return 0.0
-        dot = sum(v1[k] * v2[k] for k in common_keys)
-        n1 = math.sqrt(sum(v1[k] ** 2 for k in common_keys))
-        n2 = math.sqrt(sum(v2[k] ** 2 for k in common_keys))
-        if n1 < 1e-4 or n2 < 1e-4:
-            return 0.0
-        return max(0.0, dot / (n1 * n2))
+        mae_db = sum(abs(v1[k] - v2[k]) for k in common_keys) / len(common_keys)
+        return max(0.0, 1.0 - (mae_db / 15.0))
 
-    def _solve_graph(self, keyframes: List[Dict[str, Any]], loop_edges: List[Tuple[int, int]], iterations: int = 25) -> np.ndarray:
+    def _solve_graph(
+        self,
+        keyframes: List[Dict[str, Any]],
+        loop_edges: List[Tuple[int, int]],
+        iterations: int = 40
+    ) -> np.ndarray:
         N = len(keyframes)
-        # Positions [N, 2]
         P = np.array([[kf["x"], kf["y"]] for kf in keyframes], dtype=np.float64)
+        headings = np.array([kf.get("yaw", 0.0) for kf in keyframes], dtype=np.float64)
 
-        # Odometry deltas
         d_pdr = np.diff(P, axis=0)
 
-        # Iterative relaxed spring-mesh solver (fast, robust convergence without scipy)
+        # Iterative SE(2) relaxed solver with straight-segment collinearity regularization
         for _ in range(iterations):
             grad = np.zeros_like(P)
 
-            # Odometry constraints (springs between adjacent nodes)
+            # 1. Odometry edges (adjacent step springs)
             for i in range(N - 1):
                 err = (P[i + 1] - P[i]) - d_pdr[i]
-                grad[i] -= err * 1.0
-                grad[i + 1] += err * 1.0
+                grad[i] += err * 1.0
+                grad[i + 1] -= err * 1.0
 
-            # Loop closure constraints (pull nodes at same location together)
+                # Straight-line walk regularizer:
+                # If heading delta between consecutive steps is small (|Δθ| < 5.7°), penalize lateral displacement
+                d_theta = abs(math.atan2(math.sin(headings[i + 1] - headings[i]), math.cos(headings[i + 1] - headings[i])))
+                if d_theta < 0.10:
+                    theta_mid = (headings[i] + headings[i + 1]) / 2.0
+                    n_vec = np.array([-math.sin(theta_mid), math.cos(theta_mid)], dtype=np.float64)
+                    lat_err = np.dot(P[i + 1] - P[i], n_vec)
+                    collinear_force = 0.4 * lat_err * n_vec
+                    grad[i] -= collinear_force
+                    grad[i + 1] += collinear_force
+
+            # 2. Loop closure edges with Huber robust loss
             for i, j in loop_edges:
                 err = P[j] - P[i]
-                dist = np.linalg.norm(err)
-                # Huber robust weighting: linearize beyond 1.5m to reject false matches
-                huber_w = 1.0 if dist < 1.5 else (1.5 / max(dist, 1e-4))
-                grad[i] += err * (0.4 * huber_w)
-                grad[j] -= err * (0.4 * huber_w)
+                dist = float(np.linalg.norm(err))
+                huber_w = 1.0 if dist < 1.2 else (1.2 / max(dist, 1e-4))
+                force = err * (0.25 * huber_w)
+                grad[i] += force
+                grad[j] -= force
 
-            # Anchor node 0 at origin
+            # Anchor node 0 at initial keyframe position
             grad[0] = 0.0
-            P += 0.25 * grad
+            P += 0.15 * grad
 
         return P
 
@@ -169,6 +228,13 @@ class PoseGraphSLAM:
 
     @staticmethod
     def _quaternion_to_yaw(qx: float, qy: float, qz: float, qw: float) -> float:
+        # Tilt-compensated gravity-projected forward azimuth:
+        # Projects device body +Y (top of phone screen) onto horizontal Earth plane (East, North)
+        r01 = 2.0 * (qx * qy - qw * qz)
+        r11 = 1.0 - 2.0 * (qx * qx + qz * qz)
+        if (r01 * r01 + r11 * r11) > 0.04:
+            return math.atan2(r01, r11)
+        # Fallback to Euler yaw if phone is pointed nearly straight up/down
         siny = 2.0 * (qw * qz + qx * qy)
         cosy = 1.0 - 2.0 * (qy * qy + qz * qz)
         return math.atan2(siny, cosy)

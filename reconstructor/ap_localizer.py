@@ -15,9 +15,11 @@ class MultiApLocalizer:
     """
 
     def localize_all_aps(self, events: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        # First pass: map BSSID and 5-octet BSSID prefix to canonical ap_group_id from scan batches
+        # First pass: map BSSID and hardware stem to canonical ap_group_id
         bssid_to_gid: Dict[str, str] = {}
+        stem_to_gid: Dict[str, str] = {}
         prefix_to_gid: Dict[str, str] = {}
+
         for ev in events:
             if (ev.get("event_type") or ev.get("type")) == "wifi_scan_batch":
                 for s in ev.get("scans", []):
@@ -25,6 +27,9 @@ class MultiApLocalizer:
                     gid = s.get("ap_group_id", bssid)
                     if bssid and gid:
                         bssid_to_gid[bssid] = gid
+                        stem = self._extract_hardware_stem(bssid)
+                        if stem not in stem_to_gid:
+                            stem_to_gid[stem] = gid
                         if len(bssid) >= 14:
                             prefix_to_gid[bssid[:14].lower()] = gid
 
@@ -40,14 +45,18 @@ class MultiApLocalizer:
 
             if ev_type == "wifi_scan_batch":
                 for s in ev.get("scans", []):
-                    gid = s.get("ap_group_id", s["bssid"])
+                    bssid = s.get("bssid", "")
+                    stem = self._extract_hardware_stem(bssid)
+                    gid = stem_to_gid.get(stem) or s.get("ap_group_id", bssid)
                     rssi = float(s["rssi_dbm"])
                     ap_obs.setdefault(gid, []).append((px, py, rssi, s["bssid"], s["freq_mhz"]))
             elif ev_type == "connected_probe":
                 bssid = ev.get("bssid", "")
                 if bssid and bssid != "02:00:00:00:00:00":
+                    stem = self._extract_hardware_stem(bssid)
                     gid = (
                         bssid_to_gid.get(bssid)
+                        or stem_to_gid.get(stem)
                         or prefix_to_gid.get(bssid[:14].lower())
                         or ((bssid[:15] + "xx") if len(bssid) == 17 else bssid)
                     )
@@ -76,18 +85,24 @@ class MultiApLocalizer:
             init_x = sum(item[0] * w for item, w in zip(los_candidates, weights)) / total_w
             init_y = sum(item[1] * w for item, w in zip(los_candidates, weights)) / total_w
 
-            # Non-linear least squares fit: RSSI = P_0 - 10 * n * log10(d)
-            best_x, best_y, best_p0 = self._fit_ap_position(los_candidates, init_x, init_y)
+            # 3D Multi-Floor Variable-Projection Solver:
+            # Jointly solves (x, y, z_floor, Peff) with concrete slab loss FAF
+            fit_res = self._fit_ap_position_3d(los_candidates, init_x, init_y)
 
             # Classify as internal (inside mapped rooms) vs external neighbor
             max_rssi = obs_sorted[0][2]
-            is_internal = (max_rssi > -62.0)
+            is_internal = (max_rssi > -62.0) and fit_res["is_same_floor"]
 
             results[gid] = {
                 "ap_group_id": gid,
-                "x": round(best_x, 3),
-                "y": round(best_y, 3),
-                "p0_dbm": round(best_p0, 1),
+                "x": fit_res["x"],
+                "y": fit_res["y"],
+                "z_m": fit_res["z_m"],
+                "relative_floor": fit_res["relative_floor"],
+                "is_same_floor": fit_res["is_same_floor"],
+                "floor_loss_db": fit_res["floor_loss_db"],
+                "p0_dbm": fit_res["p0_dbm"],
+                "effective_p0_dbm": fit_res["effective_p0_dbm"],
                 "max_rssi": max_rssi,
                 "is_internal": is_internal,
                 "sample_count": len(obs)
@@ -95,39 +110,106 @@ class MultiApLocalizer:
 
         return results
 
+    @staticmethod
+    def _extract_hardware_stem(bssid: str) -> str:
+        """
+        Extracts hardware base signature across virtual multi-band BSSIDs.
+        Commercial routers (TP-Link, Huawei, ZTE, Sagemcom) toggle locally-administered bit 1
+        in octet 0 and virtual radio index in octet 3, while octets 1, 2 (OUI) and 4, 5 (board serial)
+        remain identical across 2.4 GHz, 5 GHz, and mesh interfaces.
+        """
+        parts = bssid.lower().split(":")
+        if len(parts) == 6:
+            return f"{parts[1]}:{parts[2]}:{parts[4]}:{parts[5]}"
+        return bssid.lower()
+
+    def _fit_ap_position_3d(
+        self,
+        obs: List[Tuple[float, float, float, str, int]],
+        init_x: float,
+        init_y: float
+    ) -> Dict[str, Any]:
+        """
+        Fits 3D AP position (x, y, z_m, relative_floor) using closed-form Variable Projection
+        and IEEE 802.11 TGn concrete floor-slab attenuation modeling.
+        """
+        weights = np.array([10.0 ** (item[2] / 20.0) for item in obs], dtype=np.float64)
+        sum_w = float(np.sum(weights))
+        if sum_w < 1e-6:
+            weights = np.ones(len(obs), dtype=np.float64)
+            sum_w = float(len(obs))
+
+        max_rssi = max(item[2] for item in obs)
+        candidate_floors = [0] if max_rssi > -52.0 else [0, -1, 1, -2, 2]
+
+        best_candidate = None
+        min_total_cost = 1e9
+
+        for rel_floor in candidate_floors:
+            z_m = rel_floor * 3.0
+            slab_loss_db = 0.0 if rel_floor == 0 else (18.0 + 10.0 * (abs(rel_floor) - 1))
+
+            x, y = init_x, init_y
+            lr = 0.06
+
+            for _ in range(40):
+                d_sq = np.array([(px - x)**2 + (py - y)**2 + z_m**2 + 0.25 for px, py, _, _, _ in obs])
+                d = np.sqrt(d_sq)
+                log_d = np.log10(d)
+
+                rssi_arr = np.array([item[2] for item in obs])
+                p_eff = float(np.sum(weights * (rssi_arr + 20.0 * log_d)) / sum_w)
+
+                pred_rssi = p_eff - 20.0 * log_d
+                err = pred_rssi - rssi_arr
+
+                grad_factor = (-20.0 / (d_sq * math.log(10))) * err * weights
+                grad_x = float(np.sum(grad_factor * np.array([-(px - x) for px, py, _, _, _ in obs])) / sum_w)
+                grad_y = float(np.sum(grad_factor * np.array([-(py - y) for px, py, _, _, _ in obs])) / sum_w)
+
+                x -= lr * grad_x
+                y -= lr * grad_y
+
+                offset = math.hypot(x - init_x, y - init_y)
+                if offset > 12.0:
+                    x = init_x + (x - init_x) * (12.0 / offset)
+                    y = init_y + (y - init_y) * (12.0 / offset)
+
+            # Evaluate fit
+            d_sq = np.array([(px - x)**2 + (py - y)**2 + z_m**2 + 0.25 for px, py, _, _, _ in obs])
+            d = np.sqrt(d_sq)
+            rssi_arr = np.array([item[2] for item in obs])
+            p_eff = float(np.sum(weights * (rssi_arr + 20.0 * np.log10(d))) / sum_w)
+            pred_rssi = p_eff - 20.0 * np.log10(d)
+            rmse = math.sqrt(float(np.sum(weights * (pred_rssi - rssi_arr)**2) / sum_w))
+
+            intrinsic_p0 = p_eff + slab_loss_db
+            p0_penalty = 0.15 * max(0.0, abs(intrinsic_p0 - (-40.0)) - 5.0) ** 2
+            total_cost = rmse + p0_penalty
+
+            if total_cost < min_total_cost:
+                min_total_cost = total_cost
+                best_candidate = {
+                    "x": round(float(x), 3),
+                    "y": round(float(y), 3),
+                    "z_m": round(float(z_m), 1),
+                    "relative_floor": int(rel_floor),
+                    "is_same_floor": bool(rel_floor == 0),
+                    "floor_loss_db": round(float(slab_loss_db), 1),
+                    "p0_dbm": round(float(intrinsic_p0), 1),
+                    "effective_p0_dbm": round(float(p_eff), 1),
+                    "rmse_db": round(float(rmse), 2)
+                }
+
+        return best_candidate or {
+            "x": round(init_x, 3), "y": round(init_y, 3), "z_m": 0.0,
+            "relative_floor": 0, "is_same_floor": True, "floor_loss_db": 0.0,
+            "p0_dbm": -40.0, "effective_p0_dbm": -40.0, "rmse_db": 0.0
+        }
+
     def _fit_ap_position(self, obs: List[Tuple[float, float, float, str, int]], init_x: float, init_y: float) -> Tuple[float, float, float]:
-        x, y = init_x, init_y
-        lr = 0.05
-        # 1-meter reference power estimate
-        p0 = -38.0
-
-        for _ in range(40):
-            grad_x = 0.0
-            grad_y = 0.0
-            for px, py, rssi, _, _ in obs:
-                d = max(0.4, math.hypot(px - x, py - y))
-                pred_rssi = p0 - 20.0 * math.log10(d)
-                err = pred_rssi - rssi
-
-                # Deriv w.r.t distance: d(err)/dd = -20 / (d * ln(10))
-                factor = (-20.0 / (d * math.log(10))) * err
-                # dd/dx = -(px - x) / d
-                grad_x += factor * (-(px - x) / d)
-                grad_y += factor * (-(py - y) / d)
-
-            x -= (lr * grad_x / len(obs))
-            y -= (lr * grad_y / len(obs))
-
-            # Regularize within a realistic indoor radius of the initial weighted centroid
-            offset = math.hypot(x - init_x, y - init_y)
-            if offset > 8.0:
-                scale = 8.0 / offset
-                x = init_x + (x - init_x) * scale
-                y = init_y + (y - init_y) * scale
-
-        # Re-estimate P0 with final position
-        p0_est = np.median([rssi + 20.0 * math.log10(max(0.4, math.hypot(px - x, py - y))) for px, py, rssi, _, _ in obs])
-        return x, y, float(p0_est)
+        fit = self._fit_ap_position_3d(obs, init_x, init_y)
+        return fit["x"], fit["y"], fit["p0_dbm"]
 
 
 class RttVirtualAnchorSolver:

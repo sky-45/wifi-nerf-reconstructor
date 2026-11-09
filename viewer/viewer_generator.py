@@ -69,6 +69,10 @@ def export_geojson(floorplan_data: Dict[str, Any], localized_aps: Dict[str, Dict
                 "feature_type": "access_point",
                 "ap_group_id": gid,
                 "is_internal": ap.get("is_internal", True),
+                "is_same_floor": ap.get("is_same_floor", True),
+                "relative_floor": ap.get("relative_floor", 0),
+                "z_m": ap.get("z_m", 0.0),
+                "floor_loss_db": ap.get("floor_loss_db", 0.0),
                 "p0_dbm": ap.get("p0_dbm", -40.0)
             }
         })
@@ -982,32 +986,46 @@ def generate_interactive_html_viewer(
 
     function drawCADAccessPoints(ctx) {{
       APS.forEach(ap => {{
+        const isSameFloor = ap.is_same_floor !== undefined ? ap.is_same_floor : (ap.relative_floor === 0 || !ap.relative_floor);
+        const relFloor = ap.relative_floor || 0;
         const p = cadWorldToScreen(ap.x, ap.y);
         ctx.save();
 
-        // Pulsing radio wave
-        const waveR = 8 + pulseAnim * 14;
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, waveR, 0, Math.PI * 2);
-        ctx.strokeStyle = `rgba(34, 197, 94, ${{1.0 - pulseAnim}})`;
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
+        if (isSameFloor) {{
+          // Pulsing radio wave for same-floor AP
+          const waveR = 8 + pulseAnim * 14;
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, waveR, 0, Math.PI * 2);
+          ctx.strokeStyle = `rgba(34, 197, 94, ${{1.0 - pulseAnim}})`;
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
 
-        // AP icon
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
-        ctx.fillStyle = '#22c55e';
-        ctx.fill();
-        ctx.strokeStyle = '#ffffff';
-        ctx.lineWidth = 1.5;
-        ctx.stroke();
+          // AP icon
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
+          ctx.fillStyle = '#22c55e';
+          ctx.fill();
+          ctx.strokeStyle = '#ffffff';
+          ctx.lineWidth = 1.5;
+          ctx.stroke();
+        }} else {{
+          // Off-floor neighbor AP (different floor in tall building)
+          ctx.beginPath();
+          ctx.arc(p.x, p.y, 5, 0, Math.PI * 2);
+          ctx.fillStyle = '#a78bfa';
+          ctx.fill();
+          ctx.strokeStyle = '#c4b5fd';
+          ctx.lineWidth = 1.2;
+          ctx.stroke();
+        }}
 
         if (document.getElementById('layer-labels').checked) {{
-          ctx.fillStyle = '#86efac';
+          ctx.fillStyle = isSameFloor ? '#86efac' : '#c4b5fd';
           ctx.font = '9px -apple-system, sans-serif';
           ctx.textAlign = 'center';
           const name = ap.ap_group_id.split('-')[1] || ap.ap_group_id.substring(0, 8);
-          ctx.fillText(name, p.x, p.y - 10);
+          const floorTag = isSameFloor ? '' : (relFloor < 0 ? ` [F${{relFloor}}]` : ` [F+${{relFloor}}]`);
+          ctx.fillText(name + floorTag, p.x, p.y - 10);
         }}
 
         ctx.restore();
@@ -1626,11 +1644,25 @@ def generate_interactive_html_viewer(
         }});
       }}
 
-      // 3. Access Point Pinned Routers
+      // 3. Access Point Pinned Routers (with 3D Multi-Floor Elevation)
       if (document.getElementById('layer-aps').checked) {{
         APS.forEach(ap => {{
-          addBox(ap.x, 2.2, ap.y, 0.3, 0.08, 0.3, 0, [0.13, 0.77, 0.37, 1.0]);
-          addBox(ap.x, 2.35, ap.y, 0.04, 0.25, 0.04, 0, [0.85, 0.95, 1.0, 1.0]);
+          const isSameFloor = ap.is_same_floor !== undefined ? ap.is_same_floor : (ap.relative_floor === 0 || !ap.relative_floor);
+          const relFloor = ap.relative_floor || 0;
+          const apElev = (ap.z_m !== undefined ? ap.z_m : relFloor * 3.0) + 2.2;
+
+          if (isSameFloor) {{
+            // Same floor router: green box on ceiling
+            addBox(ap.x, apElev, ap.y, 0.30, 0.08, 0.30, 0, [0.13, 0.77, 0.37, 1.0]);
+            addBox(ap.x, apElev + 0.15, ap.y, 0.04, 0.22, 0.04, 0, [0.85, 0.95, 1.0, 1.0]);
+          }} else {{
+            // Off-floor router: purple marker at true relative floor elevation
+            addBox(ap.x, apElev, ap.y, 0.28, 0.08, 0.28, 0, [0.65, 0.55, 0.98, 0.90]);
+            // Vertical plumb line connecting off-floor AP to ground plane
+            const plumbLen = Math.max(0.2, Math.abs(apElev));
+            const plumbMidY = apElev / 2.0;
+            addBox(ap.x, plumbMidY, ap.y, 0.02, plumbLen, 0.02, 0, [0.65, 0.55, 0.98, 0.45]);
+          }}
         }});
       }}
 

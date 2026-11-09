@@ -322,15 +322,26 @@ def run_reconstruction_pipeline(
                     excess = pair.get("excess_wall_loss_db", 0.0)
                     ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
 
-            # 2. Absolute path loss residual
+            # 2. Absolute path loss residual with 3D multi-floor slab compensation
             for s in ev.get("scans", []):
                 gid = s.get("ap_group_id", s["bssid"])
                 ap_info = localized_aps.get(gid)
                 if ap_info:
-                    d = max(0.4, math.hypot(pose["x"] - ap_info["x"], pose["y"] - ap_info["y"]))
-                    fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d)
-                    excess = max(0.0, fs_loss - float(s["rssi_dbm"]))
-                    ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
+                    d_2d = math.hypot(pose["x"] - ap_info["x"], pose["y"] - ap_info["y"])
+                    dz = float(ap_info.get("z_m", 0.0))
+                    d_3d = max(0.4, math.hypot(d_2d, dz))
+                    slab_loss = float(ap_info.get("floor_loss_db", 0.0))
+
+                    # If router is off-floor, require sufficient horizontal baseline and subtract slab attenuation
+                    if abs(dz) >= 2.0 and d_2d < 1.5:
+                        continue
+
+                    fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d_3d)
+                    raw_excess = fs_loss - float(s["rssi_dbm"]) - slab_loss
+                    if raw_excess > 0.0:
+                        cos_elev = d_2d / max(0.1, d_3d)
+                        excess = raw_excess * (cos_elev ** 2)
+                        ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
         elif ev_type == "connected_probe" and (idx % probe_step == 0):
             bssid = ev.get("bssid", "")
             prefix = bssid[:14].lower() if len(bssid) >= 14 else bssid.lower()
@@ -341,10 +352,18 @@ def run_reconstruction_pipeline(
                         ap_info = v
                         break
             if ap_info:
-                d = max(0.4, math.hypot(pose["x"] - ap_info["x"], pose["y"] - ap_info["y"]))
-                fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d)
-                excess = max(0.0, fs_loss - float(ev.get("rssi_dbm", -70)))
-                ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
+                d_2d = math.hypot(pose["x"] - ap_info["x"], pose["y"] - ap_info["y"])
+                dz = float(ap_info.get("z_m", 0.0))
+                d_3d = max(0.4, math.hypot(d_2d, dz))
+                slab_loss = float(ap_info.get("floor_loss_db", 0.0))
+
+                if not (abs(dz) >= 2.0 and d_2d < 1.5):
+                    fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d_3d)
+                    raw_excess = fs_loss - float(ev.get("rssi_dbm", -70)) - slab_loss
+                    if raw_excess > 0.0:
+                        cos_elev = d_2d / max(0.1, d_3d)
+                        excess = raw_excess * (cos_elev ** 2)
+                        ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
 
     print(f"[Stage 3A] Solving Fast FISTA + TV Sparse Tomography ({len(ray_data)} rays)...")
     target_dev = device if device is not None else ("cuda:0" if cfg.use_cuda else "cpu")

@@ -379,6 +379,38 @@ class SessionAssembler:
 
         return envelope, events
 
+    @staticmethod
+    def _reconcile_stream_clocks(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Detects and aligns mixed timestamp clock domains (System.nanoTime vs SystemClock.elapsedRealtimeNanos).
+        Historical batches had PDR events sampled in nanoTime (~14h) while Wi-Fi probes used elapsedRealtimeNanos (~32h).
+        Aligns PDR timestamps to the boot-clock domain so trajectories and scans interleave chronologically.
+        """
+        if not events:
+            return events
+
+        pdr_events = [ev for ev in events if ev.get("event_type") == "mag_baro_pdr" and "timestamp_ns" in ev]
+        wifi_events = [
+            ev for ev in events
+            if ev.get("event_type") in ("connected_probe", "wifi_scan_batch", "wifi_rtt") and "timestamp_ns" in ev
+        ]
+        if not pdr_events or not wifi_events:
+            return events
+
+        import numpy as _np
+        med_pdr = float(_np.median([ev["timestamp_ns"] for ev in pdr_events]))
+        med_wifi = float(_np.median([ev["timestamp_ns"] for ev in wifi_events]))
+
+        diff_ns = int(med_wifi - med_pdr)
+        # If discrepancy exceeds 10 seconds, reconcile PDR clock domain to Wi-Fi boot clock domain
+        if abs(diff_ns) > 10_000_000_000:
+            for ev in pdr_events:
+                ev["timestamp_ns"] = int(ev["timestamp_ns"] + diff_ns)
+                if "pose" in ev and isinstance(ev["pose"], dict):
+                    ev["pose"]["timestamp_ns"] = ev["timestamp_ns"]
+
+        return events
+
     def assemble_session(self, session_id: str) -> Dict[str, Any]:
         """
         Assembles all telemetry batches for a single session or environment into
@@ -407,8 +439,9 @@ class SessionAssembler:
         for key, envelope, batch_events in batch_results:
             if envelope:
                 batch_seq = envelope.get("batch_seq")
+                session_uid = envelope.get("session_id", "")
                 tier = "hf" if "/hf/" in key.replace("\\", "/") else ("lf" if "/lf/" in key.replace("\\", "/") else "default")
-                batch_uid = (tier, batch_seq)
+                batch_uid = (session_uid, tier, batch_seq)
                 if batch_seq is not None and batch_uid in seen_batch_ids:
                     continue  # Deduplicate retried batch
                 seen_batch_ids.add(batch_uid)
@@ -416,6 +449,7 @@ class SessionAssembler:
 
             all_events.extend(batch_events)
 
+        all_events = self._reconcile_stream_clocks(all_events)
         all_events.sort(key=lambda ev: ev.get("timestamp_ns", 0))
         sanitized_events = self._filter_transient_hotspots(all_events)
 
@@ -481,8 +515,9 @@ class SessionAssembler:
             for key, envelope, batch_events in dev_results:
                 if envelope:
                     batch_seq = envelope.get("batch_seq")
+                    session_uid = envelope.get("session_id", "")
                     tier = "hf" if "/hf/" in key.replace("\\", "/") else ("lf" if "/lf/" in key.replace("\\", "/") else "default")
-                    batch_uid = (tier, batch_seq)
+                    batch_uid = (session_uid, tier, batch_seq)
                     if batch_seq is not None and batch_uid in seen_batch_ids:
                         continue
                     seen_batch_ids.add(batch_uid)
@@ -490,6 +525,7 @@ class SessionAssembler:
 
                 dev_evs.extend(batch_events)
 
+            dev_evs = self._reconcile_stream_clocks(dev_evs)
             dev_evs.sort(key=lambda ev: ev.get("timestamp_ns", 0))
             device_events[dev_id] = dev_evs
             total_batches += len(seen_batch_ids)
