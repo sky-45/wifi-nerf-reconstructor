@@ -168,7 +168,7 @@ def make_request_handler(state: WebServerState):
                 self._handle_api_environments()
             elif parsed.path == "/api/floorplan":
                 self._handle_api_floorplan(query)
-            elif parsed.path == "/api/live-pose":
+            elif parsed.path in ("/api/live-pose", "/api/live_pose"):
                 self._handle_api_live_pose(query)
             elif parsed.path == "/api/status":
                 self._handle_api_status()
@@ -336,8 +336,13 @@ def make_request_handler(state: WebServerState):
 
         def log_message(self, format, *args):
             # Suppress noisy periodic poll logs, output only relevant updates
-            if "live-pose" not in args[0]:
-                super().log_message(format, *args)
+            try:
+                msg = format % args if args else format
+                if "live-pose" in str(msg) or "live_pose" in str(msg):
+                    return
+            except Exception:
+                pass
+            super().log_message(format, *args)
 
     return ReconstructorRequestHandler
 
