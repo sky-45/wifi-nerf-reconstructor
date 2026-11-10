@@ -176,7 +176,7 @@ def _extract_rich_trajectory(events: List[Dict[str, Any]]) -> List[Dict[str, Any
             "y": round(float(pose["y"]), 3),
             "z": round(float(pose.get("z", 1.1)), 3),
             "yaw": round(float(yaw), 3),
-            "ts": ev.get("ts_ms") or ev.get("timestamp") or 0,
+            "ts": ev.get("ts_ms") or ev.get("timestamp") or int(ev.get("timestamp_ns", 0) // 1_000_000),
             "device": ev.get("device_id", "phone_1")
         })
     # If yaw was uncalibrated (0.0), compute heading tangent from consecutive points
@@ -308,62 +308,93 @@ def run_reconstruction_pipeline(
             train_events.append(ev)
 
     probe_step = max(1, len(train_events) // 250)
+    last_probe_pos: Dict[str, Tuple[float, float]] = {}
     for idx, ev in enumerate(train_events):
         pose = ev.get("pose")
         if not pose:
             continue
         ev_type = ev.get("event_type") or ev.get("type")
         if ev_type == "wifi_scan_batch":
-            # 1. Multi-band differential wall loss
+            # 1. Multi-band differential wall loss (including hardware-stem merged 2.4GHz / 5GHz pairs)
+            used_pair_stems = set()
             for pair in ev.get("multiband_pairs", []):
-                gid = pair.get("ap_group_id")
-                ap_info = localized_aps.get(gid)
+                gid = pair.get("ap_group_id", "")
+                ap_info = MultiApLocalizer.match_localized_ap(localized_aps, ap_group_id=gid)
                 if ap_info:
                     excess = pair.get("excess_wall_loss_db", 0.0)
                     ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
+                    if ap_info.get("hardware_stem"):
+                        used_pair_stems.add(ap_info["hardware_stem"])
 
-            # 2. Absolute path loss residual with 3D multi-floor slab compensation
+            # Synthesize dual-band differential rays for virtual BSSIDs sharing the same hardware stem
+            scans_by_stem: Dict[str, Dict[str, Any]] = {}
+            for s in ev.get("scans", []):
+                stem = MultiApLocalizer._extract_hardware_stem(s.get("bssid", ""))
+                freq = int(s.get("freq_mhz", 2412))
+                band_key = "24" if freq < 3000 else ("5" if freq >= 4900 else "")
+                if stem and band_key:
+                    bucket = scans_by_stem.setdefault(stem, {})
+                    if band_key not in bucket or s["rssi_dbm"] > bucket[band_key]["rssi_dbm"]:
+                        bucket[band_key] = s
+
+            for stem, band_map in scans_by_stem.items():
+                if stem not in used_pair_stems and "24" in band_map and "5" in band_map:
+                    ap_info = MultiApLocalizer.match_localized_ap(localized_aps, bssid=band_map["5"]["bssid"])
+                    if ap_info:
+                        s24, s5 = band_map["24"], band_map["5"]
+                        fs_diff = 20.0 * math.log10(max(1.0, float(s5["freq_mhz"])) / max(1.0, float(s24["freq_mhz"])))
+                        diff_excess = (float(s24["rssi_dbm"]) - float(s5["rssi_dbm"])) - fs_diff
+                        if diff_excess > 0.5:
+                            dz = float(ap_info.get("z_m", 0.0))
+                            d_2d = math.hypot(pose["x"] - ap_info["x"], pose["y"] - ap_info["y"])
+                            d_3d = max(0.4, math.hypot(d_2d, dz))
+                            cos_elev = d_2d / max(0.1, d_3d)
+                            ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], diff_excess * (cos_elev ** 2)))
+
+            # 2. Absolute path loss residual with 3D multi-floor slab & band compensation
             for s in ev.get("scans", []):
                 gid = s.get("ap_group_id", s["bssid"])
-                ap_info = localized_aps.get(gid)
+                ap_info = MultiApLocalizer.match_localized_ap(localized_aps, bssid=s.get("bssid", ""), ap_group_id=gid)
                 if ap_info:
                     d_2d = math.hypot(pose["x"] - ap_info["x"], pose["y"] - ap_info["y"])
                     dz = float(ap_info.get("z_m", 0.0))
                     d_3d = max(0.4, math.hypot(d_2d, dz))
                     slab_loss = float(ap_info.get("floor_loss_db", 0.0))
+                    freq = int(s.get("freq_mhz", 2412))
+                    ref_p0 = float(ap_info.get("p0_5_dbm" if freq >= 4900 else "p0_24_dbm", ap_info["p0_dbm"]))
 
                     # If router is off-floor, require sufficient horizontal baseline and subtract slab attenuation
                     if abs(dz) >= 2.0 and d_2d < 1.5:
                         continue
 
-                    fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d_3d)
+                    fs_loss = ref_p0 - 20.0 * math.log10(d_3d)
                     raw_excess = fs_loss - float(s["rssi_dbm"]) - slab_loss
                     if raw_excess > 0.0:
                         cos_elev = d_2d / max(0.1, d_3d)
                         excess = raw_excess * (cos_elev ** 2)
                         ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
-        elif ev_type == "connected_probe" and (idx % probe_step == 0):
+        elif ev_type == "connected_probe":
             bssid = ev.get("bssid", "")
-            prefix = bssid[:14].lower() if len(bssid) >= 14 else bssid.lower()
-            ap_info = localized_aps.get((bssid[:15] + "xx") if len(bssid) == 17 else bssid)
-            if not ap_info and prefix:
-                for k, v in localized_aps.items():
-                    if k.lower().startswith(prefix):
-                        ap_info = v
-                        break
-            if ap_info:
-                d_2d = math.hypot(pose["x"] - ap_info["x"], pose["y"] - ap_info["y"])
-                dz = float(ap_info.get("z_m", 0.0))
-                d_3d = max(0.4, math.hypot(d_2d, dz))
-                slab_loss = float(ap_info.get("floor_loss_db", 0.0))
+            prev_pos = last_probe_pos.get(bssid)
+            moved_probe = (prev_pos is None) or (math.hypot(pose["x"] - prev_pos[0], pose["y"] - prev_pos[1]) >= 0.25)
+            if moved_probe or (idx % probe_step == 0):
+                last_probe_pos[bssid] = (pose["x"], pose["y"])
+                ap_info = MultiApLocalizer.match_localized_ap(localized_aps, bssid=bssid)
+                if ap_info:
+                    d_2d = math.hypot(pose["x"] - ap_info["x"], pose["y"] - ap_info["y"])
+                    dz = float(ap_info.get("z_m", 0.0))
+                    d_3d = max(0.4, math.hypot(d_2d, dz))
+                    slab_loss = float(ap_info.get("floor_loss_db", 0.0))
+                    freq = int(ev.get("freq_mhz", 5180))
+                    ref_p0 = float(ap_info.get("p0_5_dbm" if freq >= 4900 else "p0_24_dbm", ap_info["p0_dbm"]))
 
-                if not (abs(dz) >= 2.0 and d_2d < 1.5):
-                    fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d_3d)
-                    raw_excess = fs_loss - float(ev.get("rssi_dbm", -70)) - slab_loss
-                    if raw_excess > 0.0:
-                        cos_elev = d_2d / max(0.1, d_3d)
-                        excess = raw_excess * (cos_elev ** 2)
-                        ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
+                    if not (abs(dz) >= 2.0 and d_2d < 1.5):
+                        fs_loss = ref_p0 - 20.0 * math.log10(d_3d)
+                        raw_excess = fs_loss - float(ev.get("rssi_dbm", -70)) - slab_loss
+                        if raw_excess > 0.0:
+                            cos_elev = d_2d / max(0.1, d_3d)
+                            excess = raw_excess * (cos_elev ** 2)
+                            ray_data.append((ap_info["x"], ap_info["y"], pose["x"], pose["y"], excess))
 
     print(f"[Stage 3A] Solving Fast FISTA + TV Sparse Tomography ({len(ray_data)} rays)...")
     target_dev = device if device is not None else ("cuda:0" if cfg.use_cuda else "cpu")

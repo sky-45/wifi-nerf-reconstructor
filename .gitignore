@@ -15,6 +15,7 @@ dist/
 build/
 
 # Output directories & blob tests
+.cache/
 output/
 reconstruction_output/
 blob_store/

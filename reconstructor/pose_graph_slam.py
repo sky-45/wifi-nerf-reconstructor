@@ -64,19 +64,24 @@ class PoseGraphSLAM:
             if not pose:
                 continue
 
-            if t - last_t >= self.keyframe_dt_ns or not keyframes:
-                # Retain APs observed within the last 6.0 seconds
+            px, py = float(pose["x"]), float(pose["y"])
+            moved_dist = math.hypot(px - keyframes[-1]["x"], py - keyframes[-1]["y"]) if keyframes else 999.0
+            dt_last = t - last_t
+
+            # Sample keyframes when phone translates >= 0.20m (after keyframe_dt_ns) or every 30s if stationary
+            if not keyframes or (dt_last >= self.keyframe_dt_ns and moved_dist >= 0.20) or dt_last >= 30_000_000_000:
+                # Retain APs observed within the last 20.0 seconds (covering 15s Android scan intervals)
                 active_vector = {
                     b: rssi for b, (rssi, ts) in latest_rssi.items()
-                    if abs(t - ts) <= 6_000_000_000
+                    if abs(t - ts) <= 20_000_000_000
                 }
                 yaw = self._quaternion_to_yaw(
                     pose.get("qx", 0), pose.get("qy", 0), pose.get("qz", 0), pose.get("qw", 1)
                 )
                 keyframes.append({
                     "timestamp_ns": t,
-                    "x": float(pose["x"]),
-                    "y": float(pose["y"]),
+                    "x": px,
+                    "y": py,
                     "yaw": yaw,
                     "rssi_vector": active_vector,
                     "mag_norm": ev.get("mag_norm_ut", 45.0)
@@ -96,28 +101,36 @@ class PoseGraphSLAM:
     def _detect_loop_closures(
         self,
         keyframes: List[Dict[str, Any]],
-        max_mae_db: float = 4.5,
-        min_common_aps: int = 3,
+        max_mae_db: float = 3.8,
+        min_common_aps: int = 4,
         min_time_sep_ns: int = 15_000_000_000,
-        min_node_separation: int = 12
+        min_node_separation: int = 10,
+        min_walked_arc_m: float = 4.0
     ) -> List[Tuple[int, int]]:
         """
-        Detects topological loop closures using common-AP Mean Absolute Error (MAE in dB)
-        with temporal Non-Maximum Suppression (NMS) to prevent crumpling straight trajectories.
+        Detects topological loop closures using common-AP Mean Absolute Error (MAE in dB),
+        requiring a minimum walked path arc length (>= 4.0m) between i and j and mutual
+        degree-1 Non-Maximum Suppression (NMS) so stationary nodes never accumulate false edges.
         """
-        loops = []
-        last_matched_j = -100
+        n_kf = len(keyframes)
+        if n_kf < min_node_separation + 1:
+            return []
 
-        for i in range(len(keyframes)):
+        arc_len = np.zeros(n_kf, dtype=np.float64)
+        for k in range(1, n_kf):
+            step_d = math.hypot(keyframes[k]["x"] - keyframes[k - 1]["x"], keyframes[k]["y"] - keyframes[k - 1]["y"])
+            arc_len[k] = arc_len[k - 1] + step_d
+
+        candidates = []
+        for i in range(n_kf):
             v_i = keyframes[i]["rssi_vector"]
             if len(v_i) < min_common_aps:
                 continue
-            for j in range(i + min_node_separation, len(keyframes)):
+            for j in range(i + min_node_separation, n_kf):
+                if (arc_len[j] - arc_len[i]) < min_walked_arc_m:
+                    continue
                 dt = abs(keyframes[j]["timestamp_ns"] - keyframes[i]["timestamp_ns"])
                 if dt < min_time_sep_ns:
-                    continue
-
-                if abs(j - last_matched_j) < 8:
                     continue
 
                 v_j = keyframes[j]["rssi_vector"]
@@ -130,8 +143,20 @@ class PoseGraphSLAM:
 
                 mae_db = sum(abs(v_i[b] - v_j[b]) for b in common) / len(common)
                 if mae_db <= max_mae_db:
-                    loops.append((i, j))
-                    last_matched_j = j
+                    candidates.append((mae_db, i, j))
+
+        # Sort by lowest RSSI MAE first and apply mutual neighborhood NMS
+        candidates.sort(key=lambda x: x[0])
+        loops = []
+        suppressed = set()
+        for _, i, j in candidates:
+            if i in suppressed or j in suppressed:
+                continue
+            loops.append((i, j))
+            for k in range(max(0, i - 6), min(n_kf, i + 7)):
+                suppressed.add(k)
+            for k in range(max(0, j - 6), min(n_kf, j + 7)):
+                suppressed.add(k)
 
         return loops
 
@@ -171,22 +196,22 @@ class PoseGraphSLAM:
                     theta_mid = (headings[i] + headings[i + 1]) / 2.0
                     n_vec = np.array([-math.sin(theta_mid), math.cos(theta_mid)], dtype=np.float64)
                     lat_err = np.dot(P[i + 1] - P[i], n_vec)
-                    collinear_force = 0.4 * lat_err * n_vec
+                    collinear_force = 0.35 * lat_err * n_vec
                     grad[i] -= collinear_force
                     grad[i + 1] += collinear_force
 
-            # 2. Loop closure edges with Huber robust loss
+            # 2. Loop closure edges with Huber robust loss and bounded force
             for i, j in loop_edges:
                 err = P[j] - P[i]
                 dist = float(np.linalg.norm(err))
                 huber_w = 1.0 if dist < 1.2 else (1.2 / max(dist, 1e-4))
-                force = err * (0.25 * huber_w)
+                force = err * (0.08 * huber_w)
                 grad[i] += force
                 grad[j] -= force
 
             # Anchor node 0 at initial keyframe position
             grad[0] = 0.0
-            P += 0.15 * grad
+            P += 0.10 * grad
 
         return P
 
@@ -275,14 +300,39 @@ class FreeSpaceCarver:
     def detect_doorways(self, min_width_m: float = 0.65, max_width_m: float = 1.20) -> List[Tuple[float, float]]:
         """
         Finds doorway bottlenecks along the walkable mask.
-        Points where horizontal or vertical cross-sections are between 0.65m and 1.2m wide.
+        Requires a genuine hourglass constriction (0.65m to 1.2m wide) separating two wider
+        carved room regions (>= 1.5m wide on both sides), preventing single-pass walking
+        tubes (0.90m wide) from spawning false floating doorways in open space.
         """
-        min_cells = int(min_width_m / self.res)
-        max_cells = int(max_width_m / self.res)
+        min_cells = max(1, int(min_width_m / self.res))
+        max_cells = max(min_cells + 1, int(max_width_m / self.res))
+        room_cells = max(max_cells + 2, int(round(1.50 / self.res)))
+        look_cells = max(2, int(round(1.20 / self.res)))
         doorways = []
 
-        # Scan for narrow horizontal constrictions
-        for iy in range(1, self.ny - 1):
+        # Helper: max contiguous run overlapping [x0, x1] in row r
+        def _row_width_near(r: int, x0: int, x1: int) -> int:
+            if not (0 <= r < self.ny):
+                return 0
+            row = self.free_grid[r]
+            best = 0
+            run = 0
+            s_x = 0
+            for ix in range(self.nx):
+                if row[ix]:
+                    if run == 0:
+                        s_x = ix
+                    run += 1
+                else:
+                    if run > 0 and s_x <= x1 and (s_x + run - 1) >= x0:
+                        best = max(best, run)
+                    run = 0
+            if run > 0 and s_x <= x1 and (s_x + run - 1) >= x0:
+                best = max(best, run)
+            return best
+
+        # Scan for narrow horizontal constrictions separating wider regions above & below
+        for iy in range(look_cells, self.ny - look_cells):
             run = 0
             start_x = 0
             for ix in range(self.nx):
@@ -292,13 +342,17 @@ class FreeSpaceCarver:
                     run += 1
                 else:
                     if min_cells <= run <= max_cells:
-                        mid_x = (start_x + run / 2.0) * self.res
-                        mid_y = iy * self.res
-                        doorways.append((mid_x, mid_y))
+                        end_x = start_x + run - 1
+                        w_above = max(_row_width_near(iy - d, start_x, end_x) for d in range(1, look_cells + 1))
+                        w_below = max(_row_width_near(iy + d, start_x, end_x) for d in range(1, look_cells + 1))
+                        if w_above >= room_cells and w_below >= room_cells:
+                            mid_x = (start_x + run / 2.0) * self.res
+                            mid_y = iy * self.res
+                            doorways.append((mid_x, mid_y))
                     run = 0
 
         # Cluster adjacent detected pixels into distinct doorway centers
-        return self._cluster_points(doorways, merge_radius_m=0.8)
+        return self._cluster_points(doorways, merge_radius_m=1.2)
 
     def _cluster_points(self, points: List[Tuple[float, float]], merge_radius_m: float) -> List[Tuple[float, float]]:
         clusters = []

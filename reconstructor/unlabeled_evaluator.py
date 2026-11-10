@@ -52,9 +52,10 @@ class UnlabeledEvaluator:
         }
 
     def _find_ap_for_probe(self, bssid: str, aps: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-        if not bssid:
+        if not bssid or not aps:
             return None
-        ap = aps.get(bssid)
+        from reconstructor.ap_localizer import MultiApLocalizer
+        ap = MultiApLocalizer.match_localized_ap(aps, bssid=bssid, ap_group_id=bssid)
         if ap:
             return ap
         masked = (bssid[:15] + "xx") if len(bssid) == 17 else bssid
@@ -73,6 +74,7 @@ class UnlabeledEvaluator:
         aps: Dict[str, Dict[str, Any]]
     ) -> Dict[str, Any]:
         tp, fp, tn, fn = 0, 0, 0, 0
+        last_probe_pos: Dict[str, Tuple[float, float]] = {}
 
         for ev in events:
             pose = ev.get("pose")
@@ -106,17 +108,23 @@ class UnlabeledEvaluator:
             # 2. Path-loss excess from real scan batches (when multiband_pairs absent)
             if not multiband_pairs and ev_type == "wifi_scan_batch":
                 for scan in ev.get("scans", []):
-                    gid = scan.get("ap_group_id", scan.get("bssid"))
-                    ap_info = aps.get(gid) or self._find_ap_for_probe(gid, aps)
+                    bssid = scan.get("bssid", "")
+                    gid = scan.get("ap_group_id", bssid)
+                    ap_info = aps.get(gid) or self._find_ap_for_probe(bssid or gid, aps)
                     if not ap_info:
                         continue
                     d_2d = math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"])
                     dz = float(ap_info.get("z_m", 0.0))
+                    if abs(dz) >= 2.0 and d_2d < 1.5:
+                        continue
                     d = max(0.4, math.hypot(d_2d, dz))
                     slab_loss = float(ap_info.get("floor_loss_db", 0.0))
-                    fs_loss = ap_info["p0_dbm"] - slab_loss - 20.0 * math.log10(d)
-                    excess = max(0.0, fs_loss - float(scan.get("rssi_dbm", -70)))
-                    y_true = (excess >= 3.0)
+                    freq = int(scan.get("freq_mhz", 2412))
+                    ref_p0 = float(ap_info.get("p0_5_dbm" if freq >= 4900 else "p0_24_dbm", ap_info["p0_dbm"]))
+                    fs_loss = ref_p0 - slab_loss - 20.0 * math.log10(d)
+                    cos_elev = d_2d / max(0.1, d)
+                    excess = max(0.0, fs_loss - float(scan.get("rssi_dbm", -70))) * (cos_elev ** 2)
+                    y_true = (excess >= 4.0)
                     y_pred = self._ray_intersects_any_wall(ap_info["x"], ap_info["y"], rx_x, rx_y, walls)
 
                     if y_true and y_pred:
@@ -131,15 +139,25 @@ class UnlabeledEvaluator:
             # 3. Path-loss excess from high-frequency connected probes (real phone telemetry)
             elif not multiband_pairs and ev_type == "connected_probe":
                 bssid = ev.get("bssid", "")
+                prev_pos = last_probe_pos.get(bssid)
+                if prev_pos is not None and math.hypot(rx_x - prev_pos[0], rx_y - prev_pos[1]) < 0.25:
+                    continue
+                last_probe_pos[bssid] = (rx_x, rx_y)
+
                 ap_info = self._find_ap_for_probe(bssid, aps)
                 if ap_info:
                     d_2d = math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"])
                     dz = float(ap_info.get("z_m", 0.0))
+                    if abs(dz) >= 2.0 and d_2d < 1.5:
+                        continue
                     d = max(0.4, math.hypot(d_2d, dz))
                     slab_loss = float(ap_info.get("floor_loss_db", 0.0))
-                    fs_loss = ap_info["p0_dbm"] - slab_loss - 20.0 * math.log10(d)
-                    excess = max(0.0, fs_loss - float(ev.get("rssi_dbm", -70)))
-                    y_true = (excess >= 3.0)
+                    freq = int(ev.get("freq_mhz", 5180))
+                    ref_p0 = float(ap_info.get("p0_5_dbm" if freq >= 4900 else "p0_24_dbm", ap_info["p0_dbm"]))
+                    fs_loss = ref_p0 - slab_loss - 20.0 * math.log10(d)
+                    cos_elev = d_2d / max(0.1, d)
+                    excess = max(0.0, fs_loss - float(ev.get("rssi_dbm", -70))) * (cos_elev ** 2)
+                    y_true = (excess >= 4.0)
                     y_pred = self._ray_intersects_any_wall(ap_info["x"], ap_info["y"], rx_x, rx_y, walls)
 
                     if y_true and y_pred:
@@ -219,6 +237,7 @@ class UnlabeledEvaluator:
     ) -> Dict[str, float]:
         errors = []
         wall_attenuation_db = 4.5 # Expected drywall absorption
+        last_probe_pos: Dict[str, Tuple[float, float]] = {}
 
         for ev in events:
             pose = ev.get("pose")
@@ -229,8 +248,9 @@ class UnlabeledEvaluator:
 
             if ev_type == "wifi_scan_batch":
                 for scan in ev.get("scans", []):
-                    gid = scan.get("ap_group_id", scan.get("bssid"))
-                    ap_info = aps.get(gid) or self._find_ap_for_probe(gid, aps)
+                    bssid = scan.get("bssid", "")
+                    gid = scan.get("ap_group_id", bssid)
+                    ap_info = aps.get(gid) or self._find_ap_for_probe(bssid or gid, aps)
                     if not ap_info:
                         continue
 
@@ -238,30 +258,43 @@ class UnlabeledEvaluator:
                     dz = float(ap_info.get("z_m", 0.0))
                     d = max(0.4, math.hypot(d_2d, dz))
                     slab_loss = float(ap_info.get("floor_loss_db", 0.0))
+                    freq = int(scan.get("freq_mhz", 2412))
+                    ref_p0 = float(ap_info.get("p0_5_dbm" if freq >= 4900 else "p0_24_dbm", ap_info["p0_dbm"]))
                     num_walls = 0
                     for w in walls:
                         if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"]):
                             num_walls += 1
 
-                    # Forward RSSI prediction using map with 3D slab compensation
-                    pred_rssi = ap_info["p0_dbm"] - slab_loss - 20.0 * math.log10(d) - (num_walls * wall_attenuation_db)
+                    cos_elev = d_2d / max(0.1, d)
+                    eff_wall_loss = (num_walls * wall_attenuation_db) * (cos_elev ** 2)
+                    # Forward RSSI prediction using map with 3D slab & dual-band compensation
+                    pred_rssi = ref_p0 - slab_loss - 20.0 * math.log10(d) - eff_wall_loss
                     err = abs(pred_rssi - float(scan.get("rssi_dbm", -70)))
                     errors.append(err)
 
             elif ev_type == "connected_probe":
                 bssid = ev.get("bssid", "")
+                prev_pos = last_probe_pos.get(bssid)
+                if prev_pos is not None and math.hypot(rx_x - prev_pos[0], rx_y - prev_pos[1]) < 0.25:
+                    continue
+                last_probe_pos[bssid] = (rx_x, rx_y)
+
                 ap_info = self._find_ap_for_probe(bssid, aps)
                 if ap_info:
                     d_2d = math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"])
                     dz = float(ap_info.get("z_m", 0.0))
                     d = max(0.4, math.hypot(d_2d, dz))
                     slab_loss = float(ap_info.get("floor_loss_db", 0.0))
+                    freq = int(ev.get("freq_mhz", 5180))
+                    ref_p0 = float(ap_info.get("p0_5_dbm" if freq >= 4900 else "p0_24_dbm", ap_info["p0_dbm"]))
                     num_walls = 0
                     for w in walls:
                         if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"]):
                             num_walls += 1
 
-                    pred_rssi = ap_info["p0_dbm"] - slab_loss - 20.0 * math.log10(d) - (num_walls * wall_attenuation_db)
+                    cos_elev = d_2d / max(0.1, d)
+                    eff_wall_loss = (num_walls * wall_attenuation_db) * (cos_elev ** 2)
+                    pred_rssi = ref_p0 - slab_loss - 20.0 * math.log10(d) - eff_wall_loss
                     err = abs(pred_rssi - float(ev.get("rssi_dbm", -70)))
                     errors.append(err)
 

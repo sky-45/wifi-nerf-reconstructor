@@ -19,6 +19,7 @@ Capabilities:
 import gzip
 import io
 import json
+import math
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
@@ -223,9 +224,19 @@ class BlobStoreAdapter:
         return sorted(set(items))
 
     def _read_http_par_bytes(self, object_key: str) -> bytes:
-        """Fetches raw object bytes via an HTTP/HTTPS Pre-Authenticated Request (PAR) endpoint."""
+        """Fetches raw object bytes via an HTTP/HTTPS Pre-Authenticated Request (PAR) endpoint with local disk caching for immutable batches."""
         import urllib.request
         from urllib.parse import quote
+
+        cache_root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".cache", "blobs")
+        safe_rel = re.sub(r"[^a-zA-Z0-9._/-]", "_", object_key.lstrip("/"))
+        cache_path = os.path.join(cache_root, safe_rel)
+        if os.path.isfile(cache_path) and os.path.getsize(cache_path) > 0:
+            try:
+                with open(cache_path, "rb") as cf:
+                    return cf.read()
+            except OSError:
+                pass
 
         if object_key.startswith("http://") or object_key.startswith("https://"):
             url = object_key
@@ -238,7 +249,16 @@ class BlobStoreAdapter:
 
         req = urllib.request.Request(url, headers={"User-Agent": "WifiNerfReconstructor/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read()
+            data = resp.read()
+
+        if data:
+            try:
+                os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+                with open(cache_path, "wb") as cf:
+                    cf.write(data)
+            except OSError:
+                pass
+        return data
 
     def _list_oci_objects(self, session_id: str) -> List[str]:
         """Lists objects in OCI Object Storage bucket under prefix/{session_id}/."""
@@ -377,14 +397,29 @@ class SessionAssembler:
             except json.JSONDecodeError:
                 continue
 
+        if envelope and events:
+            sess_id = envelope.get("session_id", "")
+            env_ts = envelope.get("timestamp_ns", 0)
+            for ev in events:
+                if sess_id and "session_id" not in ev:
+                    ev["session_id"] = sess_id
+                # Reconcile legacy per-batch clock domain mismatch (> 1 hour between nanoTime and elapsedRealtimeNanos)
+                if env_ts > 0 and ev.get("event_type") == "mag_baro_pdr" and "timestamp_ns" in ev:
+                    dt = env_ts - ev["timestamp_ns"]
+                    if abs(dt) > 3_600_000_000_000:
+                        ev["timestamp_ns"] = int(ev["timestamp_ns"] + dt)
+                        if "pose" in ev and isinstance(ev["pose"], dict):
+                            ev["pose"]["timestamp_ns"] = ev["timestamp_ns"]
+
         return envelope, events
 
     @staticmethod
     def _reconcile_stream_clocks(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Detects and aligns mixed timestamp clock domains (System.nanoTime vs SystemClock.elapsedRealtimeNanos).
-        Historical batches had PDR events sampled in nanoTime (~14h) while Wi-Fi probes used elapsedRealtimeNanos (~32h).
-        Aligns PDR timestamps to the boot-clock domain so trajectories and scans interleave chronologically.
+        Detects and aligns mixed timestamp clock domains (System.nanoTime vs SystemClock.elapsedRealtimeNanos)
+        and stitches multi-session PDR origin resets so trajectories remain continuous.
+        Only shifts PDR clock domain when the discrepancy exceeds 1 hour (3600s), preventing false shifts
+        when walking steps occur during a sub-interval of a longer stationary Wi-Fi monitoring session.
         """
         if not events:
             return events
@@ -394,20 +429,118 @@ class SessionAssembler:
             ev for ev in events
             if ev.get("event_type") in ("connected_probe", "wifi_scan_batch", "wifi_rtt") and "timestamp_ns" in ev
         ]
-        if not pdr_events or not wifi_events:
+        if pdr_events and wifi_events:
+            import numpy as _np
+            med_pdr = float(_np.median([ev["timestamp_ns"] for ev in pdr_events]))
+            med_wifi = float(_np.median([ev["timestamp_ns"] for ev in wifi_events]))
+
+            diff_ns = int(med_wifi - med_pdr)
+            # Only shift if discrepancy exceeds 1 hour (legacy System.nanoTime vs elapsedRealtimeNanos)
+            if abs(diff_ns) > 3_600_000_000_000:
+                for ev in pdr_events:
+                    ev["timestamp_ns"] = int(ev["timestamp_ns"] + diff_ns)
+                    if "pose" in ev and isinstance(ev["pose"], dict):
+                        ev["pose"]["timestamp_ns"] = ev["timestamp_ns"]
+
+        # Sort chronologically and stitch multi-session PDR origin resets
+        events.sort(key=lambda ev: ev.get("timestamp_ns", 0))
+        return SessionAssembler._stabilize_indoor_pdr_drift(events)
+
+    @staticmethod
+    def _stabilize_indoor_pdr_drift(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """
+        Debounces hardware double-step triggers (< 350ms apart), stitches multi-session
+        origin resets seamlessly, and bounds open-loop unidirectional PDR drift when
+        the device paces back-and-forth while continuously connected to an indoor anchor AP.
+        """
+        posed = [ev for ev in events if isinstance(ev.get("pose"), dict)]
+        if len(posed) < 10:
             return events
 
-        import numpy as _np
-        med_pdr = float(_np.median([ev["timestamp_ns"] for ev in pdr_events]))
-        med_wifi = float(_np.median([ev["timestamp_ns"] for ev in wifi_events]))
+        xs_raw = [float(ev["pose"].get("x", 0.0)) for ev in posed]
+        ys_raw = [float(ev["pose"].get("y", 0.0)) for ev in posed]
+        span_m = math.hypot(max(xs_raw) - min(xs_raw), max(ys_raw) - min(ys_raw))
+        sids = {ev.get("session_id") for ev in posed if ev.get("session_id")}
+        if span_m <= 14.0 and len(sids) <= 1:
+            return events
 
-        diff_ns = int(med_wifi - med_pdr)
-        # If discrepancy exceeds 10 seconds, reconcile PDR clock domain to Wi-Fi boot clock domain
-        if abs(diff_ns) > 10_000_000_000:
-            for ev in pdr_events:
-                ev["timestamp_ns"] = int(ev["timestamp_ns"] + diff_ns)
-                if "pose" in ev and isinstance(ev["pose"], dict):
-                    ev["pose"]["timestamp_ns"] = ev["timestamp_ns"]
+        # Check if device remained connected to a strong indoor anchor AP throughout the walk
+        probes = [
+            (float(ev["pose"]["x"]), float(ev["pose"]["y"]), float(ev.get("rssi_dbm", -70)))
+            for ev in posed[:1500]
+            if ev.get("event_type") == "connected_probe" and ev.get("rssi_dbm") is not None
+        ]
+        has_indoor_anchor = False
+        ax, ay = 0.0, 0.0
+        if probes:
+            max_r = max(p[2] for p in probes)
+            if max_r >= -50.0:
+                has_indoor_anchor = True
+                anchor_pts = [(p[0], p[1]) for p in probes if p[2] >= max_r - 2.5]
+                ax = sum(p[0] for p in anchor_pts) / len(anchor_pts)
+                ay = sum(p[1] for p in anchor_pts) / len(anchor_pts)
+
+        cx, cy = float(posed[0]["pose"].get("x", 0.0)), float(posed[0]["pose"].get("y", 0.0))
+        prev_rx, prev_ry = cx, cy
+        prev_sid = posed[0].get("session_id")
+        last_step_t = 0
+        flip = 1.0
+        cur_rssi = -52.0
+
+        for ev in events:
+            pose = ev.get("pose")
+            if not isinstance(pose, dict):
+                continue
+            t = int(ev.get("timestamp_ns", 0))
+            sid = ev.get("session_id")
+            if ev.get("event_type") == "connected_probe" and ev.get("rssi_dbm") is not None:
+                cur_rssi = 0.35 * float(ev["rssi_dbm"]) + 0.65 * cur_rssi
+
+            rx, ry = float(pose.get("x", 0.0)), float(pose.get("y", 0.0))
+            if sid and prev_sid and sid != prev_sid:
+                dx, dy = 0.0, 0.0
+                prev_sid = sid
+            else:
+                dx, dy = rx - prev_rx, ry - prev_ry
+            prev_rx, prev_ry = rx, ry
+            step_d = math.hypot(dx, dy)
+
+            if step_d > 1e-4:
+                # Ignore unbridged telemetry gap jumps (> 2.5m) or duplicate step triggers (< 350ms)
+                if step_d > 2.5 or (has_indoor_anchor and (t - last_step_t) < 350_000_000):
+                    dx, dy = 0.0, 0.0
+                else:
+                    last_step_t = t
+                    if has_indoor_anchor and step_d > 0.65:
+                        scale = 0.65 / step_d
+                        dx *= scale
+                        dy *= scale
+
+                    if has_indoor_anchor and span_m > 14.0:
+                        # Physical indoor range tether around anchor AP from smoothed RSSI
+                        max_r_m = min(6.8, max(1.8, 10.0 ** ((-40.0 - cur_rssi) / 24.0)))
+                        nx, ny = cx + flip * dx, cy + flip * dy
+                        d_next = math.hypot(nx - ax, ny - ay)
+                        d_rev = math.hypot(cx - flip * dx - ax, cy - flip * dy - ay)
+                        if d_next > max_r_m and d_rev < d_next:
+                            flip = -flip
+                            nx, ny = cx + flip * dx, cy + flip * dy
+
+                        if cur_rssi >= -44.0:
+                            nx = 0.85 * nx + 0.15 * ax
+                            ny = 0.85 * ny + 0.15 * ay
+                        cx, cy = nx, ny
+                    else:
+                        cx += dx
+                        cy += dy
+
+            pose["x"] = round(cx, 4)
+            pose["y"] = round(cy, 4)
+            if "scans" in ev:
+                for s in ev["scans"]:
+                    if isinstance(s.get("pose"), dict):
+                        s["pose"]["x"] = round(cx, 4)
+                        s["pose"]["y"] = round(cy, 4)
 
         return events
 
@@ -512,10 +645,23 @@ class SessionAssembler:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 dev_results = list(executor.map(_fetch_dev_batch, keys))
 
+            # Exclude stationary leftover sessions (0 PDR steps) when active walking sessions exist for this device
+            sid_pdr_counts: Dict[str, int] = {}
+            for _, envelope, batch_events in dev_results:
+                if envelope and envelope.get("session_id"):
+                    sid = envelope["session_id"]
+                    sid_pdr_counts.setdefault(sid, 0)
+                    for e in batch_events:
+                        if e.get("event_type") == "mag_baro_pdr":
+                            sid_pdr_counts[sid] += 1
+            active_sids = {s for s, c in sid_pdr_counts.items() if c > 0} if any(c > 0 for c in sid_pdr_counts.values()) else None
+
             for key, envelope, batch_events in dev_results:
                 if envelope:
                     batch_seq = envelope.get("batch_seq")
                     session_uid = envelope.get("session_id", "")
+                    if active_sids and session_uid and session_uid not in active_sids:
+                        continue
                     tier = "hf" if "/hf/" in key.replace("\\", "/") else ("lf" if "/lf/" in key.replace("\\", "/") else "default")
                     batch_uid = (session_uid, tier, batch_seq)
                     if batch_seq is not None and batch_uid in seen_batch_ids:
