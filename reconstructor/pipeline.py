@@ -79,6 +79,8 @@ def clean_output_directory(output_dir: str, target_id: Optional[str] = None, pur
         if not os.path.isfile(fpath):
             continue
 
+        if fname.startswith("geo_anchor_"):
+            continue
         should_remove = False
         if purge_all and fname.endswith((".html", ".geojson", ".json", ".npy")):
             should_remove = True
@@ -297,10 +299,30 @@ def run_reconstruction_pipeline(
     rtt_walls = rtt_solver.extract_specular_walls(slam_events, localized_aps)
     print(f"          Identified {len(rtt_walls)} RTT specular mirror-reflector boundaries.")
 
-    # 100% Automated Earth Elevation & Building Floor Inference
-    elevation_profile = estimate_automatic_building_elevation(localized_aps, events=slam_events)
+    # 100% Automated Earth Elevation, Building Floor & UE GNSS Georeferencing Inference
+    elevation_profile = estimate_automatic_building_elevation(
+        localized_aps,
+        events=slam_events,
+        envelopes=session_data.get("envelopes")
+    )
+    geo_anchor_path = os.path.join(output_dir, f"geo_anchor_{target_id}.json")
+    if elevation_profile.get("geo_source") == "none" and os.path.exists(geo_anchor_path):
+        try:
+            with open(geo_anchor_path, "r", encoding="utf-8") as gf:
+                manual_geo = json.load(gf)
+            if manual_geo.get("lat") is not None and manual_geo.get("lon") is not None:
+                elevation_profile["lat"] = manual_geo["lat"]
+                elevation_profile["lon"] = manual_geo["lon"]
+                elevation_profile["rotation_deg"] = manual_geo.get("rotation_deg", 0)
+                elevation_profile["geo_source"] = "manual"
+                elevation_profile["is_manual_pin"] = True
+        except Exception:
+            pass
     print(f"          Automatic Elevation Profile: Level: Floor {elevation_profile['estimated_floor_number']} "
           f"(+{elevation_profile['height_above_ground_m']}m Ground, {elevation_profile['total_floors_spanned']} floors spanned)")
+    if elevation_profile.get("lat") is not None and elevation_profile.get("lon") is not None:
+        print(f"          UE Earth GNSS Anchor: ({elevation_profile['lat']}, {elevation_profile['lon']}) "
+              f"[±{elevation_profile.get('gnss_accuracy_m', '--')}m, source={elevation_profile.get('geo_source')}]")
     if elevation_profile.get("asl_altitude_m") is not None:
         print(f"          Barometric Earth Altitude: {elevation_profile['asl_altitude_m']}m ASL")
 

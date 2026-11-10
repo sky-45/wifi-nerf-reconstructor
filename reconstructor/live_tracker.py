@@ -49,7 +49,7 @@ load_env()
 import numpy as np
 
 from reconstructor.blob_loader import BlobStoreAdapter
-from reconstructor.session_partitioner import SessionPartitioner, parse_fleet_key
+from reconstructor.session_partitioner import SessionPartitioner, parse_fleet_key, extract_valid_gnss_fix
 
 
 def dist_to_segment(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> Tuple[float, float, float]:
@@ -296,6 +296,7 @@ class LiveBucketWatcher:
         self.lock = threading.Lock()
         self.latest_pose: Optional[Dict[str, Any]] = None
         self.latest_poses: Dict[str, Dict[str, Any]] = {}
+        self.latest_gnss: Dict[str, Dict[str, Any]] = {}
         self.elevation_profile: Dict[str, Any] = {}
 
         # If env_id is omitted, auto-discover and select recommended environment
@@ -320,9 +321,34 @@ class LiveBucketWatcher:
             self.env_id = new_env_id
             self.seen_batch_keys.clear()
             self.elevation_profile = {}
+            self.latest_gnss.clear()
             self.walls, self.aps = self._load_or_reconstruct_floorplan()
             self.ekf = MapMatchedEkf(self.walls, self.aps)
             self.latest_pose = None
+
+    def _attach_geo_metadata(self, pose_obj: Dict[str, Any], dev_id: str) -> Dict[str, Any]:
+        """Attaches elevation level and Earth GNSS coordinates to a live pose payload."""
+        if self.elevation_profile:
+            if "floor" not in pose_obj:
+                pose_obj["floor"] = self.elevation_profile.get("estimated_floor_number", 1)
+                pose_obj["height_above_ground_m"] = self.elevation_profile.get("height_above_ground_m", 0.0)
+                pose_obj["asl_altitude_m"] = self.elevation_profile.get("asl_altitude_m")
+
+        gnss = self.latest_gnss.get(dev_id) or (next(iter(self.latest_gnss.values())) if self.latest_gnss else None)
+        if gnss:
+            pose_obj["lat"] = gnss["lat"]
+            pose_obj["lon"] = gnss["lon"]
+            pose_obj["gnss_accuracy_m"] = gnss.get("accuracy_m")
+            pose_obj["gnss_altitude_m"] = gnss.get("altitude_m")
+            pose_obj["gnss_provider"] = gnss.get("provider")
+            pose_obj["geo_source"] = "ue_live"
+        elif self.elevation_profile and self.elevation_profile.get("lat") is not None and self.elevation_profile.get("lon") is not None:
+            pose_obj["lat"] = self.elevation_profile["lat"]
+            pose_obj["lon"] = self.elevation_profile["lon"]
+            pose_obj["gnss_accuracy_m"] = self.elevation_profile.get("gnss_accuracy_m")
+            pose_obj["gnss_altitude_m"] = self.elevation_profile.get("gnss_altitude_m")
+            pose_obj["geo_source"] = self.elevation_profile.get("geo_source", "ue_gnss")
+        return pose_obj
 
     def set_poll_interval(self, new_interval_s: float):
         """Updates polling interval dynamically."""
@@ -343,12 +369,8 @@ class LiveBucketWatcher:
 
             if target:
                 target["fleet"] = {d: dict(p) for d, p in self.latest_poses.items()}
-                if self.elevation_profile and "floor" not in target:
-                    fnum = self.elevation_profile.get("estimated_floor_number", 1)
-                    gh = self.elevation_profile.get("height_above_ground_m", 0.0)
-                    target["floor"] = fnum
-                    target["height_above_ground_m"] = gh
-                    target["asl_altitude_m"] = self.elevation_profile.get("asl_altitude_m")
+                dev_key = target.get("device_id") or (next(iter(self.latest_poses.keys())) if self.latest_poses else "phone_1")
+                self._attach_geo_metadata(target, dev_key)
                 return target
 
         # Fallback to reading disk (discarding corrupted/non-finite poses)
@@ -448,11 +470,25 @@ class LiveBucketWatcher:
                     decompressed = raw_bytes
 
                 lines = decompressed.decode("utf-8", errors="ignore").splitlines()
+                gnss_updated_dev = None
                 for line in lines:
                     if not line.strip():
                         continue
                     ev = json.loads(line)
-                    ev_type = ev.get("event_type")
+                    ev_type = ev.get("event_type") or ev.get("type")
+                    dev_id = ev.get("device_id", curr_dev or "phone_1")
+
+                    fix = extract_valid_gnss_fix(ev)
+                    if fix:
+                        with self.lock:
+                            prev_fix = self.latest_gnss.get(dev_id)
+                            # Update if first fix, newer timestamp, or notably higher accuracy
+                            is_fresher = (not prev_fix) or (fix.get("timestamp_ns", 0) >= prev_fix.get("timestamp_ns", 0))
+                            is_much_better = prev_fix and fix["accuracy_m"] <= prev_fix["accuracy_m"]
+                            if is_fresher or is_much_better:
+                                self.latest_gnss[dev_id] = fix
+                                gnss_updated_dev = dev_id
+
                     if ev_type in ("connected_probe", "pdr_step", "mag_baro_pdr"):
                         pose = ev.get("pose")
                         ts_ns = ev.get("timestamp_ns", 0)
@@ -462,17 +498,21 @@ class LiveBucketWatcher:
                                 connected_probe=ev if ev_type == "connected_probe" else None,
                                 ts_ns=ts_ns
                             )
-                            filtered["device_id"] = ev.get("device_id", curr_dev or "phone_1")
+                            filtered["device_id"] = dev_id
                             filtered["environment_id"] = curr_env
                             filtered["timestamp_ns"] = ts_ns
                             filtered["batch_key"] = key
-                            if self.elevation_profile:
-                                fnum = self.elevation_profile.get("estimated_floor_number", 1)
-                                gh = self.elevation_profile.get("height_above_ground_m", 0.0)
-                                filtered["floor"] = fnum
-                                filtered["height_above_ground_m"] = gh
-                                filtered["asl_altitude_m"] = self.elevation_profile.get("asl_altitude_m")
+                            self._attach_geo_metadata(filtered, dev_id)
                             new_poses.append(filtered)
+
+                # If a GNSS-only batch arrived with no motion step event, emit current state with updated lat/lon
+                if not new_poses and gnss_updated_dev:
+                    snap_pose = self.ekf.get_pose_estimate(0.0)
+                    snap_pose["device_id"] = gnss_updated_dev
+                    snap_pose["environment_id"] = curr_env
+                    snap_pose["batch_key"] = key
+                    self._attach_geo_metadata(snap_pose, gnss_updated_dev)
+                    new_poses.append(snap_pose)
             except Exception as e:
                 print(f"[-] Error processing batch {key}: {e}")
 
@@ -480,6 +520,7 @@ class LiveBucketWatcher:
             with self.lock:
                 for p in new_poses:
                     dev = p.get("device_id", "phone_1")
+                    self._attach_geo_metadata(p, dev)
                     self.latest_poses[dev] = p
                 latest = new_poses[-1]
                 self.latest_pose = latest

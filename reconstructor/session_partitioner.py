@@ -79,19 +79,95 @@ def classify_floor_level(
     return max(1, floor_idx), round(elev, 2)
 
 
+def extract_valid_gnss_fix(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """
+    Safely parses Earth WGS84 coordinates (lat, lon, accuracy, altitude, provider)
+    from a gnss_location event, batch_envelope, or arbitrary telemetry record.
+    Filters out null, NaN, out-of-range, or uninitialized (0.0, 0.0) coordinates.
+    """
+    if not isinstance(obj, dict):
+        return None
+
+    raw_lat = obj.get("lat") if obj.get("lat") is not None else obj.get("latitude")
+    raw_lon = obj.get("lon")
+    if raw_lon is None:
+        raw_lon = obj.get("lng") if obj.get("lng") is not None else obj.get("longitude")
+
+    if raw_lat is None or raw_lon is None:
+        return None
+
+    try:
+        lat_val = float(raw_lat)
+        lon_val = float(raw_lon)
+    except (TypeError, ValueError):
+        return None
+
+    if not (math.isfinite(lat_val) and math.isfinite(lon_val)):
+        return None
+    if abs(lat_val) > 90.0 or abs(lon_val) > 180.0:
+        return None
+    if abs(lat_val) < 1e-6 and abs(lon_val) < 1e-6:
+        return None
+
+    raw_acc = obj.get("accuracy_m")
+    if raw_acc is None:
+        raw_acc = obj.get("gnss_accuracy_m")
+    if raw_acc is None:
+        raw_acc = obj.get("accuracy")
+    try:
+        acc_val = float(raw_acc) if raw_acc is not None and math.isfinite(float(raw_acc)) and float(raw_acc) > 0 else 35.0
+    except (TypeError, ValueError):
+        acc_val = 35.0
+
+    raw_alt = obj.get("altitude_m")
+    if raw_alt is None:
+        raw_alt = obj.get("gnss_altitude_m")
+    if raw_alt is None:
+        raw_alt = obj.get("altitude")
+    try:
+        alt_val = float(raw_alt) if raw_alt is not None and math.isfinite(float(raw_alt)) else None
+    except (TypeError, ValueError):
+        alt_val = None
+
+    provider = obj.get("provider") or obj.get("gnss_provider") or "ue_gnss"
+    pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else None
+    cad_x, cad_y = None, None
+    if pose and pose.get("x") is not None and pose.get("y") is not None:
+        try:
+            px, py = float(pose["x"]), float(pose["y"])
+            if math.isfinite(px) and math.isfinite(py) and abs(px) < 1000.0 and abs(py) < 1000.0:
+                cad_x, cad_y = px, py
+        except (TypeError, ValueError):
+            pass
+
+    return {
+        "lat": lat_val,
+        "lon": lon_val,
+        "accuracy_m": acc_val,
+        "altitude_m": alt_val,
+        "provider": str(provider),
+        "cad_x": cad_x,
+        "cad_y": cad_y,
+        "timestamp_ns": obj.get("timestamp_ns", 0),
+    }
+
+
 def estimate_automatic_building_elevation(
     localized_aps: Dict[str, Dict[str, Any]],
     events: Optional[List[Dict[str, Any]]] = None,
-    floor_height_m: float = 3.0
+    floor_height_m: float = 3.0,
+    envelopes: Optional[List[Dict[str, Any]]] = None
 ) -> Dict[str, Any]:
     """
-    100% automated Earth-referenced altitude and building floor level inference:
+    100% automated Earth-referenced altitude, GNSS georeferencing, and floor level inference:
     1. Multi-Tier RF Inversion: Examines the vertical relative floor tiers of all
        localized physical routers (solved from concrete slab FAF attenuation).
        Detects lower neighbor floors below the survey plane to automatically ground
        the building and elevate the user to their true floor level.
     2. International Hypsometric Formula: Calculates absolute altitude above sea level
-       (ASL) if raw barometric pressure or GNSS telemetry is present.
+       (ASL) if raw barometric pressure is present.
+    3. Accuracy-Weighted UE GNSS Anchor: Aggregates UE Earth coordinates across events
+       and envelopes, weighted by 1 / max(3.0, accuracy_m)^2.
     """
     # 1. Analyze relative floor distribution across confirmed APs
     rel_floors = []
@@ -109,8 +185,6 @@ def estimate_automatic_building_elevation(
         min_rf, max_rf = 0, 0
         lower_count, upper_count = 0, 0
 
-    # If lower residential floor tiers exist below the survey plane,
-    # the user is automatically elevated above ground by the depth of visible lower floors
     if min_rf < 0:
         estimated_floor = 1 + abs(min_rf)
         ground_rel_z_m = min_rf * floor_height_m
@@ -122,23 +196,58 @@ def estimate_automatic_building_elevation(
         height_above_ground_m = 0.0
         method = "Ground Floor Reference (no subterranean AP tiers detected)"
 
-    # 2. Check for pressure or GPS altitude in event stream
+    # 2. Extract barometer pressure and UE GNSS coordinates across events and envelopes
     asl_altitude_m = None
-    lat, lon = None, None
-    if events:
-        pressures = []
-        for ev in events:
-            p = ev.get("pressure_hpa") or ev.get("pressure")
-            if p is not None and float(p) > 300.0:
-                pressures.append(float(p))
-            if "lat" in ev and "lon" in ev:
-                lat = float(ev["lat"])
-                lon = float(ev["lon"])
+    pressures = []
+    gnss_fixes = []
 
-        if pressures:
-            med_p = float(np.median(pressures))
-            # Standard International Barometric Formula: h = 44330 * (1 - (P / 1013.25)^0.190284)
-            asl_altitude_m = round(44330.0 * (1.0 - (med_p / 1013.25) ** 0.190284), 1)
+    for src in (events or []) + (envelopes or []):
+        p = src.get("pressure_hpa") or src.get("pressure")
+        if p is not None:
+            try:
+                pf = float(p)
+                if math.isfinite(pf) and pf > 300.0:
+                    pressures.append(pf)
+            except (TypeError, ValueError):
+                pass
+
+        fix = extract_valid_gnss_fix(src)
+        if fix:
+            gnss_fixes.append(fix)
+
+    if pressures:
+        med_p = float(np.median(pressures))
+        asl_altitude_m = round(44330.0 * (1.0 - (med_p / 1013.25) ** 0.190284), 1)
+
+    lat, lon = None, None
+    gnss_accuracy_m = None
+    gnss_altitude_m = None
+    gnss_provider = None
+    anchor_cad_x, anchor_cad_y = None, None
+    geo_source = "none"
+
+    if gnss_fixes:
+        # Discard very coarse (> 500m) cell outliers when finer fixes exist
+        tight_fixes = [f for f in gnss_fixes if f["accuracy_m"] <= 500.0]
+        pool = tight_fixes if tight_fixes else gnss_fixes
+
+        weights = [1.0 / (max(3.0, f["accuracy_m"]) ** 2) for f in pool]
+        total_w = sum(weights)
+        if total_w > 0:
+            lat = round(sum(f["lat"] * w for f, w in zip(pool, weights)) / total_w, 7)
+            lon = round(sum(f["lon"] * w for f, w in zip(pool, weights)) / total_w, 7)
+            geo_source = "ue_gnss"
+
+            best_fix = min(pool, key=lambda f: f["accuracy_m"])
+            gnss_accuracy_m = round(best_fix["accuracy_m"], 1)
+            gnss_provider = best_fix["provider"]
+            if best_fix.get("cad_x") is not None and best_fix.get("cad_y") is not None:
+                anchor_cad_x = round(best_fix["cad_x"], 3)
+                anchor_cad_y = round(best_fix["cad_y"], 3)
+
+            alts = [f["altitude_m"] for f in pool if f["altitude_m"] is not None]
+            if alts:
+                gnss_altitude_m = round(float(np.median(alts)), 1)
 
     return {
         "estimated_floor_number": estimated_floor,
@@ -152,6 +261,13 @@ def estimate_automatic_building_elevation(
         "asl_altitude_m": asl_altitude_m,
         "lat": lat,
         "lon": lon,
+        "gnss_accuracy_m": gnss_accuracy_m,
+        "gnss_altitude_m": gnss_altitude_m,
+        "gnss_provider": gnss_provider,
+        "gnss_fix_count": len(gnss_fixes),
+        "anchor_cad_x": anchor_cad_x,
+        "anchor_cad_y": anchor_cad_y,
+        "geo_source": geo_source,
         "inference_method": method
     }
 

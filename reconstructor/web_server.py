@@ -196,6 +196,8 @@ def make_request_handler(state: WebServerState):
                 self._handle_post_settings(body)
             elif parsed.path == "/api/reconstruct":
                 self._handle_post_reconstruct(body, urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/api/geo-anchor":
+                self._handle_post_geo_anchor(body)
             else:
                 self.send_error(404, "Endpoint not found")
 
@@ -247,6 +249,22 @@ def make_request_handler(state: WebServerState):
                 try:
                     with open(manifest_path, "r", encoding="utf-8") as f:
                         data = json.load(f)
+                    geo_anchor_path = os.path.join(state.output_dir, f"geo_anchor_{env_id}.json")
+                    if os.path.exists(geo_anchor_path):
+                        try:
+                            with open(geo_anchor_path, "r", encoding="utf-8") as gf:
+                                manual_geo = json.load(gf)
+                            ep = data.setdefault("elevation_profile", {})
+                            # Apply manual anchor if explicit override OR if no UE GNSS fix exists yet
+                            if manual_geo.get("is_manual_pin") or ep.get("lat") is None:
+                                if manual_geo.get("lat") is not None and manual_geo.get("lon") is not None:
+                                    ep["lat"] = manual_geo["lat"]
+                                    ep["lon"] = manual_geo["lon"]
+                                    ep["rotation_deg"] = manual_geo.get("rotation_deg", ep.get("rotation_deg", 0))
+                                    ep["geo_source"] = "manual"
+                                    ep["is_manual_pin"] = True
+                        except Exception:
+                            pass
                     self._send_json(data)
                 except Exception as e:
                     self.send_error(500, f"Error reading floorplan: {e}")
@@ -271,6 +289,17 @@ def make_request_handler(state: WebServerState):
             if pose and isinstance(pose.get("x"), (int, float)) and isinstance(pose.get("y"), (int, float)):
                 if not (math.isfinite(pose["x"]) and math.isfinite(pose["y"]) and abs(pose["x"]) < 1000.0 and abs(pose["y"]) < 1000.0):
                     pose = None
+
+            if pose and pose.get("lat") is not None and pose.get("lon") is not None:
+                try:
+                    flat = float(pose["lat"])
+                    flon = float(pose["lon"])
+                    if not (math.isfinite(flat) and math.isfinite(flon) and abs(flat) <= 90.0 and abs(flon) <= 180.0 and (abs(flat) > 1e-6 or abs(flon) > 1e-6)):
+                        pose.pop("lat", None)
+                        pose.pop("lon", None)
+                except (TypeError, ValueError):
+                    pose.pop("lat", None)
+                    pose.pop("lon", None)
 
             if pose:
                 self._send_json(pose)
@@ -303,6 +332,37 @@ def make_request_handler(state: WebServerState):
                 "message": f"Reconstruction initiated for '{env_id}'",
                 "env_id": env_id
             })
+
+        def _handle_post_geo_anchor(self, body: Dict[str, Any]):
+            env_id = str(body.get("env_id") or state.active_env).replace("/", "_")
+            anchor_path = os.path.join(state.output_dir, f"geo_anchor_{env_id}.json")
+            if body.get("clear"):
+                try:
+                    if os.path.exists(anchor_path):
+                        os.remove(anchor_path)
+                except OSError:
+                    pass
+                self._send_json({"success": True, "cleared": True, "env_id": env_id})
+                return
+
+            try:
+                lat = float(body["lat"])
+                lon = float(body["lon"])
+                if not (math.isfinite(lat) and math.isfinite(lon) and abs(lat) <= 90.0 and abs(lon) <= 180.0):
+                    raise ValueError("Coordinate out of WGS84 bounds")
+                payload = {
+                    "env_id": env_id,
+                    "lat": round(lat, 7),
+                    "lon": round(lon, 7),
+                    "rotation_deg": int(body.get("rotation_deg", 0)) % 360,
+                    "is_manual_pin": True
+                }
+                os.makedirs(state.output_dir, exist_ok=True)
+                with open(anchor_path, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=2)
+                self._send_json({"success": True, "anchor": payload})
+            except Exception as e:
+                self.send_error(400, f"Invalid geo-anchor payload: {e}")
 
         def _serve_static_file(self, filepath: str, content_type: Optional[str] = None):
             try:

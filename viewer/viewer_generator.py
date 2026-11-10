@@ -359,9 +359,15 @@ def generate_interactive_html_viewer(
 
       <!-- Satellite / Terrain Earth Controls Overlay -->
       <div id="geo-toolbar">
-        <div style="display:flex; justify-content:space-between; align-items:center;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
           <span style="font-weight:700; color:#38bdf8;">🌍 Earth Satellite & Terrain</span>
-          <button class="btn btn-secondary" style="padding:3px 7px; font-size:10px;" onclick="geolocateBrowser()">📍 My GPS</button>
+          <div style="display:flex; gap:4px;">
+            <button class="btn btn-secondary" id="btn-geo-snap" style="padding:3px 7px; font-size:10px;" onclick="snapToUeLocation()" title="Lock floorplan onto UE Earth coordinates">🧲 UE GPS</button>
+            <button class="btn btn-secondary" style="padding:3px 7px; font-size:10px;" onclick="geolocateBrowser()">📍 My GPS</button>
+          </div>
+        </div>
+        <div id="geo-source-badge" style="font-size:10px; font-weight:600; padding:4px 7px; border-radius:4px; background:#3b1d06; color:#fbbf24; border:1px solid #f59e0b;">
+          ⚠️ Waiting for UE GPS Fix (Default View)
         </div>
         <div style="display:flex; gap:4px;">
           <button class="btn" id="geo-layer-sat" style="flex:1; padding:4px; font-size:10px; justify-content:center;" onclick="setGeoBasemap('satellite')">🛰️ Satellite</button>
@@ -2082,14 +2088,31 @@ def generate_interactive_html_viewer(
       topo: 'https://tile.opentopomap.org/{{z}}/{{x}}/{{y}}.png'
     }};
 
+    const DEFAULT_FALLBACK_LAT = -12.0464;
+    const DEFAULT_FALLBACK_LON = -77.0428;
+    const hasSurveyGnss = Boolean(
+      ELEVATION_PROFILE &&
+      typeof ELEVATION_PROFILE.lat === 'number' && Number.isFinite(ELEVATION_PROFILE.lat) &&
+      typeof ELEVATION_PROFILE.lon === 'number' && Number.isFinite(ELEVATION_PROFILE.lon)
+    );
+
+    let liveUeGnss = null;
+    let lastElevFetchKey = '';
+
     let geoState = {{
       basemap: 'satellite',
-      zoom: 18,
-      centerLat: (ELEVATION_PROFILE && ELEVATION_PROFILE.lat) ? ELEVATION_PROFILE.lat : -12.0464,
-      centerLon: (ELEVATION_PROFILE && ELEVATION_PROFILE.lon) ? ELEVATION_PROFILE.lon : -77.0428,
-      anchorLat: (ELEVATION_PROFILE && ELEVATION_PROFILE.lat) ? ELEVATION_PROFILE.lat : -12.0464,
-      anchorLon: (ELEVATION_PROFILE && ELEVATION_PROFILE.lon) ? ELEVATION_PROFILE.lon : -77.0428,
-      rotationDeg: 0,
+      zoom: hasSurveyGnss ? 19 : 16,
+      centerLat: hasSurveyGnss ? ELEVATION_PROFILE.lat : DEFAULT_FALLBACK_LAT,
+      centerLon: hasSurveyGnss ? ELEVATION_PROFILE.lon : DEFAULT_FALLBACK_LON,
+      anchorLat: hasSurveyGnss ? ELEVATION_PROFILE.lat : DEFAULT_FALLBACK_LAT,
+      anchorLon: hasSurveyGnss ? ELEVATION_PROFILE.lon : DEFAULT_FALLBACK_LON,
+      anchorCadX: (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.anchor_cad_x === 'number') ? ELEVATION_PROFILE.anchor_cad_x : null,
+      anchorCadY: (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.anchor_cad_y === 'number') ? ELEVATION_PROFILE.anchor_cad_y : null,
+      gnssAccuracyM: (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.gnss_accuracy_m === 'number') ? ELEVATION_PROFILE.gnss_accuracy_m : null,
+      geoSource: hasSurveyGnss ? (ELEVATION_PROFILE.geo_source || 'ue_gnss') : 'none',
+      hasRealAnchor: hasSurveyGnss,
+      isManualPin: Boolean(ELEVATION_PROFILE && ELEVATION_PROFILE.is_manual_pin),
+      rotationDeg: (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.rotation_deg === 'number') ? ELEVATION_PROFILE.rotation_deg : 0,
       isPinMode: false,
       groundAslM: null,
       isDragging: false,
@@ -2101,38 +2124,108 @@ def generate_interactive_html_viewer(
 
     const tileCache = new Map();
 
+    function applyGeoAnchor(lat, lon, source, accuracyM = null, cadX = null, cadY = null, persistManual = false, recenter = true) {{
+      if (typeof lat !== 'number' || typeof lon !== 'number' || !Number.isFinite(lat) || !Number.isFinite(lon)) return;
+      if (Math.abs(lat) < 1e-6 && Math.abs(lon) < 1e-6) return;
+
+      const movedDeg = Math.hypot(lat - geoState.anchorLat, lon - geoState.anchorLon);
+      const sourceChanged = !geoState.hasRealAnchor || geoState.geoSource !== source;
+
+      geoState.anchorLat = lat;
+      geoState.anchorLon = lon;
+      geoState.hasRealAnchor = true;
+      geoState.geoSource = source;
+      geoState.gnssAccuracyM = (typeof accuracyM === 'number' && Number.isFinite(accuracyM)) ? accuracyM : null;
+      geoState.anchorCadX = (typeof cadX === 'number' && Number.isFinite(cadX)) ? cadX : null;
+      geoState.anchorCadY = (typeof cadY === 'number' && Number.isFinite(cadY)) ? cadY : null;
+      geoState.isManualPin = Boolean(persistManual || source === 'manual');
+
+      if (recenter && (sourceChanged || movedDeg > 0.00015)) {{
+        geoState.centerLat = lat;
+        geoState.centerLon = lon;
+        if (geoState.zoom < 18) geoState.zoom = 19;
+      }}
+
+      if (geoState.isManualPin) {{
+        saveGeoState(true);
+      }}
+
+      const elevKey = `${{lat.toFixed(4)}},${{lon.toFixed(4)}}`;
+      if (elevKey !== lastElevFetchKey) {{
+        lastElevFetchKey = elevKey;
+        fetchTerrainElevation(lat, lon);
+      }} else {{
+        updateGeoElevationUI();
+      }}
+
+      if (viewMode === 'GEO') drawGeoScene();
+    }}
+
     function initGeoMap() {{
+      // Clear any stale legacy cache lacking explicit isManualPin=true so defaults never block UE GPS
       try {{
         const saved = localStorage.getItem('wifinerf_geo_' + activeEnvId);
         if (saved) {{
           const p = JSON.parse(saved);
-          if (p.anchorLat && p.anchorLon) {{
+          if (p.isManualPin === true && typeof p.anchorLat === 'number' && typeof p.anchorLon === 'number') {{
             geoState.anchorLat = p.anchorLat;
             geoState.anchorLon = p.anchorLon;
             geoState.centerLat = p.centerLat || p.anchorLat;
             geoState.centerLon = p.centerLon || p.anchorLon;
-            geoState.zoom = p.zoom || 18;
+            geoState.zoom = p.zoom || 19;
             geoState.rotationDeg = p.rotationDeg || 0;
+            geoState.isManualPin = true;
+            geoState.hasRealAnchor = true;
+            geoState.geoSource = 'manual';
             if (p.groundAslM !== undefined) geoState.groundAslM = p.groundAslM;
+          }} else {{
+            localStorage.removeItem('wifinerf_geo_' + activeEnvId);
           }}
         }}
       }} catch (e) {{}}
+
+      if (!geoState.isManualPin) {{
+        if (liveUeGnss) {{
+          applyGeoAnchor(liveUeGnss.lat, liveUeGnss.lon, 'ue_live', liveUeGnss.accuracy_m, liveUeGnss.cad_x, liveUeGnss.cad_y, false, true);
+        }} else if (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.lat === 'number' && Number.isFinite(ELEVATION_PROFILE.lat) &&
+                   typeof ELEVATION_PROFILE.lon === 'number' && Number.isFinite(ELEVATION_PROFILE.lon)) {{
+          applyGeoAnchor(
+            ELEVATION_PROFILE.lat,
+            ELEVATION_PROFILE.lon,
+            ELEVATION_PROFILE.geo_source || 'ue_gnss',
+            ELEVATION_PROFILE.gnss_accuracy_m,
+            ELEVATION_PROFILE.anchor_cad_x,
+            ELEVATION_PROFILE.anchor_cad_y,
+            Boolean(ELEVATION_PROFILE.is_manual_pin),
+            true
+          );
+        }} else {{
+          geoState.hasRealAnchor = false;
+          geoState.geoSource = 'none';
+          geoState.anchorLat = DEFAULT_FALLBACK_LAT;
+          geoState.anchorLon = DEFAULT_FALLBACK_LON;
+          geoState.centerLat = DEFAULT_FALLBACK_LAT;
+          geoState.centerLon = DEFAULT_FALLBACK_LON;
+        }}
+      }}
 
       const rotSlider = document.getElementById('slider-geo-rot');
       if (rotSlider) rotSlider.value = String(geoState.rotationDeg);
       const rotVal = document.getElementById('geo-rot-val');
       if (rotVal) rotVal.textContent = `${{geoState.rotationDeg}}°`;
 
-      if (geoState.groundAslM === null && geoState.anchorLat && geoState.anchorLon) {{
+      if (geoState.hasRealAnchor && geoState.groundAslM === null) {{
         fetchTerrainElevation(geoState.anchorLat, geoState.anchorLon);
       }} else {{
         updateGeoElevationUI();
       }}
     }}
 
-    function saveGeoState() {{
+    function saveGeoState(persistServer = false) {{
+      if (!geoState.isManualPin) return;
       try {{
         localStorage.setItem('wifinerf_geo_' + activeEnvId, JSON.stringify({{
+          isManualPin: true,
           anchorLat: geoState.anchorLat,
           anchorLon: geoState.anchorLon,
           centerLat: geoState.centerLat,
@@ -2142,6 +2235,51 @@ def generate_interactive_html_viewer(
           groundAslM: geoState.groundAslM
         }}));
       }} catch (e) {{}}
+      if (persistServer) {{
+        fetch('/api/geo-anchor', {{
+          method: 'POST',
+          headers: {{ 'Content-Type': 'application/json' }},
+          body: JSON.stringify({{
+            env_id: activeEnvId,
+            lat: geoState.anchorLat,
+            lon: geoState.anchorLon,
+            rotation_deg: geoState.rotationDeg
+          }})
+        }}).catch(() => {{}});
+      }}
+    }}
+
+    function snapToUeLocation() {{
+      geoState.isManualPin = false;
+      try {{ localStorage.removeItem('wifinerf_geo_' + activeEnvId); }} catch (e) {{}}
+      fetch('/api/geo-anchor', {{
+        method: 'POST',
+        headers: {{ 'Content-Type': 'application/json' }},
+        body: JSON.stringify({{ env_id: activeEnvId, clear: true }})
+      }}).catch(() => {{}});
+
+      if (liveUeGnss) {{
+        applyGeoAnchor(liveUeGnss.lat, liveUeGnss.lon, 'ue_live', liveUeGnss.accuracy_m, liveUeGnss.cad_x, liveUeGnss.cad_y, false, true);
+      }} else if (ELEVATION_PROFILE && ELEVATION_PROFILE.lat && ELEVATION_PROFILE.lon && !ELEVATION_PROFILE.is_manual_pin) {{
+        applyGeoAnchor(
+          ELEVATION_PROFILE.lat,
+          ELEVATION_PROFILE.lon,
+          ELEVATION_PROFILE.geo_source || 'ue_gnss',
+          ELEVATION_PROFILE.gnss_accuracy_m,
+          ELEVATION_PROFILE.anchor_cad_x,
+          ELEVATION_PROFILE.anchor_cad_y,
+          false,
+          true
+        );
+      }} else {{
+        geoState.hasRealAnchor = false;
+        geoState.geoSource = 'none';
+        geoState.gnssAccuracyM = null;
+        geoState.groundAslM = null;
+        updateGeoElevationUI();
+        drawGeoScene();
+        alert('No UE GNSS coordinates received yet in this survey. Install/open the updated phone app to stream Earth location, or pin manually.');
+      }}
     }}
 
     function setGeoBasemap(bm) {{
@@ -2157,7 +2295,10 @@ def generate_interactive_html_viewer(
       geoState.rotationDeg = parseInt(val) || 0;
       const rotVal = document.getElementById('geo-rot-val');
       if (rotVal) rotVal.textContent = `${{geoState.rotationDeg}}°`;
-      saveGeoState();
+      if (geoState.hasRealAnchor) {{
+        geoState.isManualPin = true;
+        saveGeoState(true);
+      }}
       drawGeoScene();
     }}
 
@@ -2183,16 +2324,7 @@ def generate_interactive_html_viewer(
         return;
       }}
       navigator.geolocation.getCurrentPosition(pos => {{
-        const lat = pos.coords.latitude;
-        const lon = pos.coords.longitude;
-        geoState.anchorLat = lat;
-        geoState.anchorLon = lon;
-        geoState.centerLat = lat;
-        geoState.centerLon = lon;
-        geoState.zoom = 18;
-        saveGeoState();
-        fetchTerrainElevation(lat, lon);
-        drawGeoScene();
+        applyGeoAnchor(pos.coords.latitude, pos.coords.longitude, 'manual', pos.coords.accuracy || null, null, null, true, true);
       }}, err => {{
         alert('Could not acquire GPS position: ' + err.message);
       }}, {{ enableHighAccuracy: true, timeout: 8000 }});
@@ -2208,14 +2340,7 @@ def generate_interactive_html_viewer(
         if (results && results.length > 0) {{
           const lat = parseFloat(results[0].lat);
           const lon = parseFloat(results[0].lon);
-          geoState.anchorLat = lat;
-          geoState.anchorLon = lon;
-          geoState.centerLat = lat;
-          geoState.centerLon = lon;
-          geoState.zoom = 18;
-          saveGeoState();
-          fetchTerrainElevation(lat, lon);
-          drawGeoScene();
+          applyGeoAnchor(lat, lon, 'manual', null, null, null, true, true);
         }} else {{
           alert('No geographical matches found for: ' + query);
         }}
@@ -2225,13 +2350,17 @@ def generate_interactive_html_viewer(
     }}
 
     async function fetchTerrainElevation(lat, lon) {{
+      if (!geoState.hasRealAnchor) {{
+        updateGeoElevationUI();
+        return;
+      }}
       try {{
         const resp = await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${{lat.toFixed(6)}}&longitude=${{lon.toFixed(6)}}`);
         if (resp.ok) {{
           const data = await resp.json();
           if (data && data.elevation && data.elevation.length > 0) {{
             geoState.groundAslM = parseFloat(data.elevation[0]);
-            saveGeoState();
+            if (geoState.isManualPin) saveGeoState(false);
             updateGeoElevationUI();
             updateUI(true);
             return;
@@ -2242,15 +2371,45 @@ def generate_interactive_html_viewer(
     }}
 
     function updateGeoElevationUI() {{
+      const srcBadge = document.getElementById('geo-source-badge');
+      if (srcBadge) {{
+        const accTag = geoState.gnssAccuracyM ? ` (±${{Math.round(geoState.gnssAccuracyM)}}m)` : '';
+        if (geoState.geoSource === 'ue_live') {{
+          srcBadge.textContent = `📡 Source: UE Live GPS${{accTag}}`;
+          srcBadge.style.background = '#052e16';
+          srcBadge.style.color = '#4ade80';
+          srcBadge.style.borderColor = '#22c55e';
+        }} else if (geoState.geoSource === 'ue_gnss') {{
+          srcBadge.textContent = `🛰️ Source: UE Survey GPS${{accTag}}`;
+          srcBadge.style.background = '#082f49';
+          srcBadge.style.color = '#38bdf8';
+          srcBadge.style.borderColor = '#0284c7';
+        }} else if (geoState.geoSource === 'manual') {{
+          srcBadge.textContent = '📌 Source: Manual Map Pin';
+          srcBadge.style.background = '#1e1b4b';
+          srcBadge.style.color = '#c4b5fd';
+          srcBadge.style.borderColor = '#8b5cf6';
+        }} else {{
+          srcBadge.textContent = '⚠️ Waiting for UE GPS Fix (Default View)';
+          srcBadge.style.background = '#3b1d06';
+          srcBadge.style.color = '#fbbf24';
+          srcBadge.style.borderColor = '#f59e0b';
+        }}
+      }}
+
       const latLonEl = document.getElementById('geo-latlon-val');
-      if (latLonEl) latLonEl.textContent = `${{geoState.anchorLat.toFixed(5)}}, ${{geoState.anchorLon.toFixed(5)}}`;
+      if (latLonEl) {{
+        latLonEl.textContent = geoState.hasRealAnchor
+          ? `${{geoState.anchorLat.toFixed(5)}}, ${{geoState.anchorLon.toFixed(5)}}`
+          : 'Unpinned (No UE GPS)';
+      }}
 
       const gAslEl = document.getElementById('geo-ground-asl');
       const tAslEl = document.getElementById('geo-total-asl');
       const baseHeight = (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.height_above_ground_m === 'number') ? ELEVATION_PROFILE.height_above_ground_m : 0.0;
       const floorNum = (ELEVATION_PROFILE && ELEVATION_PROFILE.estimated_floor_number) ? ELEVATION_PROFILE.estimated_floor_number : 1;
 
-      if (geoState.groundAslM !== null) {{
+      if (geoState.groundAslM !== null && geoState.hasRealAnchor) {{
         if (gAslEl) gAslEl.textContent = `${{geoState.groundAslM.toFixed(1)}}m ASL`;
         const totalAsl = geoState.groundAslM + baseHeight;
         if (tAslEl) tAslEl.textContent = `${{totalAsl.toFixed(1)}}m ASL (Floor ${{floorNum}})`;
@@ -2258,7 +2417,7 @@ def generate_interactive_html_viewer(
         if (gAslEl) gAslEl.textContent = `~${{(ELEVATION_PROFILE.asl_altitude_m - baseHeight).toFixed(1)}}m (Baro)`;
         if (tAslEl) tAslEl.textContent = `${{ELEVATION_PROFILE.asl_altitude_m.toFixed(1)}}m ASL (Floor ${{floorNum}})`;
       }} else {{
-        if (gAslEl) gAslEl.textContent = 'Auto / Unpinned';
+        if (gAslEl) gAslEl.textContent = geoState.hasRealAnchor ? 'Fetching Terrain...' : 'Waiting for Pin / UE GPS';
         if (tAslEl) tAslEl.textContent = `+${{baseHeight.toFixed(1)}}m Ground (Floor ${{floorNum}})`;
       }}
     }}
@@ -2361,8 +2520,10 @@ def generate_interactive_html_viewer(
       const sinR = Math.sin(rad);
 
       function cadToEarthScreen(cadX, cadY) {{
-        const dx = cadX - BBOX_CENTER.x;
-        const dy = cadY - BBOX_CENTER.y;
+        const refX = (typeof geoState.anchorCadX === 'number' && Number.isFinite(geoState.anchorCadX)) ? geoState.anchorCadX : BBOX_CENTER.x;
+        const refY = (typeof geoState.anchorCadY === 'number' && Number.isFinite(geoState.anchorCadY)) ? geoState.anchorCadY : BBOX_CENTER.y;
+        const dx = cadX - refX;
+        const dy = cadY - refY;
         // Apply rotation: North (+y) rotates by building angle
         const rx = dx * cosR - dy * sinR;
         const ry = dx * sinR + dy * cosR;
@@ -2373,6 +2534,20 @@ def generate_interactive_html_viewer(
       }}
 
       geoCtx.save();
+
+      // UE GNSS Horizontal Uncertainty Ring
+      if (geoState.hasRealAnchor && geoState.gnssAccuracyM && geoState.gnssAccuracyM > 0.5) {{
+        const accRadiusPx = Math.min(240, Math.max(8, geoState.gnssAccuracyM * geoScale));
+        geoCtx.beginPath();
+        geoCtx.arc(anchorScreenX, anchorScreenY, accRadiusPx, 0, Math.PI * 2);
+        geoCtx.fillStyle = 'rgba(34, 197, 94, 0.08)';
+        geoCtx.fill();
+        geoCtx.setLineDash([4, 4]);
+        geoCtx.strokeStyle = 'rgba(34, 197, 94, 0.55)';
+        geoCtx.lineWidth = 1.2;
+        geoCtx.stroke();
+        geoCtx.setLineDash([]);
+      }}
 
       // Semi-transparent Building Footprint Backdrop
       const pNW = cadToEarthScreen(BBOX.minX - 0.4, BBOX.maxY + 0.4);
@@ -2597,12 +2772,8 @@ def generate_interactive_html_viewer(
         const clickedWorldY = centerWorld.y + (my - canvasGeo.height / 2);
         const clickedLL = worldPxToLatLon(clickedWorldX, clickedWorldY, geoState.zoom);
 
-        geoState.anchorLat = clickedLL.lat;
-        geoState.anchorLon = clickedLL.lon;
         if (geoState.isPinMode) toggleGeoPinMode();
-        saveGeoState();
-        fetchTerrainElevation(clickedLL.lat, clickedLL.lon);
-        drawGeoScene();
+        applyGeoAnchor(clickedLL.lat, clickedLL.lon, 'manual', null, null, null, true, false);
         return;
       }}
 
@@ -3150,6 +3321,31 @@ def generate_interactive_html_viewer(
         targetPhonePos.device = activePose.device_id || activePose.device;
       }}
 
+      if (activePose.lat !== undefined && activePose.lon !== undefined &&
+          typeof activePose.lat === 'number' && typeof activePose.lon === 'number' &&
+          Number.isFinite(activePose.lat) && Number.isFinite(activePose.lon) &&
+          (Math.abs(activePose.lat) > 1e-6 || Math.abs(activePose.lon) > 1e-6)) {{
+        liveUeGnss = {{
+          lat: activePose.lat,
+          lon: activePose.lon,
+          accuracy_m: typeof activePose.gnss_accuracy_m === 'number' ? activePose.gnss_accuracy_m : null,
+          cad_x: (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.anchor_cad_x === 'number') ? ELEVATION_PROFILE.anchor_cad_x : null,
+          cad_y: (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.anchor_cad_y === 'number') ? ELEVATION_PROFILE.anchor_cad_y : null
+        }};
+        if (!geoState.isManualPin) {{
+          applyGeoAnchor(
+            liveUeGnss.lat,
+            liveUeGnss.lon,
+            activePose.geo_source || 'ue_live',
+            liveUeGnss.accuracy_m,
+            liveUeGnss.cad_x,
+            liveUeGnss.cad_y,
+            false,
+            true
+          );
+        }}
+      }}
+
       if (!isTargetPoseInitialized) {{
         currentPhonePos.x = targetPhonePos.x;
         currentPhonePos.y = targetPhonePos.y;
@@ -3194,10 +3390,14 @@ def generate_interactive_html_viewer(
       }}
     }}
 
-    async function onEnvironmentSelected(newEnv) {{
-      if (!newEnv || newEnv === activeEnvId) return;
+    async function onEnvironmentSelected(newEnv, forceReload = false) {{
+      if (!newEnv || (newEnv === activeEnvId && !forceReload)) return;
       activeEnvId = newEnv;
       isTargetPoseInitialized = false;
+      liveUeGnss = null;
+      geoState.isManualPin = false;
+      geoState.groundAslM = null;
+      lastElevFetchKey = '';
       fetch('/api/settings', {{
         method: 'POST',
         headers: {{ 'Content-Type': 'application/json' }},
@@ -3247,8 +3447,8 @@ def generate_interactive_html_viewer(
               rebuild3DScene();
               render3DScene();
             }}
+            initGeoMap();
             if (viewMode === 'GEO') {{
-              initGeoMap();
               drawGeoScene();
             }}
           }}
@@ -3290,7 +3490,7 @@ def generate_interactive_html_viewer(
               btn.disabled = false;
               btn.textContent = '🔄 Reconstruct';
             }}
-            onEnvironmentSelected(activeEnvId);
+            onEnvironmentSelected(activeEnvId, true);
           }} else if (checkCount > 30) {{
             clearInterval(checker);
             if (btn) {{

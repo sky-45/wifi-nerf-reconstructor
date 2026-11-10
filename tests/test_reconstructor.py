@@ -704,5 +704,79 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         # 4. Strict offline zero-dependency check
         self.assertNotIn('<script src="http', html_content := html)
 
+    def test_28_ue_gnss_extraction_accuracy_weighting_and_live_pose(self):
+        import gzip, json, tempfile
+        from reconstructor.session_partitioner import estimate_automatic_building_elevation
+        from reconstructor.live_tracker import LiveBucketWatcher
+        from viewer.viewer_generator import generate_interactive_html_viewer
+        from reconstructor.floorplan_vectorizer import FloorplanVectorizer
+
+        # 1. Verify inverse-variance accuracy weighting, outlier rejection & CAD pin matching
+        localized_aps = {"ap1": {"relative_floor": 0, "sample_count": 50, "confidence": 0.9}}
+        events_with_gnss = [
+            {"event_type": "gnss_location", "lat": 0.0, "lon": 0.0, "accuracy_m": 10.0},  # invalid zero fix
+            {"event_type": "gnss_location", "lat": 37.9999, "lon": -122.9999, "accuracy_m": 1200.0},  # >500m outlier
+            {"event_type": "gnss_location", "lat": 37.7750, "lon": -122.4190, "accuracy_m": 100.0},  # coarse fix
+            {"event_type": "gnss_location", "lat": 37.7749, "lon": -122.4194, "accuracy_m": 5.0, "altitude_m": 42.3, "pose": {"x": 4.2, "y": 3.1}},
+        ]
+        envelopes = [
+            {"event_type": "batch_envelope", "lat": 37.7749, "lon": -122.4194, "gnss_accuracy_m": 8.0}
+        ]
+        elev = estimate_automatic_building_elevation(localized_aps, events=events_with_gnss, envelopes=envelopes)
+        self.assertEqual(elev["geo_source"], "ue_gnss")
+        self.assertAlmostEqual(elev["lat"], 37.7749, delta=1e-4)
+        self.assertAlmostEqual(elev["lon"], -122.4194, delta=1e-4)
+        self.assertEqual(elev["gnss_accuracy_m"], 5.0)
+        self.assertEqual(elev["gnss_altitude_m"], 42.3)
+        self.assertEqual(elev["anchor_cad_x"], 4.2)
+        self.assertEqual(elev["anchor_cad_y"], 3.1)
+
+        # 2. Verify LiveBucketWatcher extracts GNSS from HF batch_envelope and gnss_location
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hf_dir = os.path.join(tmpdir, "fleet", "dev_gnss", "gnss_env", "hf")
+            out_dir = os.path.join(tmpdir, "out")
+            os.makedirs(hf_dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
+
+            lines = [
+                json.dumps({"event_type": "batch_envelope", "device_id": "dev_gnss", "environment_id": "gnss_env", "batch_seq": 1, "timestamp_ns": 1000, "lat": 48.8566, "lon": 2.3522, "gnss_accuracy_m": 12.0}),
+                json.dumps({"event_type": "gnss_location", "device_id": "dev_gnss", "timestamp_ns": 1500, "lat": 48.8567, "lon": 2.3523, "accuracy_m": 6.5, "altitude_m": 35.0}),
+                json.dumps({"event_type": "mag_baro_pdr", "device_id": "dev_gnss", "timestamp_ns": 2000, "pose": {"x": 2.0, "y": 3.0, "z": 0.0, "yaw": 0.1}}),
+            ]
+            with gzip.open(os.path.join(hf_dir, "batch_1.ndjson.gz"), "wb") as gf:
+                gf.write(("\n".join(lines) + "\n").encode("utf-8"))
+
+            watcher = LiveBucketWatcher(blob_uri=tmpdir, env_id="gnss_env", output_dir=out_dir, auto_reconstruct=False)
+            poses = watcher.poll_once()
+            self.assertGreaterEqual(len(poses), 1)
+            latest = watcher.get_latest_pose("dev_gnss")
+            self.assertIsNotNone(latest)
+            self.assertAlmostEqual(latest["lat"], 48.8567, delta=1e-4)
+            self.assertAlmostEqual(latest["lon"], 2.3523, delta=1e-4)
+            self.assertEqual(latest["gnss_accuracy_m"], 6.5)
+            self.assertEqual(latest["geo_source"], "ue_live")
+
+        # 3. Verify viewer HTML properly prioritizes UE GPS & forbids caching fallback default
+        vec = FloorplanVectorizer(resolution_m=0.25)
+        grid = np.zeros((12, 12), dtype=np.float32)
+        grid[5:8, 6] = 8.0
+        fp = vec.vectorize(grid, np.zeros((12, 12), dtype=bool), [])
+        html = generate_interactive_html_viewer(
+            session_id="test_gnss_viewer",
+            floorplan_data=fp,
+            localized_aps={"ap1": {"ap_group_id": "AP1", "x": 1.5, "y": 1.5, "confidence": 0.9, "relative_floor": 0}},
+            eval_metrics={"quality_grade": "GRADE A"},
+            raw_trajectory=[{"x": 1.0, "y": 1.0, "z": 0.0, "yaw": 0.0, "ts": 100}],
+            slam_trajectory=[{"x": 1.0, "y": 1.0, "z": 0.0, "yaw": 0.0, "ts": 100}],
+            grid_heatmap=grid.tolist(),
+            elevation_profile=elev
+        )
+        self.assertIn("applyGeoAnchor", html)
+        self.assertIn("snapToUeLocation", html)
+        self.assertIn('id="geo-source-badge"', html)
+        self.assertIn(str(elev["lat"]), html)
+        self.assertIn(str(elev["lon"]), html)
+        self.assertNotIn('<script src="http', html)
+
 if __name__ == "__main__":
     unittest.main()
