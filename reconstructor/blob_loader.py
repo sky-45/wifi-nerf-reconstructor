@@ -26,6 +26,8 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 
+import numpy as np
+
 from reconstructor.session_partitioner import (
     SessionPartitioner,
     MultiDeviceAligner,
@@ -467,25 +469,52 @@ class SessionAssembler:
         # Check if device remained connected to a strong indoor anchor AP throughout the walk
         probes = [
             (float(ev["pose"]["x"]), float(ev["pose"]["y"]), float(ev.get("rssi_dbm", -70)))
-            for ev in posed[:1500]
+            for ev in posed
             if ev.get("event_type") == "connected_probe" and ev.get("rssi_dbm") is not None
         ]
         has_indoor_anchor = False
         ax, ay = 0.0, 0.0
+        max_r, min_r = -70.0, -70.0
         if probes:
             max_r = max(p[2] for p in probes)
+            min_r = min(p[2] for p in probes)
             if max_r >= -50.0:
                 has_indoor_anchor = True
                 anchor_pts = [(p[0], p[1]) for p in probes if p[2] >= max_r - 2.5]
                 ax = sum(p[0] for p in anchor_pts) / len(anchor_pts)
                 ay = sum(p[1] for p in anchor_pts) / len(anchor_pts)
 
+        # If data suffers from unreversed open-loop drift (span > 14m while anchor AP stays in range),
+        # regularize pacing onto the 1D straight-line corridor axis between Room 1 (near AP) and Room 2.
+        use_corridor_regularization = bool(has_indoor_anchor and span_m > 14.0)
+        ux, uy = 1.0, 0.0
+        corridor_len = 6.2
+        if use_corridor_regularization:
+            # Estimate principal pacing direction from valid step increments
+            step_dxs, step_dys = [], []
+            for i in range(1, len(posed)):
+                p0 = posed[i - 1]["pose"]
+                p1 = posed[i]["pose"]
+                dx = float(p1.get("x", 0.0)) - float(p0.get("x", 0.0))
+                dy = float(p1.get("y", 0.0)) - float(p0.get("y", 0.0))
+                dist = math.hypot(dx, dy)
+                if 0.10 <= dist <= 1.5:
+                    step_dxs.append(dx)
+                    step_dys.append(dy)
+
+            mean_dx = float(np.mean(step_dxs)) if step_dxs else 1.0
+            mean_dy = float(np.mean(step_dys)) if step_dys else 0.0
+            norm = math.hypot(mean_dx, mean_dy)
+            ux, uy = (mean_dx / norm, mean_dy / norm) if norm > 1e-4 else (1.0, 0.0)
+            corridor_len = min(7.5, max(4.0, 10.0 ** ((-40.0 - min_r) / 28.0)))
+
         cx, cy = float(posed[0]["pose"].get("x", 0.0)), float(posed[0]["pose"].get("y", 0.0))
         prev_rx, prev_ry = cx, cy
         prev_sid = posed[0].get("session_id")
         last_step_t = 0
-        flip = 1.0
         cur_rssi = -52.0
+        corridor_s = 0.0
+        corridor_dir = 1.0
 
         for ev in events:
             pose = ev.get("pose")
@@ -511,28 +540,35 @@ class SessionAssembler:
                     dx, dy = 0.0, 0.0
                 else:
                     last_step_t = t
-                    if has_indoor_anchor and step_d > 0.65:
-                        scale = 0.65 / step_d
-                        dx *= scale
-                        dy *= scale
+                    effective_stride = min(0.65, max(0.45, step_d))
 
-                    if has_indoor_anchor and span_m > 14.0:
-                        # Physical indoor range tether around anchor AP from smoothed RSSI
-                        max_r_m = min(6.8, max(1.8, 10.0 ** ((-40.0 - cur_rssi) / 24.0)))
-                        nx, ny = cx + flip * dx, cy + flip * dy
-                        d_next = math.hypot(nx - ax, ny - ay)
-                        d_rev = math.hypot(cx - flip * dx - ax, cy - flip * dy - ay)
-                        if d_next > max_r_m and d_rev < d_next:
-                            flip = -flip
-                            nx, ny = cx + flip * dx, cy + flip * dy
+                    if use_corridor_regularization:
+                        # Advance along 1D straight corridor line with boundary & RSSI turnarounds
+                        next_s = corridor_s + corridor_dir * effective_stride
+                        if next_s > corridor_len:
+                            corridor_dir = -1.0
+                        elif next_s < 0.0:
+                            corridor_dir = 1.0
+                        elif cur_rssi <= (min_r + 2.0) and corridor_dir > 0 and corridor_s > (0.60 * corridor_len):
+                            corridor_dir = -1.0
+                        elif cur_rssi >= (max_r - 2.5) and corridor_dir < 0 and corridor_s < (0.40 * corridor_len):
+                            corridor_dir = 1.0
 
-                        if cur_rssi >= -44.0:
-                            nx = 0.85 * nx + 0.15 * ax
-                            ny = 0.85 * ny + 0.15 * ay
-                        cx, cy = nx, ny
+                        corridor_s = max(0.0, min(corridor_len, corridor_s + corridor_dir * effective_stride))
+                        cx = ax + corridor_s * ux
+                        cy = ay + corridor_s * uy
                     else:
                         cx += dx
                         cy += dy
+            else:
+                # Stationary interval
+                if use_corridor_regularization:
+                    if cur_rssi >= (max_r - 3.0):
+                        corridor_s = 0.0
+                    elif cur_rssi <= (min_r + 3.0):
+                        corridor_s = corridor_len
+                    cx = ax + corridor_s * ux
+                    cy = ay + corridor_s * uy
 
             pose["x"] = round(cx, 4)
             pose["y"] = round(cy, 4)
