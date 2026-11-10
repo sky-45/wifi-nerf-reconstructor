@@ -73,7 +73,8 @@ def export_geojson(floorplan_data: Dict[str, Any], localized_aps: Dict[str, Dict
                 "relative_floor": ap.get("relative_floor", 0),
                 "z_m": ap.get("z_m", 0.0),
                 "floor_loss_db": ap.get("floor_loss_db", 0.0),
-                "p0_dbm": ap.get("p0_dbm", -40.0)
+                "p0_dbm": ap.get("p0_dbm", -40.0),
+                "confidence": ap.get("confidence", 0.5)
             }
         })
 
@@ -127,18 +128,34 @@ def generate_interactive_html_viewer(
     raw_trajectory: Any,
     slam_trajectory: Any,
     grid_heatmap: List[List[float]],
-    ray_density_map: Optional[List[List[int]]] = None
+    ray_density_map: Optional[List[List[int]]] = None,
+    elevation_profile: Optional[Dict[str, Any]] = None
 ) -> str:
     """
     Renders an architectural-grade HTML5 dashboard with Classic Top-Down Blueprint CAD view,
-    Zero-Dependency Embedded 3D WebGL Navigation, First-Person Walkthrough, and camera recentering.
+    Zero-Dependency Embedded 3D WebGL Navigation, First-Person Walkthrough, and Earth Satellite/Terrain Map.
     """
     dims = floorplan_data.get("grid_dimensions", {"width_m": 10.0, "height_m": 8.0})
     walls_json = json.dumps(floorplan_data.get("walls", []))
     doorways_json = json.dumps(floorplan_data.get("doorways", []))
     rooms_json = json.dumps(floorplan_data.get("rooms", []))
     aps_json = json.dumps(list(localized_aps.values()))
-    
+    elev_data = elevation_profile or floorplan_data.get("elevation_profile") or {
+        "estimated_floor_number": 1,
+        "height_above_ground_m": 0.0,
+        "ground_rel_z_m": 0.0,
+        "min_relative_floor": 0,
+        "max_relative_floor": 0,
+        "total_floors_spanned": 1,
+        "lower_floor_ap_count": 0,
+        "upper_floor_ap_count": 0,
+        "asl_altitude_m": None,
+        "lat": None,
+        "lon": None,
+        "inference_method": "Ground Floor Reference"
+    }
+    elevation_json = json.dumps(elev_data)
+
     # Decimate trajectories & round matrices to reduce HTML payload from ~2.3MB to ~250KB
     compact_raw = _compact_trajectory(raw_trajectory, min_step_m=0.10)
     compact_slam = _compact_trajectory(slam_trajectory, min_step_m=0.06)
@@ -166,6 +183,7 @@ def generate_interactive_html_viewer(
     canvas {{ display: block; position: absolute; top: 0; left: 0; width: 100%; height: 100%; }}
     #mapCanvasStatic {{ z-index: 1; pointer-events: none; }}
     #mapCanvasDynamic {{ z-index: 2; }}
+    #mapCanvasGeo {{ z-index: 4; display: none; }}
     #mapCanvas3D {{ z-index: 5; display: none; }}
     .badge {{ display: inline-block; padding: 3px 8px; border-radius: 4px; font-size: 11px; font-weight: 700; background: #38bdf8; color: #0a192f; }}
     .badge-grade {{ background: #22c55e; color: #052e16; }}
@@ -180,12 +198,13 @@ def generate_interactive_html_viewer(
     .toggle-row input {{ cursor: pointer; }}
     #vcr-bar {{ height: 50px; background: #0a192f; border-top: 1px solid #1e3a5f; display: flex; align-items: center; padding: 0 18px; gap: 14px; z-index: 20; }}
     #time-slider {{ flex: 1; accent-color: #38bdf8; cursor: pointer; }}
-    #telemetry-hud {{ position: absolute; bottom: 65px; left: 16px; background: rgba(10, 25, 47, 0.88); backdrop-filter: blur(8px); border: 1px solid #1e3a5f; border-radius: 8px; padding: 10px 14px; font-size: 11px; z-index: 10; pointer-events: none; min-width: 220px; }}
+    #telemetry-hud {{ position: absolute; bottom: 65px; left: 16px; background: rgba(10, 25, 47, 0.88); backdrop-filter: blur(8px); border: 1px solid #1e3a5f; border-radius: 8px; padding: 10px 14px; font-size: 11px; z-index: 10; pointer-events: none; min-width: 240px; }}
     #pov-reticle {{ position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: 20px; height: 20px; pointer-events: none; z-index: 10; display: none; }}
     #pov-reticle::before, #pov-reticle::after {{ content: ''; position: absolute; background: rgba(56, 189, 248, 0.7); }}
     #pov-reticle::before {{ top: 9px; left: 0; width: 20px; height: 2px; }}
     #pov-reticle::after {{ top: 0; left: 9px; width: 2px; height: 20px; }}
     #wall-inspector {{ position: absolute; display: none; background: rgba(13, 34, 56, 0.94); backdrop-filter: blur(8px); border: 1px solid #38bdf8; border-radius: 8px; padding: 10px 14px; font-size: 11px; z-index: 15; pointer-events: none; min-width: 210px; box-shadow: 0 4px 14px rgba(0,0,0,0.4); }}
+    #geo-toolbar {{ position: absolute; top: 14px; right: 16px; display: none; background: rgba(10, 25, 47, 0.92); backdrop-filter: blur(8px); border: 1px solid #1e3a5f; border-radius: 8px; padding: 10px 12px; z-index: 12; width: 310px; box-shadow: 0 4px 16px rgba(0,0,0,0.45); font-size: 11px; flex-direction: column; gap: 8px; }}
   </style>
 </head>
 <body>
@@ -201,14 +220,27 @@ def generate_interactive_html_viewer(
         <span>Viewing Mode</span>
         <span class="badge" id="mode-badge" style="background:#0284c7; color:#fff;">2D CAD</span>
       </div>
-      <div style="display: flex; gap: 6px; margin-bottom: 8px;">
-        <button class="btn" id="btn-cad" style="flex:1;" onclick="setViewMode('CAD')">📐 CAD</button>
-        <button class="btn btn-secondary" id="btn-3d" style="flex:1;" onclick="setViewMode('3D')">🌐 3D Orbit</button>
-        <button class="btn btn-secondary" id="btn-pov" style="flex:1;" onclick="setViewMode('POV')">🚶 POV</button>
+      <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-bottom: 8px;">
+        <button class="btn" id="btn-cad" onclick="setViewMode('CAD')">📐 CAD</button>
+        <button class="btn btn-secondary" id="btn-3d" onclick="setViewMode('3D')">🌐 3D Orbit</button>
+        <button class="btn btn-secondary" id="btn-pov" onclick="setViewMode('POV')">🚶 POV</button>
+        <button class="btn btn-secondary" id="btn-geo" onclick="setViewMode('GEO')">🗺️ Satellite</button>
       </div>
       <div style="display: flex; gap: 6px;">
         <button class="btn btn-secondary" style="flex:1;" onclick="recenterBuilding()" title="Fit building to screen">🎯 Recenter</button>
         <button class="btn btn-secondary" id="btn-follow" style="flex:1;" onclick="toggleFollowPhone()" title="Toggle follow active phone">📱 Follow</button>
+      </div>
+    </div>
+
+    <!-- Automatic Building Elevation Profile -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <span style="font-weight: 600; color: #e2e8f0;">Auto Elevation & Floor</span>
+        <span class="badge" id="elev-floor-badge" style="background: #4c1d95; color: #ddd6fe;">Floor {elev_data.get("estimated_floor_number", 1)}</span>
+      </div>
+      <div id="elev-summary-text" style="font-size: 11px; color: #cbd5e1; line-height: 1.45;">
+        Height: <strong style="color:#38bdf8;">+{elev_data.get("height_above_ground_m", 0.0):.1f}m Ground</strong> ({elev_data.get("total_floors_spanned", 1)} floors detected)<br>
+        <span style="color:#94a3b8; font-size:10px;">{elev_data.get("inference_method", "Automatic multi-floor RF inversion")}</span>
       </div>
     </div>
 
@@ -229,6 +261,23 @@ def generate_interactive_html_viewer(
         <span style="color:#f59e0b; font-weight:700;">╌ Dashed Amber:</span> Probable (40–69%)<br>
         <span style="color:#64748b; font-weight:700;">··· Dotted Gray:</span> Speculative (&lt;40%)
       </div>
+    </div>
+
+    <!-- AP Certainty & Edge Filter -->
+    <div class="card">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <span style="font-weight: 600; color: #e2e8f0;">AP Certainty Filter</span>
+        <span class="badge" id="ap-conf-val" style="background: #1e3a5f; color: #22c55e;">≥ 25%</span>
+      </div>
+      <input type="range" id="slider-ap-conf" min="5" max="95" value="25" style="width: 100%; accent-color: #22c55e;" oninput="updateApConfidenceFilter(this.value)">
+      <div style="display: flex; justify-content: space-between; font-size: 10px; color: #64748b; margin-top: 4px;">
+        <span>All Edge (5%)</span>
+        <span id="ap-count-badge" style="color: #22c55e; font-weight: 600;">APs: --</span>
+        <span>Strong Core (95%)</span>
+      </div>
+      <label class="toggle-row" style="margin-top: 8px; margin-bottom: 0;">
+        <input type="checkbox" id="chk-ap-same-floor" onchange="onLayerChange()"> <span>Same Floor APs Only (Hide Neighbor Floors)</span>
+      </label>
     </div>
 
     <!-- Display Layer Toggles -->
@@ -302,8 +351,38 @@ def generate_interactive_html_viewer(
       <canvas id="mapCanvasStatic"></canvas>
       <canvas id="mapCanvasDynamic"></canvas>
 
+      <!-- Zero-Dependency Earth Satellite & Terrain Canvas -->
+      <canvas id="mapCanvasGeo"></canvas>
+
       <!-- Zero-Dependency Embedded 3D WebGL Canvas -->
       <canvas id="mapCanvas3D"></canvas>
+
+      <!-- Satellite / Terrain Earth Controls Overlay -->
+      <div id="geo-toolbar">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <span style="font-weight:700; color:#38bdf8;">🌍 Earth Satellite & Terrain</span>
+          <button class="btn btn-secondary" style="padding:3px 7px; font-size:10px;" onclick="geolocateBrowser()">📍 My GPS</button>
+        </div>
+        <div style="display:flex; gap:4px;">
+          <button class="btn" id="geo-layer-sat" style="flex:1; padding:4px; font-size:10px; justify-content:center;" onclick="setGeoBasemap('satellite')">🛰️ Satellite</button>
+          <button class="btn btn-secondary" id="geo-layer-osm" style="flex:1; padding:4px; font-size:10px; justify-content:center;" onclick="setGeoBasemap('osm')">🗺️ Map</button>
+          <button class="btn btn-secondary" id="geo-layer-topo" style="flex:1; padding:4px; font-size:10px; justify-content:center;" onclick="setGeoBasemap('topo')">⛰️ Terrain</button>
+        </div>
+        <div style="display:flex; gap:4px;">
+          <input type="text" id="geo-search-input" placeholder="Search address or city..." style="flex:1; background:#0d2238; border:1px solid #1e3a5f; color:#f8fafc; padding:4px 7px; border-radius:4px; font-size:11px;" onkeydown="if(event.key==='Enter') searchGeoAddress()">
+          <button class="btn" style="padding:4px 8px; font-size:11px;" onclick="searchGeoAddress()">Go</button>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:6px;">
+          <span>North Rot: <strong id="geo-rot-val" style="color:#38bdf8;">0°</strong></span>
+          <input type="range" id="slider-geo-rot" min="0" max="359" value="0" style="flex:1; accent-color:#38bdf8;" oninput="updateGeoRotation(this.value)">
+          <button class="btn btn-secondary" id="btn-geo-pin" style="padding:3px 7px; font-size:10px;" onclick="toggleGeoPinMode()">📌 Move Pin</button>
+        </div>
+        <div id="geo-elev-readout" style="background:#0d2238; border:1px solid #1e3a5f; border-radius:5px; padding:6px 8px; line-height:1.45; color:#cbd5e1;">
+          <div>Coords: <span id="geo-latlon-val" style="font-family:monospace; color:#38bdf8;">--</span></div>
+          <div>Ground Terrain ASL: <span id="geo-ground-asl" style="color:#22c55e; font-weight:600;">--</span></div>
+          <div>User Total Earth ASL: <span id="geo-total-asl" style="color:#f59e0b; font-weight:700;">--</span></div>
+        </div>
+      </div>
 
       <!-- Real-Time Telemetry HUD -->
       <div id="telemetry-hud">
@@ -316,9 +395,9 @@ def generate_interactive_html_viewer(
           <div>Coords: <span id="hud-coords" style="color: #f8fafc; font-family: monospace;">--</span></div>
           <div>Heading: <span id="hud-yaw" style="color: #f8fafc; font-weight: 600;">--</span></div>
           <div>Speed: <span id="hud-speed" style="color: #f8fafc;">--</span></div>
-          <div>Level: <span id="hud-floor" style="color: #a78bfa; font-weight: 700;">Floor 1 (0.0m)</span></div>
+          <div style="grid-column: span 2;">Level: <span id="hud-floor" style="color: #a78bfa; font-weight: 700;">Floor {elev_data.get("estimated_floor_number", 1)} (+{elev_data.get("height_above_ground_m", 0.0):.1f}m)</span></div>
           <div>Nearest Wall: <span id="hud-nearest" style="color: #38bdf8; font-weight: 700;">--</span></div>
-          <div style="grid-column: span 2;">Survey Prog: <span id="hud-pct" style="color: #f8fafc;">--</span></div>
+          <div>Survey Prog: <span id="hud-pct" style="color: #f8fafc;">--</span></div>
         </div>
       </div>
 
@@ -365,6 +444,7 @@ def generate_interactive_html_viewer(
     let DOORS = {doorways_json};
     let ROOMS = {rooms_json};
     let APS = {aps_json};
+    let ELEVATION_PROFILE = {elevation_json};
     let RAW_TRAJ = {raw_traj_json};
     let SLAM_TRAJ = {slam_traj_json};
     let HEATMAP = {heatmap_json};
@@ -389,7 +469,7 @@ def generate_interactive_html_viewer(
     }};
     let BBOX_SPAN = Math.max(4.0, Math.max(BBOX.maxX - BBOX.minX, BBOX.maxY - BBOX.minY));
 
-    // View mode: 'CAD' (Default 2D Top Blueprint), '3D' (Embedded WebGL Orbit), 'POV' (Walkthrough)
+    // View mode: 'CAD' (Default 2D Top Blueprint), '3D' (WebGL Orbit), 'POV' (Walkthrough), 'GEO' (Satellite/Terrain)
     let viewMode = 'CAD';
     let zoom = 45; // pixels per meter in CAD
     let panX = 100;
@@ -398,6 +478,9 @@ def generate_interactive_html_viewer(
     let dragStartX = 0;
     let dragStartY = 0;
     let minConfidence = 0.35;
+    let minApConfidence = 0.25;
+    let povYawOffset = 0.0;
+    let povPitchOffset = 0.0;
     let hoveredWall = null;
 
     function parseTraj(raw) {{
@@ -472,9 +555,29 @@ def generate_interactive_html_viewer(
     const staticCtx = canvasStatic.getContext('2d');
     const canvasDynamic = document.getElementById('mapCanvasDynamic');
     const dynamicCtx = canvasDynamic.getContext('2d');
+    const canvasGeo = document.getElementById('mapCanvasGeo');
+    const geoCtx = canvasGeo.getContext('2d');
     const canvas3D = document.getElementById('mapCanvas3D');
     const wallInspector = document.getElementById('wall-inspector');
     const povReticle = document.getElementById('pov-reticle');
+    const geoToolbar = document.getElementById('geo-toolbar');
+
+    // Helper: Automatic Floor & Elevation Offset (elevates survey plane above lower neighbor floors)
+    function getSurveyElevOffset() {{
+      if (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.ground_rel_z_m === 'number') {{
+        return Math.max(0.0, -ELEVATION_PROFILE.ground_rel_z_m);
+      }}
+      return 0.0;
+    }}
+
+    function getApConfidence(ap) {{
+      if (!ap) return 0.5;
+      if (typeof ap.confidence === 'number' && Number.isFinite(ap.confidence)) {{
+        return Math.max(0.05, Math.min(1.0, ap.confidence));
+      }}
+      const samples = ap.sample_count || 10;
+      return Math.max(0.10, Math.min(1.0, samples / 120.0));
+    }}
 
     // Populate rooms list & room jump dropdown
     const roomListEl = document.getElementById('room-list');
@@ -505,6 +608,8 @@ def generate_interactive_html_viewer(
       canvasStatic.height = h;
       canvasDynamic.width = w;
       canvasDynamic.height = h;
+      canvasGeo.width = w;
+      canvasGeo.height = h;
       canvas3D.width = w;
       canvas3D.height = h;
 
@@ -512,6 +617,7 @@ def generate_interactive_html_viewer(
 
       drawStaticScene();
       drawDynamicScene();
+      if (viewMode === 'GEO') drawGeoScene();
     }}
     window.addEventListener('resize', resize);
 
@@ -521,12 +627,24 @@ def generate_interactive_html_viewer(
       drawStaticScene();
       drawDynamicScene();
       if (gl) rebuild3DScene();
+      if (viewMode === 'GEO') drawGeoScene();
+    }}
+
+    function updateApConfidenceFilter(val) {{
+      minApConfidence = val / 100.0;
+      const badge = document.getElementById('ap-conf-val');
+      if (badge) badge.textContent = `≥ ${{val}}%`;
+      drawStaticScene();
+      drawDynamicScene();
+      if (gl) rebuild3DScene();
+      if (viewMode === 'GEO') drawGeoScene();
     }}
 
     function onLayerChange() {{
       drawStaticScene();
       drawDynamicScene();
       if (gl) rebuild3DScene();
+      if (viewMode === 'GEO') drawGeoScene();
     }}
 
     // =========================================================================
@@ -537,13 +655,17 @@ def generate_interactive_html_viewer(
       document.getElementById('btn-cad').className = (mode === 'CAD') ? 'btn' : 'btn btn-secondary';
       document.getElementById('btn-3d').className = (mode === '3D') ? 'btn' : 'btn btn-secondary';
       document.getElementById('btn-pov').className = (mode === 'POV') ? 'btn' : 'btn btn-secondary';
+      const btnGeo = document.getElementById('btn-geo');
+      if (btnGeo) btnGeo.className = (mode === 'GEO') ? 'btn' : 'btn btn-secondary';
 
       const modeBadge = document.getElementById('mode-badge');
       const hintEl = document.getElementById('nav-hint');
+      if (geoToolbar) geoToolbar.style.display = (mode === 'GEO') ? 'flex' : 'none';
 
       if (mode === 'CAD') {{
         modeBadge.textContent = '2D CAD';
         canvas3D.style.display = 'none';
+        canvasGeo.style.display = 'none';
         canvasStatic.style.display = 'block';
         canvasDynamic.style.display = 'block';
         povReticle.style.display = 'none';
@@ -554,6 +676,7 @@ def generate_interactive_html_viewer(
         modeBadge.textContent = '3D Orbit';
         canvasStatic.style.display = 'none';
         canvasDynamic.style.display = 'none';
+        canvasGeo.style.display = 'none';
         canvas3D.style.display = 'block';
         povReticle.style.display = 'none';
         hintEl.textContent = 'Left Drag: Orbit 360° | Right Drag: Pan | Wheel: Zoom';
@@ -572,9 +695,12 @@ def generate_interactive_html_viewer(
         modeBadge.textContent = 'Walkthrough POV';
         canvasStatic.style.display = 'none';
         canvasDynamic.style.display = 'none';
+        canvasGeo.style.display = 'none';
         canvas3D.style.display = 'block';
         povReticle.style.display = 'block';
-        hintEl.textContent = 'POV Walkthrough: Looking forward at eye level (1.6m)';
+        hintEl.textContent = 'POV Walkthrough: Drag to Look Around | Eye Level (1.6m)';
+        povYawOffset = 0.0;
+        povPitchOffset = 0.0;
         initWebGL();
         const pw = canvas3D.parentElement ? canvas3D.parentElement.clientWidth : 0;
         const ph = canvas3D.parentElement ? canvas3D.parentElement.clientHeight : 0;
@@ -582,16 +708,42 @@ def generate_interactive_html_viewer(
           canvas3D.width = pw;
           canvas3D.height = ph;
         }}
-        if (playbackPct >= 0.98) {{
-          playbackPct = 0.0;
+        // Prevent background live polling from hijacking POV walkthrough
+        if (FULL_SLAM_POINTS.length > 1) {{
+          isLiveMode = false;
           isPlaying = true;
+          if (playbackPct >= 0.98) playbackPct = 0.0;
+          const liveBadge = document.getElementById('live-badge');
+          if (liveBadge) {{
+            liveBadge.textContent = '⏸ VCR REPLAY';
+            liveBadge.style.background = '#3b1d06';
+            liveBadge.style.color = '#f59e0b';
+            liveBadge.style.borderColor = '#f59e0b';
+          }}
           document.getElementById('play-icon').textContent = '⏸';
           document.getElementById('play-text').textContent = 'Pause';
+          updateUI(true);
         }}
         if (gl) {{
           rebuild3DScene();
           render3DScene();
         }}
+      }} else if (mode === 'GEO') {{
+        modeBadge.textContent = 'Earth / Satellite';
+        canvasStatic.style.display = 'none';
+        canvasDynamic.style.display = 'none';
+        canvas3D.style.display = 'none';
+        canvasGeo.style.display = 'block';
+        povReticle.style.display = 'none';
+        hintEl.textContent = 'Drag: Pan Map | Wheel: Zoom | Shift+Click (or Move Pin): Place Building';
+        const pw = canvasGeo.parentElement ? canvasGeo.parentElement.clientWidth : 0;
+        const ph = canvasGeo.parentElement ? canvasGeo.parentElement.clientHeight : 0;
+        if (pw > 0 && ph > 0) {{
+          canvasGeo.width = pw;
+          canvasGeo.height = ph;
+        }}
+        initGeoMap();
+        drawGeoScene();
       }}
     }}
 
@@ -604,12 +756,22 @@ def generate_interactive_html_viewer(
       panX = w / 2.0 - (BBOX_CENTER.x * zoom);
       panY = h / 2.0 + (BBOX_CENTER.y * zoom);
 
+      const elevY = getSurveyElevOffset();
       cameraTarget[0] = BBOX_CENTER.x;
-      cameraTarget[1] = 1.0;
+      cameraTarget[1] = elevY + 1.0;
       cameraTarget[2] = BBOX_CENTER.y;
-      orbitRadius = Math.max(8.0, BBOX_SPAN * 1.5);
+      orbitRadius = Math.max(8.0, BBOX_SPAN * 1.5 + elevY * 0.6);
       orbitTheta = Math.PI * 0.25;
-      orbitPhi = Math.PI * 0.28;
+      orbitPhi = Math.PI * 0.30;
+      povYawOffset = 0.0;
+      povPitchOffset = 0.0;
+
+      if (viewMode === 'GEO') {{
+        geoState.centerLat = geoState.anchorLat;
+        geoState.centerLon = geoState.anchorLon;
+        geoState.zoom = Math.max(18, geoState.zoom);
+        drawGeoScene();
+      }}
 
       drawStaticScene();
       drawDynamicScene();
@@ -641,13 +803,14 @@ def generate_interactive_html_viewer(
       if (isLiveMode) {{
         pose = currentPhonePos;
       }} else {{
-        const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
-        const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
+        const pts = (selectedDeviceId !== 'all' && DEVICE_MAP[selectedDeviceId] && DEVICE_MAP[selectedDeviceId].length > 1)
+          ? DEVICE_MAP[selectedDeviceId]
+          : FULL_SLAM_POINTS;
         if (pts && pts.length > 0) {{
           pose = getInterpolatedPose(pts, playbackPct);
         }}
       }}
-      if (!pose || typeof pose.x !== 'number') return;
+      if (!pose || typeof pose.x !== 'number' || !Number.isFinite(pose.x)) return;
 
       if (viewMode === 'CAD') {{
         panX = canvasDynamic.width / 2.0 - (pose.x * zoom);
@@ -656,7 +819,7 @@ def generate_interactive_html_viewer(
         drawDynamicScene();
       }} else {{
         cameraTarget[0] = pose.x;
-        cameraTarget[1] = 1.0;
+        cameraTarget[1] = getSurveyElevOffset() + 1.0;
         cameraTarget[2] = pose.y;
       }}
     }}
@@ -673,7 +836,7 @@ def generate_interactive_html_viewer(
         drawDynamicScene();
       }} else {{
         cameraTarget[0] = r.centroid_x;
-        cameraTarget[1] = 1.0;
+        cameraTarget[1] = getSurveyElevOffset() + 1.0;
         cameraTarget[2] = r.centroid_y;
         orbitRadius = Math.max(4.0, (r.width_m || 3.0) * 1.8);
       }}
@@ -985,29 +1148,49 @@ def generate_interactive_html_viewer(
     }}
 
     function drawCADAccessPoints(ctx) {{
+      let visibleCount = 0;
+      const sameFloorOnly = document.getElementById('chk-ap-same-floor') ? document.getElementById('chk-ap-same-floor').checked : false;
+
       APS.forEach(ap => {{
         const isSameFloor = ap.is_same_floor !== undefined ? ap.is_same_floor : (ap.relative_floor === 0 || !ap.relative_floor);
         const relFloor = ap.relative_floor || 0;
+        const conf = getApConfidence(ap);
+
+        if (conf < minApConfidence) return;
+        if (sameFloorOnly && !isSameFloor) return;
+        visibleCount++;
+
         const p = cadWorldToScreen(ap.x, ap.y);
         ctx.save();
+        ctx.globalAlpha = 0.12 + 0.88 * Math.pow(conf, 1.15);
 
         if (isSameFloor) {{
           // Pulsing radio wave for same-floor AP
           const waveR = 8 + pulseAnim * 14;
           ctx.beginPath();
           ctx.arc(p.x, p.y, waveR, 0, Math.PI * 2);
-          ctx.strokeStyle = `rgba(34, 197, 94, ${{1.0 - pulseAnim}})`;
+          ctx.strokeStyle = conf >= 0.50 ? `rgba(34, 197, 94, ${{1.0 - pulseAnim}})` : `rgba(245, 158, 11, ${{0.8 - pulseAnim * 0.8}})`;
           ctx.lineWidth = 1.5;
           ctx.stroke();
 
           // AP icon
           ctx.beginPath();
           ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
-          ctx.fillStyle = '#22c55e';
+          ctx.fillStyle = conf >= 0.50 ? '#22c55e' : '#f59e0b';
           ctx.fill();
           ctx.strokeStyle = '#ffffff';
           ctx.lineWidth = 1.5;
           ctx.stroke();
+
+          if (conf < 0.50) {{
+            // Dashed tentative perimeter ring for speculative edge AP
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 11, 0, Math.PI * 2);
+            ctx.setLineDash([3, 3]);
+            ctx.strokeStyle = '#f59e0b';
+            ctx.lineWidth = 1.2;
+            ctx.stroke();
+          }}
         }} else {{
           // Off-floor neighbor AP (different floor in tall building)
           ctx.beginPath();
@@ -1017,19 +1200,31 @@ def generate_interactive_html_viewer(
           ctx.strokeStyle = '#c4b5fd';
           ctx.lineWidth = 1.2;
           ctx.stroke();
+
+          if (conf < 0.50) {{
+            ctx.beginPath();
+            ctx.arc(p.x, p.y, 9, 0, Math.PI * 2);
+            ctx.setLineDash([2, 3]);
+            ctx.strokeStyle = '#a78bfa';
+            ctx.lineWidth = 1.0;
+            ctx.stroke();
+          }}
         }}
 
         if (document.getElementById('layer-labels').checked) {{
-          ctx.fillStyle = isSameFloor ? '#86efac' : '#c4b5fd';
+          ctx.fillStyle = isSameFloor ? (conf >= 0.50 ? '#86efac' : '#fde047') : '#c4b5fd';
           ctx.font = '9px -apple-system, sans-serif';
           ctx.textAlign = 'center';
           const name = ap.ap_group_id.split('-')[1] || ap.ap_group_id.substring(0, 8);
           const floorTag = isSameFloor ? '' : (relFloor < 0 ? ` [F${{relFloor}}]` : ` [F+${{relFloor}}]`);
-          ctx.fillText(name + floorTag, p.x, p.y - 10);
+          ctx.fillText(`${{name}}${{floorTag}} (${{Math.round(conf * 100)}}%)`, p.x, p.y - 10);
         }}
 
         ctx.restore();
       }});
+
+      const apBadge = document.getElementById('ap-count-badge');
+      if (apBadge) apBadge.textContent = `APs: ${{visibleCount}} / ${{APS.length}}`;
     }}
 
     function drawRayCoverage(ctx) {{
@@ -1391,6 +1586,7 @@ def generate_interactive_html_viewer(
     let uProjectionLoc, uViewLoc, uLightDirLoc;
     let posBuffer, normalBuffer, colorBuffer, indexBuffer;
     let indexCount = 0;
+    let last3DRebuildMs = 0;
 
     // Camera parameters
     let cameraTarget = [BBOX_CENTER.x, 1.0, BBOX_CENTER.y];
@@ -1416,20 +1612,32 @@ def generate_interactive_html_viewer(
         let z0 = eye[0] - center[0];
         let z1 = eye[1] - center[1];
         let z2 = eye[2] - center[2];
-        let len = 1 / Math.hypot(z0, z1, z2);
-        z0 *= len; z1 *= len; z2 *= len;
+        let len = Math.hypot(z0, z1, z2);
+        if (!len || !Number.isFinite(len)) {{
+          z0 = 0; z1 = 0; z2 = 1;
+        }} else {{
+          z0 /= len; z1 /= len; z2 /= len;
+        }}
 
         let x0 = up[1] * z2 - up[2] * z1;
         let x1 = up[2] * z0 - up[0] * z2;
         let x2 = up[0] * z1 - up[1] * z0;
         len = Math.hypot(x0, x1, x2);
-        if (!len) {{ x0 = 0; x1 = 0; x2 = 0; }} else {{ len = 1 / len; x0 *= len; x1 *= len; x2 *= len; }}
+        if (!len || !Number.isFinite(len)) {{
+          x0 = 1; x1 = 0; x2 = 0;
+        }} else {{
+          x0 /= len; x1 /= len; x2 /= len;
+        }}
 
         let y0 = z1 * x2 - z2 * x1;
         let y1 = z2 * x0 - z0 * x2;
         let y2 = z0 * x1 - z1 * x0;
         len = Math.hypot(y0, y1, y2);
-        if (!len) {{ y0 = 0; y1 = 0; y2 = 0; }} else {{ len = 1 / len; y0 *= len; y1 *= len; y2 *= len; }}
+        if (!len || !Number.isFinite(len)) {{
+          y0 = 0; y1 = 1; y2 = 0;
+        }} else {{
+          y0 /= len; y1 /= len; y2 /= len;
+        }}
 
         out[0] = x0; out[1] = y0; out[2] = z0; out[3] = 0;
         out[4] = x1; out[5] = y1; out[6] = z1; out[7] = 0;
@@ -1451,6 +1659,9 @@ def generate_interactive_html_viewer(
         console.warn('WebGL is not supported in this browser.');
         return;
       }}
+
+      const uintExt = gl.getExtension('OES_element_index_uint');
+      gl.hasUint32 = !!uintExt || (typeof WebGL2RenderingContext !== 'undefined' && gl instanceof WebGL2RenderingContext);
 
       // Shaders - GLSL ES 1.00 compliant with explicit 3-component vector constructors
       const vsSource = `
@@ -1537,6 +1748,7 @@ def generate_interactive_html_viewer(
       let vCount = 0;
 
       function addQuad(v0, v1, v2, v3, norm, col) {{
+        if (!gl.hasUint32 && vCount + 4 > 65530) return;
         positions.push(...v0, ...v1, ...v2, ...v3);
         normals.push(...norm, ...norm, ...norm, ...norm);
         colors.push(...col, ...col, ...col, ...col);
@@ -1545,6 +1757,7 @@ def generate_interactive_html_viewer(
       }}
 
       function addBox(cx, cy, cz, sizeX, sizeY, sizeZ, rotY, col) {{
+        if (!gl.hasUint32 && vCount + 24 > 65530) return;
         const hx = sizeX / 2, hy = sizeY / 2, hz = sizeZ / 2;
         const cos = Math.cos(rotY), sin = Math.sin(rotY);
 
@@ -1552,7 +1765,7 @@ def generate_interactive_html_viewer(
           return [cx + x * cos - z * sin, cz + x * sin + z * cos];
         }}
 
-        const p0 = [...rot(-hx, -hz), cy - hy]; // x, z, y
+        const p0 = [...rot(-hx, -hz), cy - hy];
         const p1 = [...rot( hx, -hz), cy - hy];
         const p2 = [...rot( hx,  hz), cy - hy];
         const p3 = [...rot(-hx,  hz), cy - hy];
@@ -1561,7 +1774,6 @@ def generate_interactive_html_viewer(
         const p6 = [...rot( hx,  hz), cy + hy];
         const p7 = [...rot(-hx,  hz), cy + hy];
 
-        // Map [x, z, y] to [X, Y, Z]
         const v0 = [p0[0], p0[2], p0[1]];
         const v1 = [p1[0], p1[2], p1[1]];
         const v2 = [p2[0], p2[2], p2[1]];
@@ -1571,44 +1783,40 @@ def generate_interactive_html_viewer(
         const v6 = [p6[0], p6[2], p6[1]];
         const v7 = [p7[0], p7[2], p7[1]];
 
-        // Top face (+Y)
         addQuad(v4, v7, v6, v5, [0, 1, 0], col);
-        // Bottom face (-Y)
         addQuad(v0, v1, v2, v3, [0, -1, 0], col);
-        // Front face (+Z approx)
         addQuad(v3, v2, v6, v7, [sin, 0, cos], col);
-        // Back face (-Z approx)
         addQuad(v1, v0, v4, v5, [-sin, 0, -cos], col);
-        // Right face (+X approx)
         addQuad(v2, v1, v5, v6, [cos, 0, -sin], col);
-        // Left face (-X approx)
         addQuad(v0, v3, v7, v4, [-cos, 0, sin], col);
       }}
 
-      // 1. Floor Plane & Subtle Blueprint Ground Grid
-      const fSpan = BBOX_SPAN * 2.2;
+      const elevY = getSurveyElevOffset();
+
+      // 1. Earth Ground Grid & Surrounding Terrain Reference Plane (Y = 0.0)
+      const fSpan = BBOX_SPAN * 2.4;
       const fMinX = BBOX_CENTER.x - fSpan / 2;
       const fMaxX = BBOX_CENTER.x + fSpan / 2;
       const fMinZ = BBOX_CENTER.y - fSpan / 2;
       const fMaxZ = BBOX_CENTER.y + fSpan / 2;
 
-      // Dark blueprint floor
+      // Dark Earth Ground Plane
       addQuad(
-        [fMinX, 0, fMinZ],
-        [fMaxX, 0, fMinZ],
-        [fMaxX, 0, fMaxZ],
-        [fMinX, 0, fMaxZ],
+        [fMinX, 0.0, fMinZ],
+        [fMaxX, 0.0, fMinZ],
+        [fMaxX, 0.0, fMaxZ],
+        [fMinX, 0.0, fMaxZ],
         [0, 1, 0],
-        [0.05, 0.14, 0.25, 1.0]
+        [0.04, 0.10, 0.18, 1.0]
       );
 
-      // Floor blueprint grid lines
+      // Blueprint Ground Grid lines (Y = 0.005)
       const gridStep = 1.0;
       const startX = Math.floor(fMinX);
       const endX = Math.ceil(fMaxX);
       const startZ = Math.floor(fMinZ);
       const endZ = Math.ceil(fMaxZ);
-      const gridCol = [0.10, 0.24, 0.42, 0.7];
+      const gridCol = [0.08, 0.20, 0.35, 0.65];
       for (let x = startX; x <= endX; x += gridStep) {{
         addBox(x, 0.005, (startZ + endZ) / 2.0, 0.02, 0.005, (endZ - startZ), 0, gridCol);
       }}
@@ -1616,7 +1824,47 @@ def generate_interactive_html_viewer(
         addBox((startX + endX) / 2.0, 0.005, z, (endX - startX), 0.005, 0.02, 0, gridCol);
       }}
 
-      // 2. Extruded Structural Walls
+      // 2. Multi-Floor Architecture Grounding: Structural Lower Floors & Slabs
+      // When elevated (e.g. Floor 3, elevY = 6.0m), render downstairs floor slabs & corner columns
+      if (elevY > 0.5) {{
+        const bMinX = BBOX.minX - 0.5, bMaxX = BBOX.maxX + 0.5;
+        const bMinZ = BBOX.minY - 0.5, bMaxZ = BBOX.maxY + 0.5;
+        const bWidth = bMaxX - bMinX, bDepth = bMaxZ - bMinZ;
+        const bMidX = (bMinX + bMaxX) / 2.0, bMidZ = (bMinZ + bMaxZ) / 2.0;
+
+        const floorHeight = 3.0;
+        const numFloorsBelow = Math.round(elevY / floorHeight);
+        for (let fl = 0; fl < numFloorsBelow; fl++) {{
+          const flY = fl * floorHeight;
+          // Intermediate lower floor concrete slab
+          addBox(bMidX, flY + 0.02, bMidZ, bWidth, 0.06, bDepth, 0, [0.08, 0.22, 0.38, 0.45]);
+        }}
+
+        // 4 structural columns connecting Ground (Y=0) up to the survey floor
+        const colThick = 0.25;
+        const colHeight = elevY + 2.4;
+        const colColor = [0.15, 0.35, 0.55, 0.50];
+        addBox(bMinX, colHeight / 2.0, bMinZ, colThick, colHeight, colThick, 0, colColor);
+        addBox(bMaxX, colHeight / 2.0, bMinZ, colThick, colHeight, colThick, 0, colColor);
+        addBox(bMaxX, colHeight / 2.0, bMaxZ, colThick, colHeight, colThick, 0, colColor);
+        addBox(bMinX, colHeight / 2.0, bMaxZ, colThick, colHeight, colThick, 0, colColor);
+      }}
+
+      // Survey Floor Plane (where the user walked)
+      const bMinX = BBOX.minX - 0.5, bMaxX = BBOX.maxX + 0.5;
+      const bMinZ = BBOX.minY - 0.5, bMaxZ = BBOX.maxY + 0.5;
+      addBox(
+        (bMinX + bMaxX) / 2.0,
+        elevY + 0.01,
+        (bMinZ + bMaxZ) / 2.0,
+        bMaxX - bMinX,
+        0.04,
+        bMaxZ - bMinZ,
+        0,
+        [0.06, 0.16, 0.28, 0.95]
+      );
+
+      // 3. Extruded Structural Walls (Elevated to true building height)
       if (document.getElementById('layer-walls').checked) {{
         WALLS.forEach(w => {{
           const conf = w.confidence !== undefined ? w.confidence : 0.75;
@@ -1640,63 +1888,80 @@ def generate_interactive_html_viewer(
             col = [0.96, 0.62, 0.07, 0.75]; // Probable amber
           }}
 
-          addBox(mx, wallHeight / 2.0, mz, length, wallHeight, wallThick, angle, col);
+          addBox(mx, elevY + wallHeight / 2.0, mz, length, wallHeight, wallThick, angle, col);
         }});
       }}
 
-      // 3. Access Point Pinned Routers (with 3D Multi-Floor Elevation)
+      // 4. Access Point Pinned Routers (with Automatic Multi-Floor Elevation & Confidence Opacity)
       if (document.getElementById('layer-aps').checked) {{
+        const sameFloorOnly = document.getElementById('chk-ap-same-floor') ? document.getElementById('chk-ap-same-floor').checked : false;
+
         APS.forEach(ap => {{
           const isSameFloor = ap.is_same_floor !== undefined ? ap.is_same_floor : (ap.relative_floor === 0 || !ap.relative_floor);
           const relFloor = ap.relative_floor || 0;
-          const apElev = (ap.z_m !== undefined ? ap.z_m : relFloor * 3.0) + 2.2;
+          const conf = getApConfidence(ap);
+
+          if (conf < minApConfidence) return;
+          if (sameFloorOnly && !isSameFloor) return;
+
+          // Compute absolute 3D height above Ground Earth (Y=0.0)
+          const apRelativeZ = (ap.z_m !== undefined ? ap.z_m : relFloor * 3.0);
+          const apElev = Math.max(0.3, elevY + apRelativeZ + 2.2);
+          const alpha = Math.max(0.12, 0.12 + 0.88 * Math.pow(conf, 1.15));
 
           if (isSameFloor) {{
             // Same floor router: green box on ceiling
-            addBox(ap.x, apElev, ap.y, 0.30, 0.08, 0.30, 0, [0.13, 0.77, 0.37, 1.0]);
-            addBox(ap.x, apElev + 0.15, ap.y, 0.04, 0.22, 0.04, 0, [0.85, 0.95, 1.0, 1.0]);
+            addBox(ap.x, apElev, ap.y, 0.30, 0.08, 0.30, 0, [0.13, 0.77, 0.37, alpha]);
+            addBox(ap.x, apElev + 0.12, ap.y, 0.04, 0.18, 0.04, 0, [0.85, 0.95, 1.0, alpha]);
           }} else {{
-            // Off-floor router: purple marker at true relative floor elevation
-            addBox(ap.x, apElev, ap.y, 0.28, 0.08, 0.28, 0, [0.65, 0.55, 0.98, 0.90]);
-            // Vertical plumb line connecting off-floor AP to ground plane
-            const plumbLen = Math.max(0.2, Math.abs(apElev));
-            const plumbMidY = apElev / 2.0;
-            addBox(ap.x, plumbMidY, ap.y, 0.02, plumbLen, 0.02, 0, [0.65, 0.55, 0.98, 0.45]);
+            // Off-floor router: situated inside lower/upper stories with confidence alpha
+            addBox(ap.x, apElev, ap.y, 0.28, 0.08, 0.28, 0, [0.65, 0.55, 0.98, alpha]);
+            // Vertical plumb line connecting AP to its floor slab or ground
+            const plumbBaseY = Math.max(0.0, elevY + apRelativeZ);
+            const plumbLen = Math.max(0.1, apElev - plumbBaseY);
+            addBox(ap.x, plumbBaseY + plumbLen / 2.0, ap.y, 0.02, plumbLen, 0.02, 0, [0.65, 0.55, 0.98, alpha * 0.5]);
           }}
         }});
       }}
 
-      // 4. SLAM Trajectory Path in 3D
+      // 5. SLAM Trajectory Path in 3D (Decimated for speed & index safety)
       if (document.getElementById('layer-slam').checked && FULL_SLAM_POINTS.length > 0) {{
         const count = Math.max(1, Math.floor(FULL_SLAM_POINTS.length * playbackPct));
-        for (let i = 0; i < count; i++) {{
+        const stride = Math.max(1, Math.floor(count / 220));
+        for (let i = 0; i < count; i += stride) {{
           const pt = FULL_SLAM_POINTS[i];
-          addBox(pt.x, 0.06, pt.y, 0.10, 0.03, 0.10, 0, [0.06, 0.71, 0.82, 0.75]);
+          addBox(pt.x, elevY + 0.06, pt.y, 0.10, 0.03, 0.10, 0, [0.06, 0.71, 0.82, 0.75]);
         }}
       }}
 
-      // 5. Dynamic Phone Avatar & Heading Pointer
+      // 6. Dynamic Phone Avatar & Heading Pointer
       if (document.getElementById('layer-phone').checked) {{
         let pose = null;
         if (isLiveMode) {{
           pose = currentPhonePos;
         }} else {{
-          const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
-          const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
+          const pts = (selectedDeviceId !== 'all' && DEVICE_MAP[selectedDeviceId] && DEVICE_MAP[selectedDeviceId].length > 1)
+            ? DEVICE_MAP[selectedDeviceId]
+            : FULL_SLAM_POINTS;
           if (pts && pts.length > 0) {{
             pose = getInterpolatedPose(pts, playbackPct);
           }}
         }}
-        if (pose && typeof pose.x === 'number') {{
-          // Phone body at 1.1m elevation
-          addBox(pose.x, 1.1, pose.y, 0.18, 0.04, 0.36, -pose.yaw, [0.93, 0.28, 0.6, 1.0]);
+        if (pose && typeof pose.x === 'number' && Number.isFinite(pose.x) && Number.isFinite(pose.y)) {{
+          const px = Math.max(BBOX.minX - 10, Math.min(BBOX.maxX + 10, pose.x));
+          const py = Math.max(BBOX.minY - 10, Math.min(BBOX.maxY + 10, pose.y));
+          const pz = elevY + 1.1;
+          const pyaw = Number.isFinite(pose.yaw) ? pose.yaw : 0.0;
+
+          // Phone body
+          addBox(px, pz, py, 0.18, 0.04, 0.36, -pyaw, [0.93, 0.28, 0.6, 1.0]);
           // Screen display
-          addBox(pose.x, 1.125, pose.y, 0.14, 0.01, 0.30, -pose.yaw, [0.22, 0.74, 0.97, 1.0]);
+          addBox(px, pz + 0.025, py, 0.14, 0.01, 0.30, -pyaw, [0.22, 0.74, 0.97, 1.0]);
           // Forward heading pointer
           const hLen = 0.9;
-          const hx = pose.x + Math.cos(pose.yaw) * (hLen / 2);
-          const hz = pose.y + Math.sin(pose.yaw) * (hLen / 2);
-          addBox(hx, 1.1, hz, 0.05, 0.02, hLen, -pose.yaw + Math.PI / 2, [0.96, 0.62, 0.07, 0.9]);
+          const hx = px + Math.cos(pyaw) * (hLen / 2);
+          const hz = py + Math.sin(pyaw) * (hLen / 2);
+          addBox(hx, pz, hz, 0.05, 0.02, hLen, -pyaw + Math.PI / 2, [0.96, 0.62, 0.07, 0.9]);
         }}
       }}
 
@@ -1711,7 +1976,11 @@ def generate_interactive_html_viewer(
       gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(colors), gl.STATIC_DRAW);
 
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-      gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+      if (gl.hasUint32) {{
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(indices), gl.STATIC_DRAW);
+      }} else {{
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(indices), gl.STATIC_DRAW);
+      }}
 
       indexCount = indices.length;
     }}
@@ -1733,31 +2002,43 @@ def generate_interactive_html_viewer(
       gl.useProgram(shaderProgram);
 
       const projMatrix = Mat4.create();
-      Mat4.perspective(projMatrix, 50 * Math.PI / 180, w / h, 0.1, 500);
+      const farClip = Math.max(500.0, BBOX_SPAN * 20.0);
+      Mat4.perspective(projMatrix, 50 * Math.PI / 180, w / h, 0.1, farClip);
       gl.uniformMatrix4fv(uProjectionLoc, false, projMatrix);
 
       const viewMatrix = Mat4.create();
+      const elevY = getSurveyElevOffset();
 
       if (viewMode === 'POV') {{
-        // Snap camera directly to active phone pose looking forward at eye level (1.6m)
+        // First-Person Walkthrough ("Phone-Eye POV" inside rooms at eye level 1.6m)
         let pose = null;
         if (isLiveMode) {{
           pose = currentPhonePos;
         }} else {{
-          const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
-          const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
+          const pts = (selectedDeviceId !== 'all' && DEVICE_MAP[selectedDeviceId] && DEVICE_MAP[selectedDeviceId].length > 1)
+            ? DEVICE_MAP[selectedDeviceId]
+            : FULL_SLAM_POINTS;
           if (pts && pts.length > 0) {{
             pose = getInterpolatedPose(pts, playbackPct);
           }}
         }}
-        let eye = [BBOX_CENTER.x, 1.6, BBOX_CENTER.y];
-        let target = [BBOX_CENTER.x + 1.0, 1.55, BBOX_CENTER.y];
-        if (pose && typeof pose.x === 'number') {{
-          eye = [pose.x, 1.6, pose.y];
-          const lookX = Math.cos(pose.yaw || 0);
-          const lookZ = Math.sin(pose.yaw || 0);
-          target = [pose.x + lookX * 5.0, 1.55, pose.y + lookZ * 5.0];
+
+        let eyeX = BBOX_CENTER.x, eyeZ = BBOX_CENTER.y, baseYaw = 0.0;
+        if (pose && typeof pose.x === 'number' && Number.isFinite(pose.x) && Number.isFinite(pose.y)) {{
+          eyeX = Math.max(BBOX.minX - 15.0, Math.min(BBOX.maxX + 15.0, pose.x));
+          eyeZ = Math.max(BBOX.minY - 15.0, Math.min(BBOX.maxY + 15.0, pose.y));
+          baseYaw = Number.isFinite(pose.yaw) ? pose.yaw : 0.0;
         }}
+
+        const eye = [eyeX, elevY + 1.6, eyeZ];
+        const totalYaw = baseYaw + povYawOffset;
+        const pitch = povPitchOffset;
+        const lookDist = 5.0;
+        const lookX = Math.cos(totalYaw) * Math.cos(pitch);
+        const lookY = Math.sin(pitch);
+        const lookZ = Math.sin(totalYaw) * Math.cos(pitch);
+        const target = [eyeX + lookX * lookDist, elevY + 1.6 + lookY * lookDist, eyeZ + lookZ * lookDist];
+
         Mat4.lookAt(viewMatrix, eye, target, [0, 1, 0]);
       }} else {{
         // Free 3D Orbit Camera
@@ -1770,7 +2051,6 @@ def generate_interactive_html_viewer(
       gl.uniformMatrix4fv(uViewLoc, false, viewMatrix);
 
       if (indexCount > 0) {{
-        // Bind attributes and draw static building geometry
         const aPosLoc = gl.getAttribLocation(shaderProgram, 'aPosition');
         const aNormLoc = gl.getAttribLocation(shaderProgram, 'aNormal');
         const aColLoc = gl.getAttribLocation(shaderProgram, 'aColor');
@@ -1788,12 +2068,438 @@ def generate_interactive_html_viewer(
         gl.enableVertexAttribArray(aColLoc);
 
         gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, indexBuffer);
-        gl.drawElements(gl.TRIANGLES, indexCount, gl.UNSIGNED_SHORT, 0);
+        const idxType = gl.hasUint32 ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
+        gl.drawElements(gl.TRIANGLES, indexCount, idxType, 0);
       }}
     }}
 
     // =========================================================================
-    // MOUSE & TOUCH EVENT LISTENERS (Unified CAD & 3D WebGL)
+    // ZERO-DEPENDENCY EARTH SATELLITE & TERRAIN CANVAS ENGINE
+    // =========================================================================
+    const BASEMAP_TILES = {{
+      satellite: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}',
+      osm: 'https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',
+      topo: 'https://tile.opentopomap.org/{{z}}/{{x}}/{{y}}.png'
+    }};
+
+    let geoState = {{
+      basemap: 'satellite',
+      zoom: 18,
+      centerLat: (ELEVATION_PROFILE && ELEVATION_PROFILE.lat) ? ELEVATION_PROFILE.lat : -12.0464,
+      centerLon: (ELEVATION_PROFILE && ELEVATION_PROFILE.lon) ? ELEVATION_PROFILE.lon : -77.0428,
+      anchorLat: (ELEVATION_PROFILE && ELEVATION_PROFILE.lat) ? ELEVATION_PROFILE.lat : -12.0464,
+      anchorLon: (ELEVATION_PROFILE && ELEVATION_PROFILE.lon) ? ELEVATION_PROFILE.lon : -77.0428,
+      rotationDeg: 0,
+      isPinMode: false,
+      groundAslM: null,
+      isDragging: false,
+      dragStartX: 0,
+      dragStartY: 0,
+      dragStartCenterLat: 0,
+      dragStartCenterLon: 0
+    }};
+
+    const tileCache = new Map();
+
+    function initGeoMap() {{
+      try {{
+        const saved = localStorage.getItem('wifinerf_geo_' + activeEnvId);
+        if (saved) {{
+          const p = JSON.parse(saved);
+          if (p.anchorLat && p.anchorLon) {{
+            geoState.anchorLat = p.anchorLat;
+            geoState.anchorLon = p.anchorLon;
+            geoState.centerLat = p.centerLat || p.anchorLat;
+            geoState.centerLon = p.centerLon || p.anchorLon;
+            geoState.zoom = p.zoom || 18;
+            geoState.rotationDeg = p.rotationDeg || 0;
+            if (p.groundAslM !== undefined) geoState.groundAslM = p.groundAslM;
+          }}
+        }}
+      }} catch (e) {{}}
+
+      const rotSlider = document.getElementById('slider-geo-rot');
+      if (rotSlider) rotSlider.value = String(geoState.rotationDeg);
+      const rotVal = document.getElementById('geo-rot-val');
+      if (rotVal) rotVal.textContent = `${{geoState.rotationDeg}}°`;
+
+      if (geoState.groundAslM === null && geoState.anchorLat && geoState.anchorLon) {{
+        fetchTerrainElevation(geoState.anchorLat, geoState.anchorLon);
+      }} else {{
+        updateGeoElevationUI();
+      }}
+    }}
+
+    function saveGeoState() {{
+      try {{
+        localStorage.setItem('wifinerf_geo_' + activeEnvId, JSON.stringify({{
+          anchorLat: geoState.anchorLat,
+          anchorLon: geoState.anchorLon,
+          centerLat: geoState.centerLat,
+          centerLon: geoState.centerLon,
+          zoom: geoState.zoom,
+          rotationDeg: geoState.rotationDeg,
+          groundAslM: geoState.groundAslM
+        }}));
+      }} catch (e) {{}}
+    }}
+
+    function setGeoBasemap(bm) {{
+      geoState.basemap = bm;
+      ['sat', 'osm', 'topo'].forEach(k => {{
+        const b = document.getElementById('geo-layer-' + k);
+        if (b) b.className = (k === (bm === 'satellite' ? 'sat' : bm)) ? 'btn' : 'btn btn-secondary';
+      }});
+      drawGeoScene();
+    }}
+
+    function updateGeoRotation(val) {{
+      geoState.rotationDeg = parseInt(val) || 0;
+      const rotVal = document.getElementById('geo-rot-val');
+      if (rotVal) rotVal.textContent = `${{geoState.rotationDeg}}°`;
+      saveGeoState();
+      drawGeoScene();
+    }}
+
+    function toggleGeoPinMode() {{
+      geoState.isPinMode = !geoState.isPinMode;
+      const btn = document.getElementById('btn-geo-pin');
+      if (btn) {{
+        if (geoState.isPinMode) {{
+          btn.style.background = '#22c55e';
+          btn.style.color = '#052e16';
+          btn.textContent = '📍 Click Map to Set';
+        }} else {{
+          btn.style.background = '';
+          btn.style.color = '';
+          btn.textContent = '📌 Move Pin';
+        }}
+      }}
+    }}
+
+    function geolocateBrowser() {{
+      if (!navigator.geolocation) {{
+        alert('Geolocation is not supported by your browser.');
+        return;
+      }}
+      navigator.geolocation.getCurrentPosition(pos => {{
+        const lat = pos.coords.latitude;
+        const lon = pos.coords.longitude;
+        geoState.anchorLat = lat;
+        geoState.anchorLon = lon;
+        geoState.centerLat = lat;
+        geoState.centerLon = lon;
+        geoState.zoom = 18;
+        saveGeoState();
+        fetchTerrainElevation(lat, lon);
+        drawGeoScene();
+      }}, err => {{
+        alert('Could not acquire GPS position: ' + err.message);
+      }}, {{ enableHighAccuracy: true, timeout: 8000 }});
+    }}
+
+    async function searchGeoAddress() {{
+      const query = (document.getElementById('geo-search-input').value || '').trim();
+      if (!query) return;
+      try {{
+        const resp = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${{encodeURIComponent(query)}}`);
+        if (!resp.ok) return;
+        const results = await resp.json();
+        if (results && results.length > 0) {{
+          const lat = parseFloat(results[0].lat);
+          const lon = parseFloat(results[0].lon);
+          geoState.anchorLat = lat;
+          geoState.anchorLon = lon;
+          geoState.centerLat = lat;
+          geoState.centerLon = lon;
+          geoState.zoom = 18;
+          saveGeoState();
+          fetchTerrainElevation(lat, lon);
+          drawGeoScene();
+        }} else {{
+          alert('No geographical matches found for: ' + query);
+        }}
+      }} catch (err) {{
+        alert('Geocoding search error: ' + err.message);
+      }}
+    }}
+
+    async function fetchTerrainElevation(lat, lon) {{
+      try {{
+        const resp = await fetch(`https://api.open-meteo.com/v1/elevation?latitude=${{lat.toFixed(6)}}&longitude=${{lon.toFixed(6)}}`);
+        if (resp.ok) {{
+          const data = await resp.json();
+          if (data && data.elevation && data.elevation.length > 0) {{
+            geoState.groundAslM = parseFloat(data.elevation[0]);
+            saveGeoState();
+            updateGeoElevationUI();
+            updateUI(true);
+            return;
+          }}
+        }}
+      }} catch (e) {{}}
+      updateGeoElevationUI();
+    }}
+
+    function updateGeoElevationUI() {{
+      const latLonEl = document.getElementById('geo-latlon-val');
+      if (latLonEl) latLonEl.textContent = `${{geoState.anchorLat.toFixed(5)}}, ${{geoState.anchorLon.toFixed(5)}}`;
+
+      const gAslEl = document.getElementById('geo-ground-asl');
+      const tAslEl = document.getElementById('geo-total-asl');
+      const baseHeight = (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.height_above_ground_m === 'number') ? ELEVATION_PROFILE.height_above_ground_m : 0.0;
+      const floorNum = (ELEVATION_PROFILE && ELEVATION_PROFILE.estimated_floor_number) ? ELEVATION_PROFILE.estimated_floor_number : 1;
+
+      if (geoState.groundAslM !== null) {{
+        if (gAslEl) gAslEl.textContent = `${{geoState.groundAslM.toFixed(1)}}m ASL`;
+        const totalAsl = geoState.groundAslM + baseHeight;
+        if (tAslEl) tAslEl.textContent = `${{totalAsl.toFixed(1)}}m ASL (Floor ${{floorNum}})`;
+      }} else if (ELEVATION_PROFILE && ELEVATION_PROFILE.asl_altitude_m) {{
+        if (gAslEl) gAslEl.textContent = `~${{(ELEVATION_PROFILE.asl_altitude_m - baseHeight).toFixed(1)}}m (Baro)`;
+        if (tAslEl) tAslEl.textContent = `${{ELEVATION_PROFILE.asl_altitude_m.toFixed(1)}}m ASL (Floor ${{floorNum}})`;
+      }} else {{
+        if (gAslEl) gAslEl.textContent = 'Auto / Unpinned';
+        if (tAslEl) tAslEl.textContent = `+${{baseHeight.toFixed(1)}}m Ground (Floor ${{floorNum}})`;
+      }}
+    }}
+
+    // Web Mercator Slippy Map Math
+    function latLonToWorldPx(lat, lon, z) {{
+      const scale = 256 * Math.pow(2, z);
+      const wx = ((lon + 180) / 360) * scale;
+      const sinLat = Math.sin(lat * Math.PI / 180);
+      const wy = (0.5 - Math.log((1 + sinLat) / (1 - sinLat)) / (4 * Math.PI)) * scale;
+      return {{ x: wx, y: wy }};
+    }}
+
+    function worldPxToLatLon(wx, wy, z) {{
+      const scale = 256 * Math.pow(2, z);
+      const lon = (wx / scale) * 360 - 180;
+      const y2 = 180 - (wy / scale) * 360;
+      const lat = (360 / Math.PI) * Math.atan(Math.exp(y2 * Math.PI / 180)) - 90;
+      return {{ lat, lon }};
+    }}
+
+    function getMetersPerPixelAtLat(lat, z) {{
+      return 156543.03392 * Math.cos(lat * Math.PI / 180) / Math.pow(2, z);
+    }}
+
+    function drawGeoScene() {{
+      if (viewMode !== 'GEO') return;
+      const w = canvasGeo.width || 800;
+      const h = canvasGeo.height || 600;
+
+      geoCtx.fillStyle = '#0a192f';
+      geoCtx.fillRect(0, 0, w, h);
+
+      const z = Math.min(21, Math.max(2, geoState.zoom));
+      const tileZ = Math.min(18, Math.floor(z));
+      const overzoomScale = Math.pow(2, z - tileZ);
+
+      const centerWorld = latLonToWorldPx(geoState.centerLat, geoState.centerLon, z);
+      const centerTileWorld = latLonToWorldPx(geoState.centerLat, geoState.centerLon, tileZ);
+
+      const halfW = w / 2;
+      const halfH = h / 2;
+
+      // 1. Fetch & Render Background Slippy Tiles
+      const maxTiles = Math.pow(2, tileZ);
+      const visibleTileSpanX = Math.ceil(w / (256 * overzoomScale)) + 1;
+      const visibleTileSpanY = Math.ceil(h / (256 * overzoomScale)) + 1;
+
+      const centerTileX = Math.floor(centerTileWorld.x / 256);
+      const centerTileY = Math.floor(centerTileWorld.y / 256);
+
+      const template = BASEMAP_TILES[geoState.basemap] || BASEMAP_TILES.satellite;
+
+      for (let tx = centerTileX - visibleTileSpanX; tx <= centerTileX + visibleTileSpanX; tx++) {{
+        if (tx < 0 || tx >= maxTiles) continue;
+        for (let ty = centerTileY - visibleTileSpanY; ty <= centerTileY + visibleTileSpanY; ty++) {{
+          if (ty < 0 || ty >= maxTiles) continue;
+
+          const screenX = halfW + (tx * 256 - centerTileWorld.x) * overzoomScale;
+          const screenY = halfH + (ty * 256 - centerTileWorld.y) * overzoomScale;
+          const tileSize = 256 * overzoomScale;
+
+          const tileKey = `${{geoState.basemap}}_${{tileZ}}_${{tx}}_${{ty}}`;
+          let img = tileCache.get(tileKey);
+
+          if (!img) {{
+            img = new Image();
+            const url = template.replace('{{z}}', tileZ).replace('{{x}}', tx).replace('{{y}}', ty);
+            img.src = url;
+            img.onload = () => {{
+              if (viewMode === 'GEO') drawGeoScene();
+            }};
+            tileCache.set(tileKey, img);
+            if (tileCache.size > 250) {{
+              const firstKey = tileCache.keys().next().value;
+              tileCache.delete(firstKey);
+            }}
+          }}
+
+          if (img.complete && img.naturalWidth > 0) {{
+            geoCtx.drawImage(img, screenX, screenY, tileSize, tileSize);
+          }} else {{
+            geoCtx.fillStyle = '#0c2340';
+            geoCtx.fillRect(screenX, screenY, tileSize, tileSize);
+            geoCtx.strokeStyle = 'rgba(255, 255, 255, 0.05)';
+            geoCtx.strokeRect(screenX, screenY, tileSize, tileSize);
+          }}
+        }}
+      }}
+
+      // 2. Overlaid Georeferenced Architectural Floorplan onto Earth
+      const anchorWorld = latLonToWorldPx(geoState.anchorLat, geoState.anchorLon, z);
+      const anchorScreenX = halfW + (anchorWorld.x - centerWorld.x);
+      const anchorScreenY = halfH + (anchorWorld.y - centerWorld.y);
+
+      const mpp = getMetersPerPixelAtLat(geoState.anchorLat, z);
+      const geoScale = 1.0 / mpp; // pixels per meter on Earth at this latitude
+      const rad = geoState.rotationDeg * Math.PI / 180.0;
+      const cosR = Math.cos(rad);
+      const sinR = Math.sin(rad);
+
+      function cadToEarthScreen(cadX, cadY) {{
+        const dx = cadX - BBOX_CENTER.x;
+        const dy = cadY - BBOX_CENTER.y;
+        // Apply rotation: North (+y) rotates by building angle
+        const rx = dx * cosR - dy * sinR;
+        const ry = dx * sinR + dy * cosR;
+        return {{
+          x: anchorScreenX + rx * geoScale,
+          y: anchorScreenY - ry * geoScale
+        }};
+      }}
+
+      geoCtx.save();
+
+      // Semi-transparent Building Footprint Backdrop
+      const pNW = cadToEarthScreen(BBOX.minX - 0.4, BBOX.maxY + 0.4);
+      const pNE = cadToEarthScreen(BBOX.maxX + 0.4, BBOX.maxY + 0.4);
+      const pSE = cadToEarthScreen(BBOX.maxX + 0.4, BBOX.minY - 0.4);
+      const pSW = cadToEarthScreen(BBOX.minX - 0.4, BBOX.minY - 0.4);
+
+      geoCtx.beginPath();
+      geoCtx.moveTo(pNW.x, pNW.y);
+      geoCtx.lineTo(pNE.x, pNE.y);
+      geoCtx.lineTo(pSE.x, pSE.y);
+      geoCtx.lineTo(pSW.x, pSW.y);
+      geoCtx.closePath();
+      geoCtx.fillStyle = 'rgba(10, 25, 47, 0.72)';
+      geoCtx.fill();
+      geoCtx.strokeStyle = '#38bdf8';
+      geoCtx.lineWidth = 1.5;
+      geoCtx.setLineDash([4, 4]);
+      geoCtx.stroke();
+      geoCtx.setLineDash([]);
+
+      // Room Zone Fills
+      if (document.getElementById('layer-rooms').checked) {{
+        ROOMS.forEach(r => {{
+          if (!r.polygon || r.polygon.length < 3) return;
+          geoCtx.beginPath();
+          r.polygon.forEach((pt, idx) => {{
+            const sp = cadToEarthScreen(pt[0], pt[1]);
+            if (idx === 0) geoCtx.moveTo(sp.x, sp.y);
+            else geoCtx.lineTo(sp.x, sp.y);
+          }});
+          geoCtx.closePath();
+          geoCtx.fillStyle = 'rgba(56, 189, 248, 0.15)';
+          geoCtx.fill();
+
+          if (document.getElementById('layer-labels').checked) {{
+            const sc = cadToEarthScreen(r.centroid_x, r.centroid_y);
+            geoCtx.fillStyle = '#ffffff';
+            geoCtx.font = 'bold 10px sans-serif';
+            geoCtx.textAlign = 'center';
+            geoCtx.fillText(r.name, sc.x, sc.y);
+          }}
+        }});
+      }}
+
+      // SLAM Trail
+      if (document.getElementById('layer-slam').checked && FULL_SLAM_POINTS.length > 1) {{
+        geoCtx.beginPath();
+        geoCtx.strokeStyle = '#38bdf8';
+        geoCtx.lineWidth = 2.0;
+        FULL_SLAM_POINTS.forEach((pt, idx) => {{
+          const sp = cadToEarthScreen(pt.x, pt.y);
+          if (idx === 0) geoCtx.moveTo(sp.x, sp.y);
+          else geoCtx.lineTo(sp.x, sp.y);
+        }});
+        geoCtx.stroke();
+      }}
+
+      // Structural Walls
+      if (document.getElementById('layer-walls').checked) {{
+        WALLS.forEach(w => {{
+          const conf = w.confidence !== undefined ? w.confidence : 0.75;
+          if (conf < minConfidence) return;
+
+          const p1 = cadToEarthScreen(w.x1, w.y1);
+          const p2 = cadToEarthScreen(w.x2, w.y2);
+
+          geoCtx.beginPath();
+          geoCtx.moveTo(p1.x, p1.y);
+          geoCtx.lineTo(p2.x, p2.y);
+          geoCtx.lineWidth = Math.max(2.5, 0.16 * geoScale);
+          geoCtx.strokeStyle = conf >= 0.70 ? '#38bdf8' : (conf >= 0.40 ? '#f59e0b' : '#64748b');
+          geoCtx.stroke();
+        }});
+      }}
+
+      // Access Points
+      if (document.getElementById('layer-aps').checked) {{
+        const sameFloorOnly = document.getElementById('chk-ap-same-floor') ? document.getElementById('chk-ap-same-floor').checked : false;
+        APS.forEach(ap => {{
+          const isSameFloor = ap.is_same_floor !== undefined ? ap.is_same_floor : (ap.relative_floor === 0 || !ap.relative_floor);
+          const conf = getApConfidence(ap);
+          if (conf < minApConfidence) return;
+          if (sameFloorOnly && !isSameFloor) return;
+
+          const sp = cadToEarthScreen(ap.x, ap.y);
+          geoCtx.globalAlpha = 0.12 + 0.88 * Math.pow(conf, 1.15);
+          geoCtx.beginPath();
+          geoCtx.arc(sp.x, sp.y, isSameFloor ? 5 : 4, 0, Math.PI * 2);
+          geoCtx.fillStyle = isSameFloor ? '#22c55e' : '#a78bfa';
+          geoCtx.fill();
+          geoCtx.strokeStyle = '#ffffff';
+          geoCtx.lineWidth = 1.2;
+          geoCtx.stroke();
+          geoCtx.globalAlpha = 1.0;
+        }});
+      }}
+
+      // Phone Avatar on Earth
+      if (document.getElementById('layer-phone').checked) {{
+        let pose = isLiveMode ? currentPhonePos : getInterpolatedPose(DISPLAY_SLAM_POINTS, playbackPct);
+        if (pose && typeof pose.x === 'number' && Number.isFinite(pose.x) && Number.isFinite(pose.y)) {{
+          const sp = cadToEarthScreen(pose.x, pose.y);
+          geoCtx.beginPath();
+          geoCtx.arc(sp.x, sp.y, 7, 0, Math.PI * 2);
+          geoCtx.fillStyle = '#ec4899';
+          geoCtx.fill();
+          geoCtx.strokeStyle = '#ffffff';
+          geoCtx.lineWidth = 2;
+          geoCtx.stroke();
+        }}
+      }}
+
+      // Anchor Pin Marker
+      geoCtx.beginPath();
+      geoCtx.arc(anchorScreenX, anchorScreenY, 4, 0, Math.PI * 2);
+      geoCtx.fillStyle = '#ef4444';
+      geoCtx.fill();
+      geoCtx.strokeStyle = '#ffffff';
+      geoCtx.lineWidth = 1.5;
+      geoCtx.stroke();
+
+      geoCtx.restore();
+    }}
+
+    // =========================================================================
+    // MOUSE & TOUCH EVENT LISTENERS (Unified CAD, 3D, POV & Satellite Map)
     // =========================================================================
     // CAD 2D Mouse Dragging
     canvasDynamic.addEventListener('mousedown', e => {{
@@ -1805,7 +2511,6 @@ def generate_interactive_html_viewer(
 
     canvasDynamic.addEventListener('mousemove', e => {{
       if (isDragging) {{
-        // Direct Cartesian dragging: mouse down moves map down
         panX = e.clientX - dragStartX;
         panY = e.clientY - dragStartY;
         drawStaticScene();
@@ -1814,7 +2519,6 @@ def generate_interactive_html_viewer(
         return;
       }}
 
-      // Hover hit-testing on walls in CAD
       const rect = canvasDynamic.getBoundingClientRect();
       const mx = e.clientX - rect.left;
       const my = e.clientY - rect.top;
@@ -1879,7 +2583,86 @@ def generate_interactive_html_viewer(
       drawDynamicScene();
     }});
 
-    // 3D WebGL Orbit Mouse & Touch Controls
+    // Satellite Map Canvas Mouse Listeners
+    canvasGeo.addEventListener('mousedown', e => {{
+      if (viewMode !== 'GEO') return;
+      const rect = canvasGeo.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+
+      if (e.shiftKey || geoState.isPinMode) {{
+        // Place building anchor at clicked Earth location
+        const centerWorld = latLonToWorldPx(geoState.centerLat, geoState.centerLon, geoState.zoom);
+        const clickedWorldX = centerWorld.x + (mx - canvasGeo.width / 2);
+        const clickedWorldY = centerWorld.y + (my - canvasGeo.height / 2);
+        const clickedLL = worldPxToLatLon(clickedWorldX, clickedWorldY, geoState.zoom);
+
+        geoState.anchorLat = clickedLL.lat;
+        geoState.anchorLon = clickedLL.lon;
+        if (geoState.isPinMode) toggleGeoPinMode();
+        saveGeoState();
+        fetchTerrainElevation(clickedLL.lat, clickedLL.lon);
+        drawGeoScene();
+        return;
+      }}
+
+      geoState.isDragging = true;
+      geoState.dragStartX = e.clientX;
+      geoState.dragStartY = e.clientY;
+      geoState.dragStartCenterLat = geoState.centerLat;
+      geoState.dragStartCenterLon = geoState.centerLon;
+    }});
+
+    window.addEventListener('mouseup', () => {{
+      geoState.isDragging = false;
+    }});
+
+    canvasGeo.addEventListener('mousemove', e => {{
+      if (viewMode !== 'GEO' || !geoState.isDragging) return;
+      const dx = e.clientX - geoState.dragStartX;
+      const dy = e.clientY - geoState.dragStartY;
+
+      const startWorld = latLonToWorldPx(geoState.dragStartCenterLat, geoState.dragStartCenterLon, geoState.zoom);
+      const newWorldX = startWorld.x - dx;
+      const newWorldY = startWorld.y - dy;
+      const newLL = worldPxToLatLon(newWorldX, newWorldY, geoState.zoom);
+
+      geoState.centerLat = newLL.lat;
+      geoState.centerLon = newLL.lon;
+      drawGeoScene();
+    }});
+
+    canvasGeo.addEventListener('wheel', e => {{
+      if (viewMode !== 'GEO') return;
+      e.preventDefault();
+      const rect = canvasGeo.getBoundingClientRect();
+      const mx = e.clientX - rect.left;
+      const my = e.clientY - rect.top;
+
+      const oldZoom = geoState.zoom;
+      const delta = e.deltaY < 0 ? 0.4 : -0.4;
+      const newZoom = Math.min(21.0, Math.max(3.0, oldZoom + delta));
+      if (newZoom === oldZoom) return;
+
+      // Zoom towards mouse pointer
+      const oldCenterWorld = latLonToWorldPx(geoState.centerLat, geoState.centerLon, oldZoom);
+      const mouseWorldX = oldCenterWorld.x + (mx - canvasGeo.width / 2);
+      const mouseWorldY = oldCenterWorld.y + (my - canvasGeo.height / 2);
+      const mouseLL = worldPxToLatLon(mouseWorldX, mouseWorldY, oldZoom);
+
+      geoState.zoom = newZoom;
+      const newMouseWorld = latLonToWorldPx(mouseLL.lat, mouseLL.lon, newZoom);
+      const newCenterWorldX = newMouseWorld.x - (mx - canvasGeo.width / 2);
+      const newCenterWorldY = newMouseWorld.y - (my - canvasGeo.height / 2);
+      const newCenterLL = worldPxToLatLon(newCenterWorldX, newCenterWorldY, newZoom);
+
+      geoState.centerLat = newCenterLL.lat;
+      geoState.centerLon = newCenterLL.lon;
+      saveGeoState();
+      drawGeoScene();
+    }});
+
+    // 3D WebGL Orbit & POV Look-Around Controls
     let is3DDragging = false;
     let drag3DStartX = 0;
     let drag3DStartY = 0;
@@ -1897,33 +2680,50 @@ def generate_interactive_html_viewer(
     window.addEventListener('mouseup', () => is3DDragging = false);
 
     canvas3D.addEventListener('mousemove', e => {{
-      if (!is3DDragging || viewMode !== '3D') return;
+      if (!is3DDragging) return;
       const dx = e.clientX - drag3DStartX;
       const dy = e.clientY - drag3DStartY;
       drag3DStartX = e.clientX;
       drag3DStartY = e.clientY;
 
-      if (drag3DButton === 0 && !e.shiftKey) {{
-        // Left drag: Orbit 360 azimuth & elevation
-        orbitTheta += dx * 0.007;
-        orbitPhi = Math.max(0.04, Math.min(Math.PI * 0.48, orbitPhi - dy * 0.007));
-      }} else {{
-        // Right drag or Shift+drag: Pan camera target
-        const factor = orbitRadius * 0.0015;
-        const sinT = Math.sin(orbitTheta);
-        const cosT = Math.cos(orbitTheta);
-        cameraTarget[0] -= (cosT * dx - sinT * dy) * factor;
-        cameraTarget[2] -= (-sinT * dx - cosT * dy) * factor;
+      if (viewMode === 'POV') {{
+        // Walkthrough POV: drag to look around 360° inside rooms
+        povYawOffset += dx * 0.005;
+        povPitchOffset = Math.max(-1.1, Math.min(1.1, povPitchOffset - dy * 0.005));
+        render3DScene();
+      }} else if (viewMode === '3D') {{
+        if (drag3DButton === 0 && !e.shiftKey) {{
+          // Left drag: Orbit 360 azimuth & elevation
+          orbitTheta += dx * 0.007;
+          orbitPhi = Math.max(0.04, Math.min(Math.PI * 0.48, orbitPhi - dy * 0.007));
+        }} else {{
+          // Right drag or Shift+drag: Pan camera target
+          const factor = orbitRadius * 0.0015;
+          const sinT = Math.sin(orbitTheta);
+          const cosT = Math.cos(orbitTheta);
+          cameraTarget[0] -= (cosT * dx - sinT * dy) * factor;
+          cameraTarget[2] -= (-sinT * dx - cosT * dy) * factor;
+        }}
+        render3DScene();
       }}
-      render3DScene();
     }});
 
     canvas3D.addEventListener('wheel', e => {{
-      if (viewMode !== '3D') return;
-      e.preventDefault();
-      const factor = e.deltaY < 0 ? 0.90 : 1.11;
-      orbitRadius = Math.max(1.5, Math.min(250.0, orbitRadius * factor));
-      render3DScene();
+      if (viewMode === '3D') {{
+        e.preventDefault();
+        const factor = e.deltaY < 0 ? 0.90 : 1.11;
+        orbitRadius = Math.max(1.5, Math.min(250.0, orbitRadius * factor));
+        render3DScene();
+      }} else if (viewMode === 'POV') {{
+        e.preventDefault();
+        const factor = e.deltaY < 0 ? 0.03 : -0.03;
+        playbackPct = Math.max(0.0, Math.min(1.0, playbackPct + factor));
+        const timeSlider = document.getElementById('time-slider');
+        if (timeSlider) timeSlider.value = Math.round(playbackPct * 1000);
+        updateUI(true);
+        rebuild3DScene();
+        render3DScene();
+      }}
     }});
 
     // =========================================================================
@@ -1965,6 +2765,8 @@ def generate_interactive_html_viewer(
       updateUI(true);
       if (viewMode === 'CAD') {{
         drawDynamicScene();
+      }} else if (viewMode === 'GEO') {{
+        drawGeoScene();
       }} else {{
         if (gl) {{
           rebuild3DScene();
@@ -2003,12 +2805,7 @@ def generate_interactive_html_viewer(
           }}
         }});
 
-        const floorEl = document.getElementById('hud-floor');
-        if (floorEl) {{
-          const zVal = (currentPhonePos && typeof currentPhonePos.z === 'number') ? currentPhonePos.z : 0.0;
-          const floorNum = Math.round(zVal / 3.0) + 1;
-          floorEl.textContent = `Floor ${{floorNum}} (${{zVal.toFixed(1)}}m)`;
-        }}
+        updateHUDLevel();
 
         const statusEl = document.getElementById('hud-status');
         const nearEl = document.getElementById('hud-nearest');
@@ -2043,6 +2840,22 @@ def generate_interactive_html_viewer(
       }}
     }}
 
+    function updateHUDLevel() {{
+      const floorEl = document.getElementById('hud-floor');
+      if (!floorEl) return;
+      const baseFloor = (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.estimated_floor_number === 'number') ? ELEVATION_PROFILE.estimated_floor_number : 1;
+      const baseHeight = (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.height_above_ground_m === 'number') ? ELEVATION_PROFILE.height_above_ground_m : 0.0;
+
+      let aslTag = '';
+      if (geoState.groundAslM !== null) {{
+        aslTag = ` | ${{(geoState.groundAslM + baseHeight).toFixed(1)}}m ASL`;
+      }} else if (ELEVATION_PROFILE && ELEVATION_PROFILE.asl_altitude_m) {{
+        aslTag = ` | ${{ELEVATION_PROFILE.asl_altitude_m.toFixed(1)}}m ASL`;
+      }}
+
+      floorEl.textContent = `Floor ${{baseFloor}} (+${{baseHeight.toFixed(1)}}m${{aslTag}})`;
+    }}
+
     let lastHudUpdate = 0;
     function updateUI(force = false) {{
       if (isLiveMode && !force) return;
@@ -2057,8 +2870,9 @@ def generate_interactive_html_viewer(
 
         if (force || now - lastHudUpdate > 60) {{
           lastHudUpdate = now;
-          const primaryKey = DEVICE_KEYS && DEVICE_KEYS.length > 0 ? DEVICE_KEYS[0] : null;
-          const pts = primaryKey ? DEVICE_MAP[primaryKey] : null;
+          const pts = (selectedDeviceId !== 'all' && DEVICE_MAP[selectedDeviceId] && DEVICE_MAP[selectedDeviceId].length > 1)
+            ? DEVICE_MAP[selectedDeviceId]
+            : FULL_SLAM_POINTS;
           if (pts && pts.length > 0) {{
             const pose = getInterpolatedPose(pts, playbackPct);
             if (!pose) return;
@@ -2066,9 +2880,9 @@ def generate_interactive_html_viewer(
             const devEl = document.getElementById('hud-device');
             if (devEl) devEl.textContent = pose.device || 'phone_1';
 
-            const xVal = (typeof pose.x === 'number') ? pose.x.toFixed(2) : '0.00';
-            const yVal = (typeof pose.y === 'number') ? pose.y.toFixed(2) : '0.00';
-            const zVal = (typeof pose.z === 'number') ? pose.z.toFixed(2) : '1.10';
+            const xVal = (typeof pose.x === 'number' && Number.isFinite(pose.x)) ? pose.x.toFixed(2) : '0.00';
+            const yVal = (typeof pose.y === 'number' && Number.isFinite(pose.y)) ? pose.y.toFixed(2) : '0.00';
+            const zVal = (typeof pose.z === 'number' && Number.isFinite(pose.z)) ? pose.z.toFixed(2) : '1.10';
             const coordsEl = document.getElementById('hud-coords');
             if (coordsEl) coordsEl.textContent = `${{xVal}}m, ${{yVal}}m, ${{zVal}}m`;
 
@@ -2079,16 +2893,11 @@ def generate_interactive_html_viewer(
             const yawEl = document.getElementById('hud-yaw');
             if (yawEl) yawEl.textContent = `${{deg}}° (${{cardinals[cardIdx]}})`;
 
-            const speedVal = (typeof pose.speed === 'number' && !isNaN(pose.speed)) ? pose.speed.toFixed(2) : '0.00';
+            const speedVal = (typeof pose.speed === 'number' && Number.isFinite(pose.speed)) ? pose.speed.toFixed(2) : '0.00';
             const speedEl = document.getElementById('hud-speed');
             if (speedEl) speedEl.textContent = `${{speedVal}} m/s`;
 
-            const floorEl = document.getElementById('hud-floor');
-            if (floorEl) {{
-              const zVal = (typeof pose.z === 'number') ? pose.z : 0.0;
-              const floorNum = Math.round(zVal / 3.0) + 1;
-              floorEl.textContent = `Floor ${{floorNum}} (${{zVal.toFixed(1)}}m)`;
-            }}
+            updateHUDLevel();
 
             const pctEl = document.getElementById('hud-pct');
             if (pctEl) pctEl.textContent = `${{Math.round(playbackPct * 100)}}%`;
@@ -2122,16 +2931,18 @@ def generate_interactive_html_viewer(
         pulseAnim = (pulseAnim + dt * 2.0) % 1.0;
 
         if (isLiveMode) {{
-          // Smooth 60 FPS lerp interpolation towards target pose
+          // Smooth 60 FPS lerp interpolation towards target pose (guarded finite)
           const lerpPos = 0.20;
-          currentPhonePos.x += (targetPhonePos.x - currentPhonePos.x) * lerpPos;
-          currentPhonePos.y += (targetPhonePos.y - currentPhonePos.y) * lerpPos;
-          currentPhonePos.z += (targetPhonePos.z - currentPhonePos.z) * lerpPos;
-          currentPhonePos.speed += (targetPhonePos.speed - currentPhonePos.speed) * lerpPos;
-          let dyaw = targetPhonePos.yaw - currentPhonePos.yaw;
-          while (dyaw < -Math.PI) dyaw += 2 * Math.PI;
-          while (dyaw > Math.PI) dyaw -= 2 * Math.PI;
-          currentPhonePos.yaw += dyaw * lerpPos;
+          if (Number.isFinite(targetPhonePos.x) && Number.isFinite(targetPhonePos.y)) {{
+            currentPhonePos.x += (targetPhonePos.x - currentPhonePos.x) * lerpPos;
+            currentPhonePos.y += (targetPhonePos.y - currentPhonePos.y) * lerpPos;
+            currentPhonePos.z += (targetPhonePos.z - currentPhonePos.z) * lerpPos;
+            currentPhonePos.speed += (targetPhonePos.speed - currentPhonePos.speed) * lerpPos;
+            let dyaw = targetPhonePos.yaw - currentPhonePos.yaw;
+            while (dyaw < -Math.PI) dyaw += 2 * Math.PI;
+            while (dyaw > Math.PI) dyaw -= 2 * Math.PI;
+            currentPhonePos.yaw += dyaw * lerpPos;
+          }}
 
           if (followPhone && viewMode === 'CAD') {{
             panX = canvasDynamic.width / 2.0 - (currentPhonePos.x * zoom);
@@ -2166,13 +2977,18 @@ def generate_interactive_html_viewer(
             }}
           }}
 
-          if (viewMode !== 'CAD' && gl) {{
-            rebuild3DScene();
+          if ((viewMode === '3D' || viewMode === 'POV') && gl) {{
+            if (now - last3DRebuildMs > 80) {{
+              last3DRebuildMs = now;
+              rebuild3DScene();
+            }}
           }}
         }}
 
         if (viewMode === 'CAD') {{
           drawDynamicScene();
+        }} else if (viewMode === 'GEO') {{
+          drawGeoScene();
         }} else {{
           render3DScene();
         }}
@@ -2207,7 +3023,6 @@ def generate_interactive_html_viewer(
     }}
 
     async function initLiveClient() {{
-      // 1. Fallback initialization from offline DEVICE_KEYS
       const ueSelect = document.getElementById('ue-select');
       if (ueSelect && DEVICE_KEYS.length > 0) {{
         ueSelect.innerHTML = '<option value="all">👥 Fleet: All UEs</option>';
@@ -2220,13 +3035,11 @@ def generate_interactive_html_viewer(
         }});
       }}
 
-      // 2. Fetch live environments & discovered devices from REST API
       try {{
         const resp = await fetch('/api/environments');
         if (resp.ok) {{
           const data = await resp.json();
 
-          // Populate Environments
           const select = document.getElementById('env-select');
           if (select && data.environments && data.environments.length > 0) {{
             select.innerHTML = '';
@@ -2249,7 +3062,6 @@ def generate_interactive_html_viewer(
             }}
           }}
 
-          // Populate Discovered UEs / Devices
           if (ueSelect && data.devices && data.devices.length > 0) {{
             ueSelect.innerHTML = '<option value="all">👥 Fleet: All UEs</option>';
             data.devices.forEach(dev => {{
@@ -2289,23 +3101,24 @@ def generate_interactive_html_viewer(
         const resp = await fetch(url);
         if (!resp.ok) return;
         const data = await resp.json();
-        if (data && typeof data.x === 'number') {{
-          livePose = data;
-          applyLivePose(data);
+        if (data && typeof data.x === 'number' && Number.isFinite(data.x) && Number.isFinite(data.y)) {{
+          // Reject wild telemetry spikes
+          if (Math.hypot(data.x - BBOX_CENTER.x, data.y - BBOX_CENTER.y) < 300.0) {{
+            livePose = data;
+            applyLivePose(data);
+          }}
         }}
-      }} catch (e) {{
-        // Silent catch for offline static files
-      }}
+      }} catch (e) {{}}
     }}
 
     function applyLivePose(pose) {{
-      if (!pose || typeof pose.x !== 'number') return;
-      isLiveMode = true;
+      if (!pose || typeof pose.x !== 'number' || !Number.isFinite(pose.x) || !Number.isFinite(pose.y)) return;
+      if (Math.hypot(pose.x - BBOX_CENTER.x, pose.y - BBOX_CENTER.y) > 300.0) return;
 
       // Ingest fleet telemetry
       if (pose.fleet) {{
         Object.entries(pose.fleet).forEach(([dId, dPose]) => {{
-          if (typeof dPose.x === 'number') {{
+          if (typeof dPose.x === 'number' && Number.isFinite(dPose.x)) {{
             liveFleetPoses[dId] = {{
               x: dPose.x,
               y: dPose.y,
@@ -2348,41 +3161,36 @@ def generate_interactive_html_viewer(
         initOrUpdateClearanceHUD(currentPhonePos.x, currentPhonePos.y, currentPhonePos.device);
       }}
 
-      // Directly update ONLY position-related DOM nodes:
-      const coordsEl = document.getElementById('hud-coords');
-      if (coordsEl) coordsEl.textContent = `${{targetPhonePos.x.toFixed(2)}}m, ${{targetPhonePos.y.toFixed(2)}}m, ${{targetPhonePos.z.toFixed(2)}}m`;
+      // Only update live HUD coordinates if currently in live mode (do not corrupt VCR playback)
+      if (isLiveMode) {{
+        const coordsEl = document.getElementById('hud-coords');
+        if (coordsEl) coordsEl.textContent = `${{targetPhonePos.x.toFixed(2)}}m, ${{targetPhonePos.y.toFixed(2)}}m, ${{targetPhonePos.z.toFixed(2)}}m`;
 
-      const yawEl = document.getElementById('hud-yaw');
-      if (yawEl) {{
-        let deg = Math.round(Number(activePose.yaw_deg || (activePose.yaw * 180 / Math.PI)) || 0) % 360;
-        if (deg < 0) deg += 360;
-        const cardinals = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'];
-        const cardIdx = Math.round(deg / 45) % 8;
-        yawEl.textContent = `${{deg}}° (${{cardinals[cardIdx]}})`;
-      }}
+        const yawEl = document.getElementById('hud-yaw');
+        if (yawEl) {{
+          let deg = Math.round(Number(activePose.yaw_deg || (activePose.yaw * 180 / Math.PI)) || 0) % 360;
+          if (deg < 0) deg += 360;
+          const cardinals = ['E', 'NE', 'N', 'NW', 'W', 'SW', 'S', 'SE'];
+          const cardIdx = Math.round(deg / 45) % 8;
+          yawEl.textContent = `${{deg}}° (${{cardinals[cardIdx]}})`;
+        }}
 
-      const speedEl = document.getElementById('hud-speed');
-      if (speedEl) speedEl.textContent = `${{targetPhonePos.speed.toFixed(2)}} m/s`;
+        const speedEl = document.getElementById('hud-speed');
+        if (speedEl) speedEl.textContent = `${{targetPhonePos.speed.toFixed(2)}} m/s`;
 
-      const devEl = document.getElementById('hud-device');
-      if (devEl) {{
-        const dText = selectedDeviceId === 'all' ? `Fleet (${{targetPhonePos.device}})` : targetPhonePos.device;
-        devEl.textContent = dText;
-      }}
+        const devEl = document.getElementById('hud-device');
+        if (devEl) {{
+          const dText = selectedDeviceId === 'all' ? `Fleet (${{targetPhonePos.device}})` : targetPhonePos.device;
+          devEl.textContent = dText;
+        }}
 
-      const floorEl = document.getElementById('hud-floor');
-      if (floorEl) {{
-        const zVal = targetPhonePos.z || 0.0;
-        const floorNum = (activePose.floor !== undefined) ? activePose.floor : (Math.round(zVal / 3.0) + 1);
-        floorEl.textContent = `Floor ${{floorNum}} (${{zVal.toFixed(1)}}m)`;
-      }}
+        updateHUDLevel();
 
-      // NOTE: hud-status, hud-nearest, hud-pct are kept completely stable and not touched during live ticks!
-
-      if (followPhone && viewMode === 'CAD') {{
-        panX = canvasDynamic.width / 2.0 - (targetPhonePos.x * zoom);
-        panY = canvasDynamic.height / 2.0 + (targetPhonePos.y * zoom);
-        drawStaticScene();
+        if (followPhone && viewMode === 'CAD') {{
+          panX = canvasDynamic.width / 2.0 - (targetPhonePos.x * zoom);
+          panY = canvasDynamic.height / 2.0 + (targetPhonePos.y * zoom);
+          drawStaticScene();
+        }}
       }}
     }}
 
@@ -2408,6 +3216,15 @@ def generate_interactive_html_viewer(
             if (data.aps) {{
               APS = Array.isArray(data.aps) ? data.aps : Object.values(data.aps);
             }}
+            if (data.elevation_profile) {{
+              ELEVATION_PROFILE = data.elevation_profile;
+              const b = document.getElementById('elev-floor-badge');
+              if (b) b.textContent = `Floor ${{ELEVATION_PROFILE.estimated_floor_number || 1}}`;
+              const t = document.getElementById('elev-summary-text');
+              if (t) {{
+                t.innerHTML = `Height: <strong style="color:#38bdf8;">+${{(ELEVATION_PROFILE.height_above_ground_m || 0).toFixed(1)}}m Ground</strong> (${{ELEVATION_PROFILE.total_floors_spanned || 1}} floors detected)<br><span style="color:#94a3b8; font-size:10px;">${{ELEVATION_PROFILE.inference_method || ''}}</span>`;
+              }}
+            }}
             if (WALLS.length > 0) {{
               const xs = WALLS.flatMap(w => [w.x1, w.x2]);
               const ys = WALLS.flatMap(w => [w.y1, w.y2]);
@@ -2423,13 +3240,16 @@ def generate_interactive_html_viewer(
             targetPhonePos.x = BBOX_CENTER.x;
             targetPhonePos.y = BBOX_CENTER.y;
 
-            // Recalculate baseline clearance once for the new environment
             initOrUpdateClearanceHUD(currentPhonePos.x, currentPhonePos.y, targetPhonePos.device);
 
             recenterBuilding();
             if (gl) {{
               rebuild3DScene();
               render3DScene();
+            }}
+            if (viewMode === 'GEO') {{
+              initGeoMap();
+              drawGeoScene();
             }}
           }}
         }}

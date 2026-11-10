@@ -6,6 +6,7 @@ Zero external dependencies (uses standard library http.server).
 """
 
 import json
+import math
 import os
 import sys
 import threading
@@ -132,7 +133,7 @@ class WebServerState:
                 with self.lock:
                     self.reconstruct_status = f"Reconstruction of '{env_id}' complete!"
                     if self.watcher:
-                        self.watcher.set_active_env(env_id)
+                        self.watcher.set_active_env(env_id, force=True)
             except Exception as e:
                 with self.lock:
                     self.reconstruct_status = f"Reconstruction failed: {e}"
@@ -266,6 +267,10 @@ def make_request_handler(state: WebServerState):
                             pose = json.load(f)
                     except Exception:
                         pass
+
+            if pose and isinstance(pose.get("x"), (int, float)) and isinstance(pose.get("y"), (int, float)):
+                if not (math.isfinite(pose["x"]) and math.isfinite(pose["y"]) and abs(pose["x"]) < 1000.0 and abs(pose["y"]) < 1000.0):
+                    pose = None
 
             if pose:
                 self._send_json(pose)

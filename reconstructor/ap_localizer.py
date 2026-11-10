@@ -138,6 +138,23 @@ class MultiApLocalizer:
             is_internal = (max_rssi > -62.0) and fit_res["is_same_floor"]
             sample_bssid = next(iter(ap_bssids.get(gid, {gid})))
 
+            # Calculate continuous spatial confidence score [0.10, 1.0]
+            # Accounts for observation count, peak RSSI proximity, path-loss fit RMSE,
+            # extrapolation outside surveyed walk, and multi-floor slab attenuation ambiguity.
+            count_factor = min(1.0, math.sqrt(len(obs) / 35.0))
+            rssi_factor = max(0.05, min(1.0, (max_rssi - (-85.0)) / 35.0))
+            rmse = fit_res.get("rmse_db", 3.0)
+            fit_factor = max(0.25, min(1.0, (8.0 - rmse) / 5.0))
+            min_walk_dist = min(math.hypot(ox - ap_x, oy - ap_y) for ox, oy, *_ in obs)
+            extrap_factor = max(0.35, 1.0 - max(0.0, min_walk_dist - 1.5) / 8.0)
+            floor_factor = 1.0 if fit_res["is_same_floor"] else 0.75
+            band_boost = 1.15 if (obs_24 and obs_5) else 1.0
+            raw_conf = (
+                (0.35 * count_factor + 0.45 * rssi_factor + 0.20 * fit_factor)
+                * extrap_factor * floor_factor * band_boost
+            )
+            ap_conf = round(max(0.10, min(1.0, raw_conf)), 2)
+
             results[gid] = {
                 "ap_group_id": gid,
                 "hardware_stem": self._extract_hardware_stem(sample_bssid),
@@ -155,7 +172,8 @@ class MultiApLocalizer:
                 "effective_p0_dbm": fit_res["effective_p0_dbm"],
                 "max_rssi": max_rssi,
                 "is_internal": is_internal,
-                "sample_count": len(obs)
+                "sample_count": len(obs),
+                "confidence": ap_conf
             }
 
         return results

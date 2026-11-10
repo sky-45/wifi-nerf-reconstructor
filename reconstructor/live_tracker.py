@@ -11,6 +11,7 @@ import gzip
 import json
 import math
 import os
+import re
 import sys
 import threading
 import time
@@ -87,38 +88,97 @@ class MapMatchedEkf:
     def __init__(self, walls: List[Dict[str, Any]], aps: List[Dict[str, Any]]):
         self.walls = walls or []
         self.aps = {}
-        for ap in aps:
+        for ap in (aps or []):
             bssid = ap.get("bssid") or ap.get("ap_group_id")
             if bssid:
                 self.aps[bssid.lower()] = ap
-        self.state = np.array([5.0, 5.0, 0.0, 0.0, 0.0], dtype=np.float64)  # [x, y, vx, vy, yaw]
+            for mb in ap.get("member_bssids", []):
+                if mb:
+                    self.aps[mb.lower()] = ap
+
+        # Derive spatial safety bounds from reconstructed map
+        all_xs = [w["x1"] for w in self.walls] + [w["x2"] for w in self.walls] + [ap.get("x", 5.0) for ap in (aps or [])]
+        all_ys = [w["y1"] for w in self.walls] + [w["y2"] for w in self.walls] + [ap.get("y", 5.0) for ap in (aps or [])]
+        if all_xs and all_ys:
+            self.bounds = (min(all_xs) - 5.0, max(all_xs) + 5.0, min(all_ys) - 5.0, max(all_ys) + 5.0)
+        else:
+            self.bounds = (-25.0, 45.0, -25.0, 45.0)
+
+        init_x = (self.bounds[0] + self.bounds[1]) / 2.0
+        init_y = (self.bounds[2] + self.bounds[3]) / 2.0
+        self.state = np.array([init_x, init_y, 0.0, 0.0, 0.0], dtype=np.float64)  # [x, y, vx, vy, yaw]
         self.cov = np.diag([1.0, 1.0, 0.5, 0.5, 0.2])  # State covariance
         self.last_update_ts_ns = 0
         self.initialized = False
 
     def predict_and_update(self, raw_pose: Dict[str, Any], connected_probe: Optional[Dict[str, Any]] = None, ts_ns: int = 0) -> Dict[str, Any]:
         """Runs one prediction-update cycle for an incoming live HF event."""
-        px = float(raw_pose.get("x", self.state[0]))
-        py = float(raw_pose.get("y", self.state[1]))
-        pz = float(raw_pose.get("z", 1.1))
-        yaw = float(raw_pose.get("yaw", 0.0))
+        try:
+            px = float(raw_pose.get("x", self.state[0]))
+            py = float(raw_pose.get("y", self.state[1]))
+            pz = float(raw_pose.get("z", 0.0))
+            if "yaw" in raw_pose and raw_pose["yaw"] is not None:
+                yaw = float(raw_pose["yaw"])
+            elif "qz" in raw_pose and "qw" in raw_pose:
+                qx = float(raw_pose.get("qx", 0.0))
+                qy = float(raw_pose.get("qy", 0.0))
+                qz = float(raw_pose.get("qz", 0.0))
+                qw = float(raw_pose.get("qw", 1.0))
+                yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+            else:
+                yaw = 0.0
+        except (TypeError, ValueError):
+            return self.get_pose_estimate(0.0)
 
-        if not self.initialized:
+        # Reject non-finite or open-loop runaway raw poses before integrating
+        if not (math.isfinite(px) and math.isfinite(py) and math.isfinite(pz)):
+            return self.get_pose_estimate(0.0)
+
+        # If legacy telemetry drifted far outside building bounds (e.g. -316m), fall back to current map state
+        in_map = (self.bounds[0] - 15.0 <= px <= self.bounds[1] + 15.0 and
+                  self.bounds[2] - 15.0 <= py <= self.bounds[3] + 15.0)
+        if not in_map:
+            px = float(self.state[0])
+            py = float(self.state[1])
+        else:
+            px = max(self.bounds[0], min(self.bounds[1], px))
+            py = max(self.bounds[2], min(self.bounds[3], py))
+
+        if not self.initialized or not (math.isfinite(self.state[0]) and math.isfinite(self.state[1])):
             self.state[0] = px
             self.state[1] = py
-            self.state[4] = yaw
+            self.state[2] = 0.0
+            self.state[3] = 0.0
+            self.state[4] = yaw if math.isfinite(yaw) else 0.0
             self.last_update_ts_ns = ts_ns
             self.initialized = True
             return self.get_pose_estimate(pz)
 
-        dt = max(0.001, (ts_ns - self.last_update_ts_ns) / 1e9) if self.last_update_ts_ns > 0 else 0.1
+        # Enforce chronological monotonicity and physical dt bounds to prevent velocity explosion
+        if self.last_update_ts_ns > 0 and ts_ns > 0:
+            if ts_ns <= self.last_update_ts_ns:
+                return self.get_pose_estimate(pz)
+            dt = min(5.0, max(0.05, (ts_ns - self.last_update_ts_ns) / 1e9))
+        else:
+            dt = 0.2
         self.last_update_ts_ns = ts_ns
 
-        # 1. Motion prediction: blend raw PDR with velocity
+        # 1. Motion prediction: blend raw PDR with damped velocity
         prev_x, prev_y = self.state[0], self.state[1]
-        alpha = 0.75  # PDR weight
-        proposed_x = (1.0 - alpha) * (self.state[0] + self.state[2] * dt) + alpha * px
-        proposed_y = (1.0 - alpha) * (self.state[1] + self.state[3] * dt) + alpha * py
+        vx_clamped = max(-2.5, min(2.5, float(self.state[2])))
+        vy_clamped = max(-2.5, min(2.5, float(self.state[3])))
+
+        if math.hypot(px - prev_x, py - prev_y) > 4.0:
+            # Smooth transition on sudden telemetry reset
+            proposed_x = 0.35 * prev_x + 0.65 * px
+            proposed_y = 0.35 * prev_y + 0.65 * py
+            vx_clamped, vy_clamped = 0.0, 0.0
+        else:
+            alpha = 0.75  # PDR weight
+            pred_x = prev_x + vx_clamped * min(dt, 1.0)
+            pred_y = prev_y + vy_clamped * min(dt, 1.0)
+            proposed_x = (1.0 - alpha) * pred_x + alpha * px
+            proposed_y = (1.0 - alpha) * pred_y + alpha * py
 
         # 2. Map-Matching Constraint: Check for wall crossings
         p1 = (prev_x, prev_y)
@@ -165,14 +225,22 @@ class MapMatchedEkf:
                     proposed_x += (proposed_x - ap_x) / curr_dist * (err * kalman_k)
                     proposed_y += (proposed_y - ap_y) / curr_dist * (err * kalman_k)
 
-        # Update state
+        # Bound position and clamp velocity to physical pedestrian limits (max 2.5 m/s)
+        proposed_x = max(self.bounds[0], min(self.bounds[1], proposed_x))
+        proposed_y = max(self.bounds[2], min(self.bounds[3], proposed_y))
         vx = (proposed_x - prev_x) / dt
         vy = (proposed_y - prev_y) / dt
+        speed = math.hypot(vx, vy)
+        if speed > 2.5:
+            scale = 2.5 / speed
+            vx *= scale
+            vy *= scale
+
         self.state[0] = proposed_x
         self.state[1] = proposed_y
         self.state[2] = vx
         self.state[3] = vy
-        self.state[4] = yaw
+        self.state[4] = yaw if math.isfinite(yaw) else self.state[4]
 
         return self.get_pose_estimate(pz)
 
@@ -228,6 +296,7 @@ class LiveBucketWatcher:
         self.lock = threading.Lock()
         self.latest_pose: Optional[Dict[str, Any]] = None
         self.latest_poses: Dict[str, Dict[str, Any]] = {}
+        self.elevation_profile: Dict[str, Any] = {}
 
         # If env_id is omitted, auto-discover and select recommended environment
         if not env_id:
@@ -242,14 +311,15 @@ class LiveBucketWatcher:
         self.walls, self.aps = self._load_or_reconstruct_floorplan()
         self.ekf = MapMatchedEkf(self.walls, self.aps)
 
-    def set_active_env(self, new_env_id: str):
+    def set_active_env(self, new_env_id: str, force: bool = False):
         """Switches tracking to a new environment dynamically."""
         with self.lock:
-            if self.env_id == new_env_id:
+            if self.env_id == new_env_id and not force:
                 return
-            print(f"[*] Switching live tracker active environment: '{self.env_id}' -> '{new_env_id}'")
+            print(f"[*] {'Reloading' if self.env_id == new_env_id else 'Switching'} live tracker active environment: '{self.env_id}' -> '{new_env_id}'")
             self.env_id = new_env_id
             self.seen_batch_keys.clear()
+            self.elevation_profile = {}
             self.walls, self.aps = self._load_or_reconstruct_floorplan()
             self.ekf = MapMatchedEkf(self.walls, self.aps)
             self.latest_pose = None
@@ -273,17 +343,28 @@ class LiveBucketWatcher:
 
             if target:
                 target["fleet"] = {d: dict(p) for d, p in self.latest_poses.items()}
+                if self.elevation_profile and "floor" not in target:
+                    fnum = self.elevation_profile.get("estimated_floor_number", 1)
+                    gh = self.elevation_profile.get("height_above_ground_m", 0.0)
+                    target["floor"] = fnum
+                    target["height_above_ground_m"] = gh
+                    target["asl_altitude_m"] = self.elevation_profile.get("asl_altitude_m")
                 return target
 
-        # Fallback to reading disk
+        # Fallback to reading disk (discarding corrupted/non-finite poses)
         disk_path = os.path.join(self.output_dir, f"live_pose_{self.env_id}.json")
         if os.path.exists(disk_path):
             try:
                 with open(disk_path, "r", encoding="utf-8") as f:
                     disk_pose = json.load(f)
-                    if disk_pose:
-                        disk_pose["fleet"] = {disk_pose.get("device_id", "phone_1"): disk_pose}
-                    return disk_pose
+                    if disk_pose and isinstance(disk_pose.get("x"), (int, float)) and isinstance(disk_pose.get("y"), (int, float)):
+                        if math.isfinite(disk_pose["x"]) and math.isfinite(disk_pose["y"]) and abs(disk_pose["x"]) < 1000.0 and abs(disk_pose["y"]) < 1000.0:
+                            if self.elevation_profile and "floor" not in disk_pose:
+                                disk_pose["floor"] = self.elevation_profile.get("estimated_floor_number", 1)
+                                disk_pose["height_above_ground_m"] = self.elevation_profile.get("height_above_ground_m", 0.0)
+                                disk_pose["asl_altitude_m"] = self.elevation_profile.get("asl_altitude_m")
+                            disk_pose["fleet"] = {disk_pose.get("device_id", "phone_1"): disk_pose}
+                            return disk_pose
             except Exception:
                 pass
         return None
@@ -303,6 +384,7 @@ class LiveBucketWatcher:
                     walls = data.get("floorplan", {}).get("walls") or data.get("walls", [])
                     raw_aps = data.get("aps") or data.get("access_points", [])
                     aps = list(raw_aps.values()) if isinstance(raw_aps, dict) else raw_aps
+                    self.elevation_profile = data.get("elevation_profile") or {}
                     print(f"[*] Loaded CAD map '{path}': {len(walls)} walls, {len(aps)} APs")
                     return walls, aps
                 except Exception as e:
@@ -326,6 +408,7 @@ class LiveBucketWatcher:
                         walls = data.get("floorplan", {}).get("walls") or data.get("walls", [])
                         raw_aps = data.get("aps") or data.get("access_points", [])
                         aps = list(raw_aps.values()) if isinstance(raw_aps, dict) else raw_aps
+                        self.elevation_profile = data.get("elevation_profile") or {}
                         print(f"[*] Successfully reconstructed CAD map: {len(walls)} walls, {len(aps)} APs")
                         return walls, aps
             except Exception as e:
@@ -350,8 +433,12 @@ class LiveBucketWatcher:
         if not new_keys:
             return []
 
+        def _key_sort_key(k: str):
+            nums = [int(n) for n in re.findall(r"\d+", os.path.basename(k))]
+            return (nums, k)
+
         new_poses = []
-        for key in sorted(new_keys):
+        for key in sorted(new_keys, key=_key_sort_key):
             self.seen_batch_keys.add(key)
             try:
                 raw_bytes = self.adapter.read_object_bytes(key)
@@ -379,6 +466,12 @@ class LiveBucketWatcher:
                             filtered["environment_id"] = curr_env
                             filtered["timestamp_ns"] = ts_ns
                             filtered["batch_key"] = key
+                            if self.elevation_profile:
+                                fnum = self.elevation_profile.get("estimated_floor_number", 1)
+                                gh = self.elevation_profile.get("height_above_ground_m", 0.0)
+                                filtered["floor"] = fnum
+                                filtered["height_above_ground_m"] = gh
+                                filtered["asl_altitude_m"] = self.elevation_profile.get("asl_altitude_m")
                             new_poses.append(filtered)
             except Exception as e:
                 print(f"[-] Error processing batch {key}: {e}")

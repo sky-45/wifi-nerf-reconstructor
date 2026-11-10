@@ -51,7 +51,11 @@ from typing import Dict, Any, List, Optional, Tuple
 import numpy as np
 
 from reconstructor.blob_loader import BlobStoreAdapter, SessionAssembler
-from reconstructor.session_partitioner import SessionPartitioner, parse_fleet_key
+from reconstructor.session_partitioner import (
+    SessionPartitioner,
+    parse_fleet_key,
+    estimate_automatic_building_elevation,
+)
 from reconstructor.pose_graph_slam import PoseGraphSLAM, FreeSpaceCarver
 from reconstructor.ap_localizer import MultiApLocalizer, RttVirtualAnchorSolver
 from reconstructor.nerfmap_engine import NeRFMapEngine
@@ -293,6 +297,13 @@ def run_reconstruction_pipeline(
     rtt_walls = rtt_solver.extract_specular_walls(slam_events, localized_aps)
     print(f"          Identified {len(rtt_walls)} RTT specular mirror-reflector boundaries.")
 
+    # 100% Automated Earth Elevation & Building Floor Inference
+    elevation_profile = estimate_automatic_building_elevation(localized_aps, events=slam_events)
+    print(f"          Automatic Elevation Profile: Level: Floor {elevation_profile['estimated_floor_number']} "
+          f"(+{elevation_profile['height_above_ground_m']}m Ground, {elevation_profile['total_floors_spanned']} floors spanned)")
+    if elevation_profile.get("asl_altitude_m") is not None:
+        print(f"          Barometric Earth Altitude: {elevation_profile['asl_altitude_m']}m ASL")
+
     # -------------------------------------------------------------------------
     # Stage 3: Two-Tier Physics Inversion (FISTA + NeRFMap)
     # -------------------------------------------------------------------------
@@ -478,6 +489,7 @@ def run_reconstruction_pipeline(
     print(f"          ✓ Saved GeoJSON: {geojson_path}")
 
     # 2. JSON Floorplan Manifest
+    floorplan["elevation_profile"] = elevation_profile
     manifest_path = os.path.join(output_dir, f"floorplan_{target_id}.json")
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump({
@@ -486,12 +498,13 @@ def run_reconstruction_pipeline(
             "environment_id": target_id,
             "devices": session_data.get("device_ids", ["single_session"]),
             "metrics": metrics,
+            "elevation_profile": elevation_profile,
             "floorplan": floorplan,
             "aps": localized_aps
         }, f, indent=2)
     print(f"          ✓ Saved JSON Manifest: {manifest_path}")
 
-    # 3. Interactive HTML Viewer (2D + 2.5D Isometric 3D)
+    # 3. Interactive HTML Viewer (2D + 2.5D Isometric 3D + Satellite/Terrain Map)
     viewer_path = os.path.join(output_dir, f"viewer_{target_id}.html")
     html_content = generate_interactive_html_viewer(
         session_id=target_id,
@@ -501,7 +514,8 @@ def run_reconstruction_pipeline(
         raw_trajectory=raw_traj,
         slam_trajectory=slam_traj,
         grid_heatmap=final_grid.tolist(),
-        ray_density_map=floorplan.get("ray_density_map")
+        ray_density_map=floorplan.get("ray_density_map"),
+        elevation_profile=elevation_profile
     )
     with open(viewer_path, "w", encoding="utf-8") as f:
         f.write(html_content)
@@ -512,6 +526,7 @@ def run_reconstruction_pipeline(
         "target_id": target_id,
         "metrics": metrics,
         "floorplan": floorplan,
+        "elevation_profile": elevation_profile,
         "viewer_path": viewer_path,
         "geojson_path": geojson_path,
         "session_data": session_data

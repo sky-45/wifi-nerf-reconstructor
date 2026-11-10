@@ -566,5 +566,143 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         max_dev = max(abs(y - 3.0) for y in corrected_ys)
         self.assertLess(max_dev, 0.15)
 
+    def test_24_ekf_stability_and_out_of_order_microsecond_timestamps(self):
+        from reconstructor.live_tracker import MapMatchedEkf
+        walls = [{"x1": 0.0, "y1": 0.0, "x2": 10.0, "y2": 0.0, "confidence": 0.8}]
+        aps = [{"ap_group_id": "ap1", "x": 5.0, "y": 4.0, "p0_dbm": -40.0}]
+        ekf = MapMatchedEkf(walls, aps)
+
+        t0 = 1_000_000_000_000
+        # 1. Normal step
+        p1 = ekf.predict_and_update({"x": 5.0, "y": 2.0, "z": 0.0, "yaw": 0.0}, ts_ns=t0)
+        self.assertEqual(p1["x"], 5.0)
+        self.assertEqual(p1["y"], 2.0)
+
+        # 2. Out-of-order past timestamp (should be safely rejected without mutating or exploding state)
+        p_old = ekf.predict_and_update({"x": 100.0, "y": 100.0, "z": 0.0, "yaw": 0.0}, ts_ns=t0 - 500_000_000)
+        self.assertEqual(p_old["x"], 5.0)
+        self.assertEqual(p_old["y"], 2.0)
+
+        # 3. Microsecond delta (1 nanosecond delta: previously caused (1/dt) explosion)
+        p_micro = ekf.predict_and_update({"x": 5.05, "y": 2.05, "z": 0.0, "yaw": 0.0}, ts_ns=t0 + 1)
+        self.assertLessEqual(p_micro["speed_mps"], 2.5)
+        self.assertTrue(math.isfinite(p_micro["x"]))
+        self.assertTrue(math.isfinite(p_micro["y"]))
+        self.assertLess(abs(p_micro["x"]), 50.0)
+
+        # 4. Teleportation / Runaway jump to 1e+43
+        p_insane = ekf.predict_and_update({"x": -2.75e+43, "y": 8.11e+43, "z": 0.0, "yaw": 0.0}, ts_ns=t0 + 10_000_000_000)
+        self.assertTrue(math.isfinite(p_insane["x"]))
+        self.assertTrue(math.isfinite(p_insane["y"]))
+        self.assertLess(abs(p_insane["x"]), 50.0)
+        self.assertLess(abs(p_insane["y"]), 50.0)
+        self.assertLessEqual(p_insane["speed_mps"], 2.5)
+
+    def test_25_ap_confidence_and_edge_filtering(self):
+        from reconstructor.ap_localizer import MultiApLocalizer
+        localizer = MultiApLocalizer()
+
+        # Generate dense observations for an internal dual-band AP and sparse observations for an edge AP
+        events_dense = []
+        for i in range(120):
+            scans = [
+                {"bssid": "aa:bb:cc:dd:ee:01", "ap_group_id": "AP_CORE", "band": "2.4GHz", "freq_mhz": 2437, "rssi_dbm": -45 - int(i * 0.1)},
+                {"bssid": "aa:bb:cc:dd:ee:02", "ap_group_id": "AP_CORE", "band": "5GHz", "freq_mhz": 5180, "rssi_dbm": -48 - int(i * 0.1)},
+            ]
+            if i < 5:
+                scans.append({"bssid": "11:22:33:44:55:66", "ap_group_id": "AP_EDGE", "band": "2.4GHz", "freq_mhz": 2412, "rssi_dbm": -77 - (i % 2)})
+            events_dense.append({
+                "event_type": "wifi_scan_batch",
+                "pose": {"x": 2.0 + (i % 5) * 0.2, "y": 3.0 + (i % 4) * 0.2, "z": 0.0},
+                "scans": scans,
+            })
+
+        aps = localizer.localize_all_aps(events_dense)
+        self.assertIn("AP_CORE", aps)
+        self.assertIn("AP_EDGE", aps)
+        core_ap = aps["AP_CORE"]
+        edge_ap = aps["AP_EDGE"]
+
+        self.assertIn("confidence", core_ap)
+        self.assertIn("confidence", edge_ap)
+        self.assertGreaterEqual(core_ap["confidence"], 0.70)
+        self.assertLess(edge_ap["confidence"], 0.50)
+
+    def test_26_automatic_building_elevation_inference(self):
+        from reconstructor.session_partitioner import estimate_automatic_building_elevation
+
+        # Multi-floor APs matching real tall residential building
+        localized_aps = {
+            "ap_f0": {"relative_floor": 0, "sample_count": 200, "confidence": 0.95},
+            "ap_f_minus1": {"relative_floor": -1, "sample_count": 50, "confidence": 0.60},
+            "ap_f_minus2": {"relative_floor": -2, "sample_count": 40, "confidence": 0.55}
+        }
+
+        # 1. Automatic Floor Detection without Barometer
+        elev = estimate_automatic_building_elevation(localized_aps, events=None, floor_height_m=3.0)
+        self.assertEqual(elev["estimated_floor_number"], 3)
+        self.assertEqual(elev["height_above_ground_m"], 6.0)
+        self.assertEqual(elev["ground_rel_z_m"], -6.0)
+        self.assertEqual(elev["total_floors_spanned"], 3)
+        self.assertEqual(elev["lower_floor_ap_count"], 2)
+
+        # 2. Barometric Altitude Ingestion
+        events_with_baro = [
+            {"event_type": "mag_baro_pdr", "pressure_hpa": 1001.2},
+            {"event_type": "mag_baro_pdr", "pressure_hpa": 1001.4}
+        ]
+        elev_baro = estimate_automatic_building_elevation(localized_aps, events=events_with_baro)
+        self.assertIsNotNone(elev_baro["asl_altitude_m"])
+        self.assertAlmostEqual(elev_baro["asl_altitude_m"], 101.5, delta=10.0)
+
+    def test_27_zero_dependency_satellite_map_and_elevation_viewer(self):
+        from viewer.viewer_generator import generate_interactive_html_viewer
+        from reconstructor.floorplan_vectorizer import FloorplanVectorizer
+
+        vec = FloorplanVectorizer(resolution_m=0.25)
+        grid = np.zeros((20, 20), dtype=np.float32)
+        grid[8:12, 10] = 10.0
+        fp = vec.vectorize(grid, np.zeros((20, 20), dtype=bool), [])
+
+        elev_profile = {
+            "estimated_floor_number": 3,
+            "height_above_ground_m": 6.0,
+            "ground_rel_z_m": -6.0,
+            "total_floors_spanned": 3,
+            "asl_altitude_m": 126.5
+        }
+
+        html = generate_interactive_html_viewer(
+            session_id="test_geo_viewer",
+            floorplan_data=fp,
+            localized_aps={"ap1": {"ap_group_id": "AP1", "x": 2.5, "y": 2.5, "confidence": 0.85, "relative_floor": 0}},
+            eval_metrics={"quality_grade": "GRADE A"},
+            raw_trajectory=[{"x": 1.0, "y": 1.0, "z": 0.0, "yaw": 0.0, "ts": 100}],
+            slam_trajectory=[{"x": 1.0, "y": 1.0, "z": 0.0, "yaw": 0.0, "ts": 100}],
+            grid_heatmap=grid.tolist(),
+            elevation_profile=elev_profile
+        )
+
+        # 1. Test Earth Satellite & Terrain Canvas is integrated
+        self.assertIn('id="mapCanvasGeo"', html)
+        self.assertIn('id="btn-geo"', html)
+        self.assertIn('id="geo-toolbar"', html)
+        self.assertIn("BASEMAP_TILES", html)
+        self.assertIn("drawGeoScene", html)
+        self.assertIn("getMetersPerPixelAtLat", html)
+
+        # 2. Test AP Certainty filter
+        self.assertIn('id="slider-ap-conf"', html)
+        self.assertIn('id="chk-ap-same-floor"', html)
+        self.assertIn("getApConfidence", html)
+
+        # 3. Test Automatic Elevation Integration
+        self.assertIn("getSurveyElevOffset", html)
+        self.assertIn("updateHUDLevel", html)
+        self.assertIn("Floor 3", html)
+
+        # 4. Strict offline zero-dependency check
+        self.assertNotIn('<script src="http', html_content := html)
+
 if __name__ == "__main__":
     unittest.main()
