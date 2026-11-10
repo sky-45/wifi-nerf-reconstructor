@@ -21,6 +21,11 @@ from typing import Dict, Any, List, Tuple, Optional, Set
 import numpy as np
 
 from reconstructor.ap_localizer import MultiApLocalizer
+from reconstructor.geoid import (
+    egm96_undulation_m,
+    wgs84_to_msl,
+    fetch_ground_terrain_elevation_m,
+)
 
 # Regex strictly matching tiered fleet partition hierarchy:
 # 1. Standard tiered: fleet/{device_id}/{env_id}/{hf|lf}/batch_{seq}.ndjson.gz
@@ -129,6 +134,22 @@ def extract_valid_gnss_fix(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     except (TypeError, ValueError):
         alt_val = None
 
+    raw_msl = obj.get("msl_altitude_m")
+    if raw_msl is None:
+        raw_msl = obj.get("gnss_msl_altitude_m")
+    try:
+        msl_val = float(raw_msl) if raw_msl is not None and math.isfinite(float(raw_msl)) else None
+    except (TypeError, ValueError):
+        msl_val = None
+
+    raw_sep = obj.get("geoid_sep_m")
+    if raw_sep is None:
+        raw_sep = obj.get("gnss_geoid_sep_m")
+    try:
+        sep_val = float(raw_sep) if raw_sep is not None and math.isfinite(float(raw_sep)) else None
+    except (TypeError, ValueError):
+        sep_val = None
+
     provider = obj.get("provider") or obj.get("gnss_provider") or "ue_gnss"
     pose = obj.get("pose") if isinstance(obj.get("pose"), dict) else None
     cad_x, cad_y = None, None
@@ -145,6 +166,8 @@ def extract_valid_gnss_fix(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "lon": lon_val,
         "accuracy_m": acc_val,
         "altitude_m": alt_val,
+        "msl_altitude_m": msl_val,
+        "geoid_sep_m": sep_val,
         "provider": str(provider),
         "cad_x": cad_x,
         "cad_y": cad_y,
@@ -152,22 +175,102 @@ def extract_valid_gnss_fix(obj: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _weighted_median_or_trimmed_mean(pairs: List[Tuple[float, float]]) -> Optional[float]:
+    """Computes an outlier-resistant inverse-variance average over (value, weight) samples."""
+    if not pairs:
+        return None
+    if len(pairs) >= 4:
+        vals = np.array([p[0] for p in pairs], dtype=np.float64)
+        q25, q75 = np.percentile(vals, [25.0, 75.0])
+        iqr = max(1.5, float(q75 - q25))
+        kept = [p for p in pairs if (q25 - 1.5 * iqr) <= p[0] <= (q75 + 1.5 * iqr)]
+        if kept:
+            pairs = kept
+    total_w = sum(w for _, w in pairs)
+    if total_w <= 0:
+        return float(np.median([p[0] for p in pairs]))
+    return float(sum(v * w for v, w in pairs) / total_w)
+
+
+def estimate_vertical_altitude_msl(
+    gnss_fixes: List[Dict[str, Any]],
+    lat: float,
+    lon: float
+) -> Tuple[Optional[float], str]:
+    """
+    Solves true Orthometric Altitude above Mean Sea Level (MSL) using provider-aware priority:
+      1. Direct hardware MSL altitude (Android 14 AltitudeConverter or NMEA $GPGGA).
+      2. Real 3D 'gps'-provider fixes converted from WGS84 ellipsoid via global EGM96 geoid.
+         Strictly prevents coarse/sticky 'network'/'fused' altitudes from overriding true GPS 3D fixes.
+      3. Fallback to non-GPS altitude fixes if no true 3D GPS fixes are present.
+    Returns (user_msl_altitude_m, vertical_source_tag).
+    """
+    if not gnss_fixes:
+        return None, "none"
+
+    # 1. Direct hardware orthometric MSL (NMEA GGA or Android 14+ AltitudeConverter)
+    msl_pairs = [
+        (f["msl_altitude_m"], 1.0 / (max(3.0, f["accuracy_m"]) ** 2))
+        for f in gnss_fixes
+        if f.get("msl_altitude_m") is not None
+    ]
+    if msl_pairs:
+        med_msl = _weighted_median_or_trimmed_mean(msl_pairs)
+        if med_msl is not None:
+            return round(med_msl, 2), "ue_nmea_msl"
+
+    # 2. Pure 3D GPS satellite WGS84 altitude fixes (prefer tight accuracy <= 100m if >= 2 exist)
+    gps_fixes = [
+        f for f in gnss_fixes
+        if str(f.get("provider", "")).lower() == "gps" and f.get("altitude_m") is not None
+    ]
+    if gps_fixes:
+        tight_gps = [f for f in gps_fixes if f["accuracy_m"] <= 100.0]
+        gps_pool = tight_gps if len(tight_gps) >= 2 else gps_fixes
+        pairs = []
+        for f in gps_pool:
+            w = 1.0 / (max(5.0, f["accuracy_m"]) ** 2)
+            # Use chipset NMEA geoid separation if present, else global EGM96 lookup
+            if f.get("geoid_sep_m") is not None:
+                msl_h = f["altitude_m"] - f["geoid_sep_m"]
+            else:
+                msl_h = wgs84_to_msl(lat, lon, f["altitude_m"])
+            pairs.append((msl_h, w))
+        med_msl = _weighted_median_or_trimmed_mean(pairs)
+        if med_msl is not None:
+            return round(med_msl, 2), "ue_gps_egm96"
+
+    # 3. Fallback: non-GPS provider altitude fixes (e.g. Fused/Network when indoors without GPS)
+    other_pairs = [
+        (wgs84_to_msl(lat, lon, f["altitude_m"]), 1.0 / (max(5.0, f["accuracy_m"]) ** 2))
+        for f in gnss_fixes
+        if f.get("altitude_m") is not None
+    ]
+    if other_pairs:
+        med_msl = _weighted_median_or_trimmed_mean(other_pairs)
+        if med_msl is not None:
+            return round(med_msl, 2), "ue_fused_egm96"
+
+    return None, "none"
+
+
 def estimate_automatic_building_elevation(
     localized_aps: Dict[str, Dict[str, Any]],
     events: Optional[List[Dict[str, Any]]] = None,
     floor_height_m: float = 3.0,
-    envelopes: Optional[List[Dict[str, Any]]] = None
+    envelopes: Optional[List[Dict[str, Any]]] = None,
+    cache_dir: Optional[str] = "./output",
+    ground_terrain_asl_m: Optional[float] = None,
+    allow_dem_network: bool = True
 ) -> Dict[str, Any]:
     """
     100% automated Earth-referenced altitude, GNSS georeferencing, and floor level inference:
-    1. Multi-Tier RF Inversion: Examines the vertical relative floor tiers of all
-       localized physical routers (solved from concrete slab FAF attenuation).
-       Detects lower neighbor floors below the survey plane to automatically ground
-       the building and elevate the user to their true floor level.
-    2. International Hypsometric Formula: Calculates absolute altitude above sea level
-       (ASL) if raw barometric pressure is present.
-    3. Accuracy-Weighted UE GNSS Anchor: Aggregates UE Earth coordinates across events
-       and envelopes, weighted by 1 / max(3.0, accuracy_m)^2.
+    1. Multi-Tier RF Inversion: Detects neighbor floors below the survey plane to provide
+       a guaranteed lower bound on floor height (e.g. >= Floor 3 when -2 floors are visible).
+    2. True Orthometric Elevation & Earth DEM: Combines hardware MSL or WGS84 GPS altitude
+       corrected by global EGM96 geoid undulation with local Earth Ground Terrain DEM to
+       resolve tall multi-story buildings (e.g. Floors 14-16) automatically without caps.
+    3. International Hypsometric Formula: Uses raw barometric pressure when available.
     """
     # 1. Analyze relative floor distribution across confirmed APs
     rel_floors = []
@@ -186,15 +289,17 @@ def estimate_automatic_building_elevation(
         lower_count, upper_count = 0, 0
 
     if min_rf < 0:
-        estimated_floor = 1 + abs(min_rf)
-        ground_rel_z_m = min_rf * floor_height_m
-        height_above_ground_m = abs(min_rf) * floor_height_m
+        rf_floor_min = 1 + abs(min_rf)
+        rf_height_min_m = abs(min_rf) * floor_height_m
         method = f"Multi-Floor RF Slab Inversion: {lower_count} lower-tier neighbor APs detected (down to Z={min_rf * floor_height_m:.1f}m)"
     else:
-        estimated_floor = 1
-        ground_rel_z_m = 0.0
-        height_above_ground_m = 0.0
+        rf_floor_min = 1
+        rf_height_min_m = 0.0
         method = "Ground Floor Reference (no subterranean AP tiers detected)"
+
+    estimated_floor = rf_floor_min
+    height_above_ground_m = rf_height_min_m
+    ground_rel_z_m = -height_above_ground_m
 
     # 2. Extract barometer pressure and UE GNSS coordinates across events and envelopes
     asl_altitude_m = None
@@ -222,12 +327,14 @@ def estimate_automatic_building_elevation(
     lat, lon = None, None
     gnss_accuracy_m = None
     gnss_altitude_m = None
+    gnss_msl_altitude_m = None
+    geoid_undulation_m = None
     gnss_provider = None
     anchor_cad_x, anchor_cad_y = None, None
     geo_source = "none"
+    vertical_source = "rf_slab"
 
     if gnss_fixes:
-        # Discard very coarse (> 500m) cell outliers when finer fixes exist
         tight_fixes = [f for f in gnss_fixes if f["accuracy_m"] <= 500.0]
         pool = tight_fixes if tight_fixes else gnss_fixes
 
@@ -237,6 +344,7 @@ def estimate_automatic_building_elevation(
             lat = round(sum(f["lat"] * w for f, w in zip(pool, weights)) / total_w, 7)
             lon = round(sum(f["lon"] * w for f, w in zip(pool, weights)) / total_w, 7)
             geo_source = "ue_gnss"
+            geoid_undulation_m = egm96_undulation_m(lat, lon)
 
             best_fix = min(pool, key=lambda f: f["accuracy_m"])
             gnss_accuracy_m = round(best_fix["accuracy_m"], 1)
@@ -245,29 +353,68 @@ def estimate_automatic_building_elevation(
                 anchor_cad_x = round(best_fix["cad_x"], 3)
                 anchor_cad_y = round(best_fix["cad_y"], 3)
 
-            alts = [f["altitude_m"] for f in pool if f["altitude_m"] is not None]
-            if alts:
-                gnss_altitude_m = round(float(np.median(alts)), 1)
+            raw_alts = [f["altitude_m"] for f in pool if f["altitude_m"] is not None]
+            if raw_alts:
+                gnss_altitude_m = round(float(np.median(raw_alts)), 1)
+
+            user_msl, v_src = estimate_vertical_altitude_msl(pool, lat, lon)
+            if user_msl is not None:
+                gnss_msl_altitude_m = round(user_msl, 1)
+                vertical_source = v_src
+                if asl_altitude_m is None:
+                    asl_altitude_m = gnss_msl_altitude_m
+
+    # 3. Compute Earth-referenced high-rise floor height above Ground DEM terrain
+    resolved_ground_asl = ground_terrain_asl_m
+    if resolved_ground_asl is None and lat is not None and lon is not None:
+        resolved_ground_asl = fetch_ground_terrain_elevation_m(
+            lat, lon, cache_dir=cache_dir, allow_network=allow_dem_network
+        )
+
+    user_earth_asl = gnss_msl_altitude_m if gnss_msl_altitude_m is not None else asl_altitude_m
+    if (
+        user_earth_asl is not None
+        and resolved_ground_asl is not None
+        and vertical_source in ("ue_nmea_msl", "ue_gps_egm96")
+    ):
+        raw_dz = float(user_earth_asl) - float(resolved_ground_asl)
+        if -5.0 <= raw_dz <= 600.0:
+            # Subtract ~1.2m typical phone-in-hand height above floor slab
+            handheld_offset_m = 1.2
+            slab_dz = max(rf_height_min_m, max(0.0, raw_dz - handheld_offset_m))
+            estimated_floor = max(rf_floor_min, 1 + int(round(slab_dz / floor_height_m)))
+            height_above_ground_m = round(slab_dz, 1)
+            ground_rel_z_m = round(-height_above_ground_m, 1)
+            method = (
+                f"Earth GNSS + EGM96 + Ground DEM: {gnss_msl_altitude_m:.1f}m ASL "
+                f"(Terrain {resolved_ground_asl:.1f}m, Geoid N={geoid_undulation_m:+.1f}m, Δz={height_above_ground_m:.1f}m)"
+            )
 
     return {
         "estimated_floor_number": estimated_floor,
         "height_above_ground_m": round(height_above_ground_m, 1),
         "ground_rel_z_m": round(ground_rel_z_m, 1),
+        "rf_min_floor": rf_floor_min,
+        "rf_min_height_m": round(rf_height_min_m, 1),
         "min_relative_floor": min_rf,
         "max_relative_floor": max_rf,
         "total_floors_spanned": (max_rf - min_rf) + 1,
         "lower_floor_ap_count": lower_count,
         "upper_floor_ap_count": upper_count,
         "asl_altitude_m": asl_altitude_m,
+        "ground_terrain_asl_m": resolved_ground_asl,
+        "geoid_undulation_m": geoid_undulation_m,
         "lat": lat,
         "lon": lon,
         "gnss_accuracy_m": gnss_accuracy_m,
         "gnss_altitude_m": gnss_altitude_m,
+        "gnss_msl_altitude_m": gnss_msl_altitude_m,
         "gnss_provider": gnss_provider,
         "gnss_fix_count": len(gnss_fixes),
         "anchor_cad_x": anchor_cad_x,
         "anchor_cad_y": anchor_cad_y,
         "geo_source": geo_source,
+        "vertical_source": vertical_source,
         "inference_method": method
     }
 

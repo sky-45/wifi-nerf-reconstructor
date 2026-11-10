@@ -49,7 +49,13 @@ load_env()
 import numpy as np
 
 from reconstructor.blob_loader import BlobStoreAdapter
-from reconstructor.session_partitioner import SessionPartitioner, parse_fleet_key, extract_valid_gnss_fix
+from reconstructor.session_partitioner import (
+    SessionPartitioner,
+    parse_fleet_key,
+    extract_valid_gnss_fix,
+    estimate_vertical_altitude_msl,
+)
+from reconstructor.geoid import fetch_ground_terrain_elevation_m
 
 
 def dist_to_segment(px: float, py: float, x1: float, y1: float, x2: float, y2: float) -> Tuple[float, float, float]:
@@ -297,6 +303,8 @@ class LiveBucketWatcher:
         self.latest_pose: Optional[Dict[str, Any]] = None
         self.latest_poses: Dict[str, Dict[str, Any]] = {}
         self.latest_gnss: Dict[str, Dict[str, Any]] = {}
+        self.gnss_vertical_samples: Dict[str, List[Dict[str, Any]]] = {}
+        self.ground_dem_asl: Optional[float] = None
         self.elevation_profile: Dict[str, Any] = {}
 
         # If env_id is omitted, auto-discover and select recommended environment
@@ -322,17 +330,21 @@ class LiveBucketWatcher:
             self.seen_batch_keys.clear()
             self.elevation_profile = {}
             self.latest_gnss.clear()
+            self.gnss_vertical_samples.clear()
+            self.ground_dem_asl = None
             self.walls, self.aps = self._load_or_reconstruct_floorplan()
             self.ekf = MapMatchedEkf(self.walls, self.aps)
             self.latest_pose = None
 
     def _attach_geo_metadata(self, pose_obj: Dict[str, Any], dev_id: str) -> Dict[str, Any]:
-        """Attaches elevation level and Earth GNSS coordinates to a live pose payload."""
-        if self.elevation_profile:
-            if "floor" not in pose_obj:
-                pose_obj["floor"] = self.elevation_profile.get("estimated_floor_number", 1)
-                pose_obj["height_above_ground_m"] = self.elevation_profile.get("height_above_ground_m", 0.0)
-                pose_obj["asl_altitude_m"] = self.elevation_profile.get("asl_altitude_m")
+        """Attaches high-rise floor level, orthometric ASL altitude, and Earth GNSS coordinates."""
+        rf_min_floor = int(self.elevation_profile.get("rf_min_floor", 1)) if self.elevation_profile else 1
+        rf_min_height = float(self.elevation_profile.get("rf_min_height_m", 0.0)) if self.elevation_profile else 0.0
+
+        if self.elevation_profile and "floor" not in pose_obj:
+            pose_obj["floor"] = self.elevation_profile.get("estimated_floor_number", 1)
+            pose_obj["height_above_ground_m"] = self.elevation_profile.get("height_above_ground_m", 0.0)
+            pose_obj["asl_altitude_m"] = self.elevation_profile.get("asl_altitude_m")
 
         gnss = self.latest_gnss.get(dev_id) or (next(iter(self.latest_gnss.values())) if self.latest_gnss else None)
         if gnss:
@@ -348,6 +360,36 @@ class LiveBucketWatcher:
             pose_obj["gnss_accuracy_m"] = self.elevation_profile.get("gnss_accuracy_m")
             pose_obj["gnss_altitude_m"] = self.elevation_profile.get("gnss_altitude_m")
             pose_obj["geo_source"] = self.elevation_profile.get("geo_source", "ue_gnss")
+
+        # Upgrade floor estimation dynamically using live GPS/NMEA orthometric height vs Earth Ground DEM
+        lat_val = pose_obj.get("lat")
+        lon_val = pose_obj.get("lon")
+        v_samples = self.gnss_vertical_samples.get(dev_id) or (
+            next(iter(self.gnss_vertical_samples.values())) if self.gnss_vertical_samples else []
+        )
+        if lat_val is not None and lon_val is not None and v_samples:
+            if self.ground_dem_asl is None:
+                if self.elevation_profile and self.elevation_profile.get("ground_terrain_asl_m") is not None:
+                    self.ground_dem_asl = float(self.elevation_profile["ground_terrain_asl_m"])
+                else:
+                    self.ground_dem_asl = fetch_ground_terrain_elevation_m(
+                        lat_val, lon_val, cache_dir=self.output_dir
+                    )
+            user_msl, v_src = estimate_vertical_altitude_msl(v_samples, lat_val, lon_val)
+            if (
+                user_msl is not None
+                and self.ground_dem_asl is not None
+                and v_src in ("ue_nmea_msl", "ue_gps_egm96")
+            ):
+                raw_dz = float(user_msl) - float(self.ground_dem_asl)
+                if -5.0 <= raw_dz <= 600.0:
+                    slab_dz = max(rf_min_height, max(0.0, raw_dz - 1.2))
+                    pose_obj["floor"] = max(rf_min_floor, 1 + int(round(slab_dz / 3.0)))
+                    pose_obj["height_above_ground_m"] = round(slab_dz, 1)
+                    pose_obj["asl_altitude_m"] = round(user_msl, 1)
+                    pose_obj["ground_terrain_asl_m"] = self.ground_dem_asl
+                    pose_obj["vertical_source"] = v_src
+
         return pose_obj
 
     def set_poll_interval(self, new_interval_s: float):
@@ -459,8 +501,14 @@ class LiveBucketWatcher:
             nums = [int(n) for n in re.findall(r"\d+", os.path.basename(k))]
             return (nums, k)
 
+        ordered_new = sorted(new_keys, key=_key_sort_key)
+        # On cold start with large historical backlogs, fast-forward past old keys and replay the latest tail
+        if not self.seen_batch_keys and len(ordered_new) > 60:
+            self.seen_batch_keys.update(ordered_new[:-60])
+            ordered_new = ordered_new[-60:]
+
         new_poses = []
-        for key in sorted(new_keys, key=_key_sort_key):
+        for key in ordered_new:
             self.seen_batch_keys.add(key)
             try:
                 raw_bytes = self.adapter.read_object_bytes(key)
@@ -482,12 +530,17 @@ class LiveBucketWatcher:
                     if fix:
                         with self.lock:
                             prev_fix = self.latest_gnss.get(dev_id)
-                            # Update if first fix, newer timestamp, or notably higher accuracy
+                            # Update horizontal anchor if first fix, newer timestamp, or notably higher accuracy
                             is_fresher = (not prev_fix) or (fix.get("timestamp_ns", 0) >= prev_fix.get("timestamp_ns", 0))
                             is_much_better = prev_fix and fix["accuracy_m"] <= prev_fix["accuracy_m"]
                             if is_fresher or is_much_better:
                                 self.latest_gnss[dev_id] = fix
                                 gnss_updated_dev = dev_id
+                            if fix.get("msl_altitude_m") is not None or fix.get("altitude_m") is not None:
+                                vlist = self.gnss_vertical_samples.setdefault(dev_id, [])
+                                vlist.append(fix)
+                                if len(vlist) > 120:
+                                    del vlist[:-120]
 
                     if ev_type in ("connected_probe", "pdr_step", "mag_baro_pdr"):
                         pose = ev.get("pose")

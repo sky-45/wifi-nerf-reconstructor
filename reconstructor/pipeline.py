@@ -79,7 +79,7 @@ def clean_output_directory(output_dir: str, target_id: Optional[str] = None, pur
         if not os.path.isfile(fpath):
             continue
 
-        if fname.startswith("geo_anchor_"):
+        if fname.startswith(("geo_anchor_", "geo_dem_cache")):
             continue
         should_remove = False
         if purge_all and fname.endswith((".html", ".geojson", ".json", ".npy")):
@@ -303,7 +303,8 @@ def run_reconstruction_pipeline(
     elevation_profile = estimate_automatic_building_elevation(
         localized_aps,
         events=slam_events,
-        envelopes=session_data.get("envelopes")
+        envelopes=session_data.get("envelopes"),
+        cache_dir=output_dir
     )
     geo_anchor_path = os.path.join(output_dir, f"geo_anchor_{target_id}.json")
     if elevation_profile.get("geo_source") == "none" and os.path.exists(geo_anchor_path):
@@ -319,12 +320,14 @@ def run_reconstruction_pipeline(
         except Exception:
             pass
     print(f"          Automatic Elevation Profile: Level: Floor {elevation_profile['estimated_floor_number']} "
-          f"(+{elevation_profile['height_above_ground_m']}m Ground, {elevation_profile['total_floors_spanned']} floors spanned)")
+          f"(+{elevation_profile['height_above_ground_m']}m Ground, {elevation_profile['total_floors_spanned']} floors spanned) "
+          f"[{elevation_profile.get('inference_method', '')}]")
     if elevation_profile.get("lat") is not None and elevation_profile.get("lon") is not None:
         print(f"          UE Earth GNSS Anchor: ({elevation_profile['lat']}, {elevation_profile['lon']}) "
               f"[±{elevation_profile.get('gnss_accuracy_m', '--')}m, source={elevation_profile.get('geo_source')}]")
     if elevation_profile.get("asl_altitude_m") is not None:
-        print(f"          Barometric Earth Altitude: {elevation_profile['asl_altitude_m']}m ASL")
+        print(f"          Earth Orthometric Altitude: {elevation_profile['asl_altitude_m']}m ASL "
+              f"(Ground Terrain={elevation_profile.get('ground_terrain_asl_m', '--')}m ASL)")
 
     # -------------------------------------------------------------------------
     # Stage 3: Two-Tier Physics Inversion (FISTA + NeRFMap)

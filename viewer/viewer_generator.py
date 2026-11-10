@@ -570,6 +570,9 @@ def generate_interactive_html_viewer(
 
     // Helper: Automatic Floor & Elevation Offset (elevates survey plane above lower neighbor floors)
     function getSurveyElevOffset() {{
+      if (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.height_above_ground_m === 'number') {{
+        return Math.max(0.0, ELEVATION_PROFILE.height_above_ground_m);
+      }}
       if (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.ground_rel_z_m === 'number') {{
         return Math.max(0.0, -ELEVATION_PROFILE.ground_rel_z_m);
       }}
@@ -766,7 +769,7 @@ def generate_interactive_html_viewer(
       cameraTarget[0] = BBOX_CENTER.x;
       cameraTarget[1] = elevY + 1.0;
       cameraTarget[2] = BBOX_CENTER.y;
-      orbitRadius = Math.max(8.0, BBOX_SPAN * 1.5 + elevY * 0.6);
+      orbitRadius = Math.max(10.0, BBOX_SPAN * 1.45 + Math.min(10.0, elevY * 0.15));
       orbitTheta = Math.PI * 0.25;
       orbitPhi = Math.PI * 0.30;
       povYawOffset = 0.0;
@@ -1839,7 +1842,7 @@ def generate_interactive_html_viewer(
         const bMidX = (bMinX + bMaxX) / 2.0, bMidZ = (bMinZ + bMaxZ) / 2.0;
 
         const floorHeight = 3.0;
-        const numFloorsBelow = Math.round(elevY / floorHeight);
+        const numFloorsBelow = Math.min(80, Math.round(elevY / floorHeight));
         for (let fl = 0; fl < numFloorsBelow; fl++) {{
           const flY = fl * floorHeight;
           // Intermediate lower floor concrete slab
@@ -2411,10 +2414,12 @@ def generate_interactive_html_viewer(
 
       if (geoState.groundAslM !== null && geoState.hasRealAnchor) {{
         if (gAslEl) gAslEl.textContent = `${{geoState.groundAslM.toFixed(1)}}m ASL`;
-        const totalAsl = geoState.groundAslM + baseHeight;
+        const totalAsl = (ELEVATION_PROFILE && ELEVATION_PROFILE.asl_altitude_m)
+          ? ELEVATION_PROFILE.asl_altitude_m
+          : (geoState.groundAslM + baseHeight);
         if (tAslEl) tAslEl.textContent = `${{totalAsl.toFixed(1)}}m ASL (Floor ${{floorNum}})`;
       }} else if (ELEVATION_PROFILE && ELEVATION_PROFILE.asl_altitude_m) {{
-        if (gAslEl) gAslEl.textContent = `~${{(ELEVATION_PROFILE.asl_altitude_m - baseHeight).toFixed(1)}}m (Baro)`;
+        if (gAslEl) gAslEl.textContent = `~${{(ELEVATION_PROFILE.asl_altitude_m - baseHeight).toFixed(1)}}m`;
         if (tAslEl) tAslEl.textContent = `${{ELEVATION_PROFILE.asl_altitude_m.toFixed(1)}}m ASL (Floor ${{floorNum}})`;
       }} else {{
         if (gAslEl) gAslEl.textContent = geoState.hasRealAnchor ? 'Fetching Terrain...' : 'Waiting for Pin / UE GPS';
@@ -3018,10 +3023,10 @@ def generate_interactive_html_viewer(
       const baseHeight = (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.height_above_ground_m === 'number') ? ELEVATION_PROFILE.height_above_ground_m : 0.0;
 
       let aslTag = '';
-      if (geoState.groundAslM !== null) {{
-        aslTag = ` | ${{(geoState.groundAslM + baseHeight).toFixed(1)}}m ASL`;
-      }} else if (ELEVATION_PROFILE && ELEVATION_PROFILE.asl_altitude_m) {{
+      if (ELEVATION_PROFILE && typeof ELEVATION_PROFILE.asl_altitude_m === 'number') {{
         aslTag = ` | ${{ELEVATION_PROFILE.asl_altitude_m.toFixed(1)}}m ASL`;
+      }} else if (geoState.groundAslM !== null) {{
+        aslTag = ` | ${{(geoState.groundAslM + baseHeight).toFixed(1)}}m ASL`;
       }}
 
       floorEl.textContent = `Floor ${{baseFloor}} (+${{baseHeight.toFixed(1)}}m${{aslTag}})`;
@@ -3319,6 +3324,35 @@ def generate_interactive_html_viewer(
       targetPhonePos.speed = Number(activePose.speed_mps) || 0.0;
       if (activePose.device_id || activePose.device) {{
         targetPhonePos.device = activePose.device_id || activePose.device;
+      }}
+
+      if (typeof activePose.floor === 'number' && typeof activePose.height_above_ground_m === 'number') {{
+        const prevFloor = ELEVATION_PROFILE ? ELEVATION_PROFILE.estimated_floor_number : 1;
+        if (!ELEVATION_PROFILE) ELEVATION_PROFILE = {{}};
+        ELEVATION_PROFILE.estimated_floor_number = activePose.floor;
+        ELEVATION_PROFILE.height_above_ground_m = activePose.height_above_ground_m;
+        ELEVATION_PROFILE.ground_rel_z_m = -activePose.height_above_ground_m;
+        if (typeof activePose.asl_altitude_m === 'number') {{
+          ELEVATION_PROFILE.asl_altitude_m = activePose.asl_altitude_m;
+        }}
+        if (typeof activePose.ground_terrain_asl_m === 'number') {{
+          ELEVATION_PROFILE.ground_terrain_asl_m = activePose.ground_terrain_asl_m;
+          geoState.groundAslM = activePose.ground_terrain_asl_m;
+        }}
+        if (prevFloor !== activePose.floor) {{
+          const b = document.getElementById('elev-floor-badge');
+          if (b) b.textContent = `Floor ${{activePose.floor}}`;
+          const t = document.getElementById('elev-summary-text');
+          if (t) {{
+            const gAsl = (typeof activePose.ground_terrain_asl_m === 'number') ? ` | Ground ${{activePose.ground_terrain_asl_m.toFixed(1)}}m ASL` : '';
+            t.innerHTML = `Height: <strong style="color:#38bdf8;">+${{activePose.height_above_ground_m.toFixed(1)}}m Ground</strong>${{gAsl}}`;
+          }}
+          updateGeoElevationUI();
+          if (gl && (viewMode === '3D' || viewMode === 'POV')) {{
+            cameraTarget[1] = activePose.height_above_ground_m + 1.0;
+            rebuild3DScene();
+          }}
+        }}
       }}
 
       if (activePose.lat !== undefined && activePose.lon !== undefined &&

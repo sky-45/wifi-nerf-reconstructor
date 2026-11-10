@@ -722,7 +722,9 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         envelopes = [
             {"event_type": "batch_envelope", "lat": 37.7749, "lon": -122.4194, "gnss_accuracy_m": 8.0}
         ]
-        elev = estimate_automatic_building_elevation(localized_aps, events=events_with_gnss, envelopes=envelopes)
+        elev = estimate_automatic_building_elevation(
+            localized_aps, events=events_with_gnss, envelopes=envelopes, allow_dem_network=False
+        )
         self.assertEqual(elev["geo_source"], "ue_gnss")
         self.assertAlmostEqual(elev["lat"], 37.7749, delta=1e-4)
         self.assertAlmostEqual(elev["lon"], -122.4194, delta=1e-4)
@@ -777,6 +779,74 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         self.assertIn(str(elev["lat"]), html)
         self.assertIn(str(elev["lon"]), html)
         self.assertNotIn('<script src="http', html)
+
+    def test_29_egm96_geoid_and_high_rise_floor_elevation(self):
+        import gzip, json, tempfile
+        from reconstructor.geoid import egm96_undulation_m, wgs84_to_msl
+        from reconstructor.session_partitioner import estimate_automatic_building_elevation
+        from reconstructor.live_tracker import LiveBucketWatcher
+
+        # 1. Verify global NGA EGM96 geoid undulation signs & magnitudes
+        self.assertAlmostEqual(egm96_undulation_m(-12.08785, -77.02843), 23.1, delta=1.0)
+        self.assertAlmostEqual(egm96_undulation_m(7.0, 80.0), -96.8, delta=2.0)
+        self.assertAlmostEqual(egm96_undulation_m(65.0, -18.0), 67.3, delta=2.0)
+        self.assertAlmostEqual(wgs84_to_msl(-12.08785, -77.02843, 190.5), 167.4, delta=1.5)
+
+        # 2. Tall high-rise floor detection with RF=-2 lower bound + WGS84 GPS + Ground DEM
+        aps_multi = {
+            "ap_home": {"relative_floor": 0, "sample_count": 200, "confidence": 0.95},
+            "ap_below2": {"relative_floor": -2, "sample_count": 30, "confidence": 0.55},
+        }
+        high_rise_events = [
+            # Network fallback has tighter horizontal accuracy but quantized vertical altitude (must not override GPS vertical)
+            {"event_type": "gnss_location", "lat": -12.08785, "lon": -77.02843, "altitude_m": 180.7, "accuracy_m": 20.0, "provider": "network"},
+            {"event_type": "gnss_location", "lat": -12.08784, "lon": -77.02848, "altitude_m": 190.5, "accuracy_m": 41.0, "provider": "gps"},
+            {"event_type": "gnss_location", "lat": -12.08784, "lon": -77.02851, "altitude_m": 189.5, "accuracy_m": 50.9, "provider": "gps"},
+        ]
+        elev = estimate_automatic_building_elevation(
+            aps_multi, events=high_rise_events, ground_terrain_asl_m=122.0, allow_dem_network=False
+        )
+        self.assertEqual(elev["vertical_source"], "ue_gps_egm96")
+        self.assertGreaterEqual(elev["estimated_floor_number"], 14)
+        self.assertLessEqual(elev["estimated_floor_number"], 16)
+        self.assertGreater(elev["height_above_ground_m"], 40.0)
+        self.assertAlmostEqual(elev["ground_terrain_asl_m"], 122.0, delta=0.1)
+
+        # 3. Hardware NMEA / Android 14 MSL takes precedence over WGS84 conversion
+        msl_events = [
+            {"event_type": "gnss_location", "lat": -12.08784, "lon": -77.02848, "altitude_m": 190.5, "msl_altitude_m": 166.5, "accuracy_m": 25.0, "provider": "gps"}
+        ]
+        elev_msl = estimate_automatic_building_elevation(
+            aps_multi, events=msl_events, ground_terrain_asl_m=122.0, allow_dem_network=False
+        )
+        self.assertEqual(elev_msl["vertical_source"], "ue_nmea_msl")
+        self.assertAlmostEqual(elev_msl["gnss_msl_altitude_m"], 166.5, delta=0.2)
+        self.assertEqual(elev_msl["estimated_floor_number"], 15)
+
+        # 4. LiveBucketWatcher preserves GPS vertical altitude & caches DEM to resolve tall floor live
+        with tempfile.TemporaryDirectory() as tmpdir:
+            hf_dir = os.path.join(tmpdir, "fleet", "dev_tall", "tall_env", "hf")
+            out_dir = os.path.join(tmpdir, "out")
+            os.makedirs(hf_dir, exist_ok=True)
+            os.makedirs(out_dir, exist_ok=True)
+            with open(os.path.join(out_dir, "geo_dem_cache.json"), "w") as df:
+                json.dump({"-12.088,-77.028": 122.0}, df)
+
+            lines = [
+                json.dumps({"event_type": "gnss_location", "device_id": "dev_tall", "timestamp_ns": 1000, "lat": -12.08784, "lon": -77.02848, "altitude_m": 190.5, "accuracy_m": 41.0, "provider": "gps"}),
+                json.dumps({"event_type": "batch_envelope", "device_id": "dev_tall", "environment_id": "tall_env", "batch_seq": 1, "timestamp_ns": 2000, "lat": -12.08785, "lon": -77.02843, "gnss_altitude_m": 180.7, "gnss_accuracy_m": 20.0, "gnss_provider": "network"}),
+                json.dumps({"event_type": "mag_baro_pdr", "device_id": "dev_tall", "timestamp_ns": 3000, "pose": {"x": 2.0, "y": 3.0, "z": 0.0, "yaw": 0.0}}),
+            ]
+            with gzip.open(os.path.join(hf_dir, "batch_1.ndjson.gz"), "wb") as gf:
+                gf.write(("\n".join(lines) + "\n").encode("utf-8"))
+
+            watcher = LiveBucketWatcher(blob_uri=tmpdir, env_id="tall_env", output_dir=out_dir, auto_reconstruct=False)
+            watcher.poll_once()
+            latest = watcher.get_latest_pose("dev_tall")
+            self.assertIsNotNone(latest)
+            self.assertGreaterEqual(latest["floor"], 14)
+            self.assertLessEqual(latest["floor"], 16)
+            self.assertEqual(latest["vertical_source"], "ue_gps_egm96")
 
 if __name__ == "__main__":
     unittest.main()
