@@ -110,8 +110,11 @@ class UnlabeledEvaluator:
                     ap_info = aps.get(gid) or self._find_ap_for_probe(gid, aps)
                     if not ap_info:
                         continue
-                    d = max(0.4, math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"]))
-                    fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d)
+                    d_2d = math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"])
+                    dz = float(ap_info.get("z_m", 0.0))
+                    d = max(0.4, math.hypot(d_2d, dz))
+                    slab_loss = float(ap_info.get("floor_loss_db", 0.0))
+                    fs_loss = ap_info["p0_dbm"] - slab_loss - 20.0 * math.log10(d)
                     excess = max(0.0, fs_loss - float(scan.get("rssi_dbm", -70)))
                     y_true = (excess >= 3.0)
                     y_pred = self._ray_intersects_any_wall(ap_info["x"], ap_info["y"], rx_x, rx_y, walls)
@@ -130,8 +133,11 @@ class UnlabeledEvaluator:
                 bssid = ev.get("bssid", "")
                 ap_info = self._find_ap_for_probe(bssid, aps)
                 if ap_info:
-                    d = max(0.4, math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"]))
-                    fs_loss = ap_info["p0_dbm"] - 20.0 * math.log10(d)
+                    d_2d = math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"])
+                    dz = float(ap_info.get("z_m", 0.0))
+                    d = max(0.4, math.hypot(d_2d, dz))
+                    slab_loss = float(ap_info.get("floor_loss_db", 0.0))
+                    fs_loss = ap_info["p0_dbm"] - slab_loss - 20.0 * math.log10(d)
                     excess = max(0.0, fs_loss - float(ev.get("rssi_dbm", -70)))
                     y_true = (excess >= 3.0)
                     y_pred = self._ray_intersects_any_wall(ap_info["x"], ap_info["y"], rx_x, rx_y, walls)
@@ -228,14 +234,17 @@ class UnlabeledEvaluator:
                     if not ap_info:
                         continue
 
-                    d = max(0.4, math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"]))
+                    d_2d = math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"])
+                    dz = float(ap_info.get("z_m", 0.0))
+                    d = max(0.4, math.hypot(d_2d, dz))
+                    slab_loss = float(ap_info.get("floor_loss_db", 0.0))
                     num_walls = 0
                     for w in walls:
                         if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"]):
                             num_walls += 1
 
-                    # Forward RSSI prediction using map
-                    pred_rssi = ap_info["p0_dbm"] - 20.0 * math.log10(d) - (num_walls * wall_attenuation_db)
+                    # Forward RSSI prediction using map with 3D slab compensation
+                    pred_rssi = ap_info["p0_dbm"] - slab_loss - 20.0 * math.log10(d) - (num_walls * wall_attenuation_db)
                     err = abs(pred_rssi - float(scan.get("rssi_dbm", -70)))
                     errors.append(err)
 
@@ -243,13 +252,16 @@ class UnlabeledEvaluator:
                 bssid = ev.get("bssid", "")
                 ap_info = self._find_ap_for_probe(bssid, aps)
                 if ap_info:
-                    d = max(0.4, math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"]))
+                    d_2d = math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"])
+                    dz = float(ap_info.get("z_m", 0.0))
+                    d = max(0.4, math.hypot(d_2d, dz))
+                    slab_loss = float(ap_info.get("floor_loss_db", 0.0))
                     num_walls = 0
                     for w in walls:
                         if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"]):
                             num_walls += 1
 
-                    pred_rssi = ap_info["p0_dbm"] - 20.0 * math.log10(d) - (num_walls * wall_attenuation_db)
+                    pred_rssi = ap_info["p0_dbm"] - slab_loss - 20.0 * math.log10(d) - (num_walls * wall_attenuation_db)
                     err = abs(pred_rssi - float(ev.get("rssi_dbm", -70)))
                     errors.append(err)
 
