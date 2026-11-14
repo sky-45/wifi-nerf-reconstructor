@@ -21,28 +21,7 @@ _ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT_DIR not in sys.path:
     sys.path.insert(0, _ROOT_DIR)
 
-def load_env(env_path: str = ".env"):
-    """Reads a local .env file if present and populates os.environ."""
-    candidates = [
-        env_path,
-        os.path.join(_ROOT_DIR, ".env"),
-        os.path.join(os.getcwd(), ".env")
-    ]
-    for path in candidates:
-        if os.path.isfile(path):
-            try:
-                with open(path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#") and "=" in line:
-                            k, v = line.split("=", 1)
-                            k = k.strip()
-                            v = v.strip().strip("'\"")
-                            if k and k not in os.environ:
-                                os.environ[k] = v
-                break
-            except Exception:
-                pass
+from reconstructor.env_utils import load_env
 
 load_env()
 

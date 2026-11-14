@@ -116,19 +116,23 @@ class WebServerState:
             if self.watcher:
                 self.watcher.set_poll_interval(interval_s)
 
-    def trigger_reconstruction(self, env_id: str):
-        """Executes full floorplan pipeline reconstruction in a background worker thread."""
+    def trigger_reconstruction(self, env_id: str, rebuild_index: bool = False):
+        """Executes full 3D environment reconstruction in a background worker thread."""
         def worker():
             with self.lock:
                 self.is_reconstructing = True
-                self.reconstruct_status = f"Reconstructing '{env_id}'..."
+                self.reconstruct_status = (
+                    f"Reloading bucket & reconstructing '{env_id}'..."
+                    if rebuild_index else f"Reconstructing '{env_id}'..."
+                )
             try:
                 from reconstructor.pipeline import run_pipeline
                 run_pipeline(
                     blob_uri=self.blob_uri,
                     target_id=env_id,
                     output_dir=self.output_dir,
-                    clean=True
+                    clean=True,
+                    rebuild_index=rebuild_index,
                 )
                 with self.lock:
                     self.reconstruct_status = f"Reconstruction of '{env_id}' complete!"
@@ -173,6 +177,16 @@ def make_request_handler(state: WebServerState):
                 self._handle_api_live_pose(query)
             elif parsed.path == "/api/status":
                 self._handle_api_status()
+            elif parsed.path.startswith("/static/"):
+                static_root = os.path.realpath(
+                    os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "viewer", "static")
+                )
+                rel = parsed.path[len("/static/"):].lstrip("/")
+                fpath = os.path.realpath(os.path.join(static_root, rel))
+                if fpath.startswith(static_root) and os.path.isfile(fpath):
+                    self._serve_static_file(fpath)
+                else:
+                    self.send_error(404, "Static asset not found")
             else:
                 # Check static file in output_dir
                 rel_path = parsed.path.lstrip("/")
@@ -196,47 +210,36 @@ def make_request_handler(state: WebServerState):
                 self._handle_post_settings(body)
             elif parsed.path == "/api/reconstruct":
                 self._handle_post_reconstruct(body, urllib.parse.parse_qs(parsed.query))
+            elif parsed.path == "/api/reload":
+                body["rebuild_index"] = True
+                self._handle_post_reconstruct(body, urllib.parse.parse_qs(parsed.query))
             elif parsed.path == "/api/geo-anchor":
                 self._handle_post_geo_anchor(body)
             else:
                 self.send_error(404, "Endpoint not found")
 
         def _handle_serve_viewer(self, query: Dict[str, list]):
-            env_id = query.get("env", [state.active_env])[0]
+            static_index = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "viewer", "static", "index.html"
+            )
+            if os.path.isfile(static_index):
+                self._serve_static_file(static_index, content_type="text/html; charset=utf-8")
+                return
+
+            env_id = query.get("env_id", query.get("env", [state.active_env]))[0]
             viewer_file = os.path.join(state.output_dir, f"viewer_{env_id}.html")
-
-            # Fallback candidates
-            if not os.path.isfile(viewer_file):
-                for fname in os.listdir(state.output_dir) if os.path.isdir(state.output_dir) else []:
-                    if fname.startswith("viewer_") and fname.endswith(".html"):
-                        viewer_file = os.path.join(state.output_dir, fname)
-                        break
-
             if os.path.isfile(viewer_file):
                 self._serve_static_file(viewer_file, content_type="text/html; charset=utf-8")
             else:
-                # Floorplan not generated yet, generate minimal interactive dashboard
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self._send_cors_headers()
-                self.end_headers()
-                html = (
-                    f"<html><head><title>Wi-Fi NeRF</title></head><body style='background:#0a192f;color:#fff;font-family:sans-serif;padding:30px;'>"
-                    f"<h2>Wi-Fi NeRF Reconstructor</h2>"
-                    f"<p>No viewer compiled yet for environment <code>{env_id}</code>.</p>"
-                    f"<p>Triggering automatic reconstruction in progress...</p>"
-                    f"<script>setTimeout(() => location.reload(), 3000);</script>"
-                    f"</body></html>"
-                )
-                self.wfile.write(html.encode("utf-8"))
-                state.trigger_reconstruction(env_id)
+                self.send_error(404, "Viewer not found")
 
         def _handle_api_environments(self):
             data = state.get_environments_summary()
             self._send_json(data)
 
         def _handle_api_floorplan(self, query: Dict[str, list]):
-            env_id = query.get("env", [state.active_env])[0]
+            env_id = query.get("env_id", query.get("env", [state.active_env]))[0]
             manifest_path = os.path.join(state.output_dir, f"floorplan_{env_id}.json")
             if not os.path.exists(manifest_path):
                 # Check for cluster prefix
@@ -272,8 +275,8 @@ def make_request_handler(state: WebServerState):
                 self.send_error(404, f"Floorplan not found for environment '{env_id}'")
 
         def _handle_api_live_pose(self, query: Dict[str, list]):
-            env_id = query.get("env", [state.active_env])[0]
-            device_id = query.get("device", [None])[0]
+            env_id = query.get("env_id", query.get("env", [state.active_env]))[0]
+            device_id = query.get("device_id", query.get("device", [None]))[0]
             if state.watcher:
                 pose = state.watcher.get_latest_pose(device_id=device_id)
             else:
@@ -326,11 +329,13 @@ def make_request_handler(state: WebServerState):
 
         def _handle_post_reconstruct(self, body: Dict[str, Any], query: Dict[str, list]):
             env_id = body.get("env_id") or query.get("env", [state.active_env])[0]
-            state.trigger_reconstruction(env_id)
+            rebuild_index = bool(body.get("rebuild_index", False))
+            state.trigger_reconstruction(env_id, rebuild_index=rebuild_index)
             self._send_json({
                 "success": True,
                 "message": f"Reconstruction initiated for '{env_id}'",
-                "env_id": env_id
+                "env_id": env_id,
+                "rebuild_index": rebuild_index,
             })
 
         def _handle_post_geo_anchor(self, body: Dict[str, Any]):

@@ -5,6 +5,7 @@ and uses RTT NLoS reflections to detect mirror-image specular wall boundaries.
 """
 
 import math
+import zlib
 from typing import Dict, Any, List, Tuple, Optional
 import numpy as np
 
@@ -50,14 +51,18 @@ class MultiApLocalizer:
                 bssid_to_gid[b_key] = stem_to_gid[stem]
 
         # Group measurements by physical AP Group or BSSID
-        ap_obs: Dict[str, List[Tuple[float, float, float, str, int]]] = {}
+        # Each tuple: (px, py, rssi, bssid, freq_mhz, pz)
+        ap_obs: Dict[str, List[Tuple[float, float, float, str, int, float]]] = {}
         ap_bssids: Dict[str, set] = {}
+        z_vals: List[float] = []
 
         for ev in events:
             pose = ev.get("pose")
             if not pose:
                 continue
             px, py = pose["x"], pose["y"]
+            pz = float(pose.get("z", 0.0))
+            z_vals.append(pz)
             ev_type = ev.get("event_type") or ev.get("type")
 
             if ev_type == "wifi_scan_batch":
@@ -66,7 +71,7 @@ class MultiApLocalizer:
                     stem = self._extract_hardware_stem(bssid)
                     gid = stem_to_gid.get(stem) or bssid_to_gid.get(bssid.lower()) or s.get("ap_group_id", bssid)
                     rssi = float(s["rssi_dbm"])
-                    ap_obs.setdefault(gid, []).append((px, py, rssi, bssid, s["freq_mhz"]))
+                    ap_obs.setdefault(gid, []).append((px, py, rssi, bssid, s["freq_mhz"], pz))
                     ap_bssids.setdefault(gid, set()).add(bssid.lower())
             elif ev_type == "connected_probe":
                 bssid = ev.get("bssid", "")
@@ -80,7 +85,7 @@ class MultiApLocalizer:
                     )
                     rssi = float(ev.get("rssi_dbm", -70))
                     freq = int(ev.get("freq_mhz", 5180))
-                    ap_obs.setdefault(gid, []).append((px, py, rssi, bssid, freq))
+                    ap_obs.setdefault(gid, []).append((px, py, rssi, bssid, freq, pz))
                     ap_bssids.setdefault(gid, set()).add(bssid.lower())
 
         if not ap_obs:
@@ -109,10 +114,12 @@ class MultiApLocalizer:
             total_w = sum(weights)
             init_x = sum(item[0] * w for item, w in zip(los_candidates, weights)) / total_w
             init_y = sum(item[1] * w for item, w in zip(los_candidates, weights)) / total_w
+            sample_bssid = next(iter(ap_bssids.get(gid, {gid})))
+            hw_stem = self._extract_hardware_stem(sample_bssid)
 
             # 3D Multi-Floor Variable-Projection Solver:
             # Jointly solves (x, y, z_floor, Peff) with concrete slab loss FAF
-            fit_res = self._fit_ap_position_3d(los_candidates, init_x, init_y)
+            fit_res = self._fit_ap_position_3d(los_candidates, init_x, init_y, stem=hw_stem)
 
             # Compute band-specific reference P0 (2.4 GHz vs 5 GHz) at the solved 3D position
             ap_x, ap_y, ap_z = fit_res["x"], fit_res["y"], fit_res["z_m"]
@@ -120,23 +127,26 @@ class MultiApLocalizer:
             obs_24 = sorted([it for it in obs if it[4] < 3000], key=lambda x: x[2], reverse=True)
             obs_5 = sorted([it for it in obs if it[4] >= 4900], key=lambda x: x[2], reverse=True)
 
-            def _band_p0(band_obs: List[Tuple[float, float, float, str, int]], default_p0: float) -> float:
+            def _band_p0(band_obs: List[Tuple[Any, ...]], default_p0: float) -> float:
                 if not band_obs:
                     return default_p0
                 top_k = band_obs[:max(1, int(math.ceil(len(band_obs) * 0.55)))]
                 vals = []
-                for bx, by, brssi, _, _ in top_k:
-                    d3 = math.sqrt((bx - ap_x) ** 2 + (by - ap_y) ** 2 + ap_z ** 2 + 0.25)
-                    vals.append(brssi + slab_loss + 20.0 * math.log10(d3))
+                for item in top_k:
+                    bx, by, brssi = item[0], item[1], item[2]
+                    bz = float(item[5]) if len(item) >= 6 else 0.0
+                    s_steps = int(round(abs(ap_z - bz) / 3.0))
+                    s_loss = 0.0 if s_steps <= 0 else (18.0 + 10.0 * (s_steps - 1))
+                    d3 = math.sqrt((bx - ap_x) ** 2 + (by - ap_y) ** 2 + (ap_z - bz) ** 2 + 0.25)
+                    vals.append(brssi + s_loss + 20.0 * math.log10(d3))
                 raw_b_p0 = float(np.median(vals))
-                return round(max(-46.0, min(-34.0, raw_b_p0)), 1)
+                return round(max(-46.0, min(-15.0, raw_b_p0)), 1)
 
             p0_24_dbm = _band_p0(obs_24, fit_res["p0_dbm"])
             p0_5_dbm = _band_p0(obs_5, fit_res["p0_dbm"])
 
             # Classify as internal (inside mapped rooms) vs external neighbor
             is_internal = (max_rssi > -62.0) and fit_res["is_same_floor"]
-            sample_bssid = next(iter(ap_bssids.get(gid, {gid})))
 
             # Calculate continuous spatial confidence score [0.10, 1.0]
             # Accounts for observation count, peak RSSI proximity, path-loss fit RMSE,
@@ -153,11 +163,44 @@ class MultiApLocalizer:
                 (0.35 * count_factor + 0.45 * rssi_factor + 0.20 * fit_factor)
                 * extrap_factor * floor_factor * band_boost
             )
-            ap_conf = round(max(0.10, min(1.0, raw_conf)), 2)
+
+            # Observability & spatial conditioning across observer positions
+            pts = np.array([[item[0], item[1]] for item in obs], dtype=np.float64)
+            if len(pts) >= 3:
+                p_cov = np.cov(pts.T)
+                p_eigs = np.linalg.eigvalsh(p_cov)
+                rx_minor_std = math.sqrt(max(0.0, float(p_eigs[0])))
+                rx_major_std = math.sqrt(max(0.0, float(p_eigs[1])))
+            else:
+                rx_minor_std, rx_major_std = 0.0, 0.0
+
+            if fit_res.get("is_radial_uncertain"):
+                obs_mode = "camping_radial"
+                conf_cap = 0.45
+            elif rx_minor_std >= 0.7 and rx_major_std >= 1.2:
+                obs_mode = "pinned_2d"
+                conf_cap = 0.98
+            elif rx_major_std >= 0.8:
+                obs_mode = "sector_constrained"
+                conf_cap = 0.82 if (is_internal and bool(obs_24 and obs_5)) else 0.72
+            elif is_internal and bool(obs_24 and obs_5) and len(obs) >= 50:
+                obs_mode = "sector_constrained"
+                conf_cap = 0.78
+            else:
+                obs_mode = "camping_radial"
+                conf_cap = 0.45
+
+            ap_conf = round(max(0.10, min(conf_cap, raw_conf)), 2)
+            z_obs_span = (max(z_vals) - min(z_vals)) if z_vals else 0.0
+            cx_rx = float(np.mean(pts[:, 0]))
+            cy_rx = float(np.mean(pts[:, 1]))
+            az_deg = round(math.degrees(math.atan2(fit_res["y"] - cy_rx, fit_res["x"] - cx_rx)) % 360.0, 1)
+            range_m = round(math.hypot(fit_res["x"] - cx_rx, fit_res["y"] - cy_rx), 2)
+            v_ambig = bool(fit_res.get("vertical_ambiguous", (not fit_res["is_same_floor"]) and (z_obs_span < 1.2)))
 
             results[gid] = {
                 "ap_group_id": gid,
-                "hardware_stem": self._extract_hardware_stem(sample_bssid),
+                "hardware_stem": hw_stem,
                 "member_bssids": sorted(list(ap_bssids.get(gid, set()))),
                 "is_dual_band": bool(obs_24 and obs_5),
                 "p0_24_dbm": p0_24_dbm,
@@ -167,13 +210,25 @@ class MultiApLocalizer:
                 "z_m": fit_res["z_m"],
                 "relative_floor": fit_res["relative_floor"],
                 "is_same_floor": fit_res["is_same_floor"],
+                "floor_ambiguous": bool((not fit_res["is_same_floor"]) and (v_ambig or z_obs_span < 1.2)),
+                "vertical_ambiguous": v_ambig,
+                "alt_relative_floor": int(fit_res.get("alt_relative_floor", -fit_res["relative_floor"] if v_ambig else fit_res["relative_floor"])),
+                "alt_z_m": float(fit_res.get("alt_z_m", -fit_res["z_m"] if v_ambig else fit_res["z_m"])),
+                "vertical_uncertainty_m": float(fit_res.get("vertical_uncertainty_m", abs(fit_res["z_m"]) if v_ambig else 0.0)),
                 "floor_loss_db": fit_res["floor_loss_db"],
                 "p0_dbm": fit_res["p0_dbm"],
                 "effective_p0_dbm": fit_res["effective_p0_dbm"],
                 "max_rssi": max_rssi,
                 "is_internal": is_internal,
                 "sample_count": len(obs),
-                "confidence": ap_conf
+                "confidence": ap_conf,
+                "observability": obs_mode,
+                "is_radial_uncertain": bool(fit_res.get("is_radial_uncertain", obs_mode == "camping_radial")),
+                "uncertainty_radius_m": fit_res.get("uncertainty_radius_m", range_m if obs_mode == "camping_radial" else round(max(0.5, 2.5 * (1.0 - ap_conf)), 2)),
+                "anchor_x": round(cx_rx, 2),
+                "anchor_y": round(cy_rx, 2),
+                "azimuth_deg": az_deg,
+                "range_m": range_m,
             }
 
         return results
@@ -221,11 +276,14 @@ class MultiApLocalizer:
         self,
         obs: List[Tuple[float, float, float, str, int]],
         init_x: float,
-        init_y: float
+        init_y: float,
+        stem: str = "",
     ) -> Dict[str, Any]:
         """
         Fits 3D AP position (x, y, z_m, relative_floor) using physically bounded Variable Projection
         and IEEE 802.11 TGn concrete floor-slab attenuation modeling.
+        Handles stationary/camping UEs cleanly by resolving RSSI-based 3D radial ring + floor slab
+        without stacking all neighbor APs on top of the UE centroid.
         """
         weights = np.array([10.0 ** (item[2] / 20.0) for item in obs], dtype=np.float64)
         sum_w = float(np.sum(weights))
@@ -236,7 +294,11 @@ class MultiApLocalizer:
         px_arr = np.array([item[0] for item in obs], dtype=np.float64)
         py_arr = np.array([item[1] for item in obs], dtype=np.float64)
         rssi_arr = np.array([item[2] for item in obs], dtype=np.float64)
+        pz_arr = np.array([float(item[5]) if len(item) >= 6 else 0.0 for item in obs], dtype=np.float64)
+        z_obs_span = float(np.ptp(pz_arr)) if len(pz_arr) > 0 else 0.0
+        pz_med = float(np.median(pz_arr)) if len(pz_arr) > 0 else 0.0
         max_rssi = float(np.max(rssi_arr))
+        med_rssi = float(np.median(rssi_arr))
 
         # Compute empirical RSSI gradient direction across the walk to break symmetry for weak external APs
         mean_x = float(np.sum(weights * px_arr) / sum_w)
@@ -246,59 +308,84 @@ class MultiApLocalizer:
         gy = float(np.sum(weights * (rssi_arr - mean_r) * (py_arr - mean_y)) / sum_w)
         g_norm = math.hypot(gx, gy)
         ux, uy = (gx / g_norm, gy / g_norm) if g_norm > 1e-3 else (0.0, 0.0)
+        spread_m = math.hypot(float(np.std(px_arr)), float(np.std(py_arr)))
+        is_near_dense_same_floor = (max_rssi > -52.0) and (len(obs) >= 60)
+        is_camping_stationary = (spread_m < 0.25) or (
+            (spread_m < 0.8) and (g_norm <= 0.05) and (not is_near_dense_same_floor)
+        )
 
-        candidate_floors = [0] if max_rssi > -52.0 else [0, -1, 1, -2, 2]
+        candidate_floors = [0] if (max_rssi > -52.0 and z_obs_span < 1.2) else [0, -1, 1, -2, 2]
 
         best_candidate = None
         min_total_cost = 1e9
+        cost_by_floor: Dict[int, float] = {}
 
         for rel_floor in candidate_floors:
             z_m = rel_floor * 3.0
+            dz_arr = z_m - pz_arr
+            slab_steps_arr = np.round(np.abs(dz_arr) / 3.0)
+            sample_slab_db = np.where(slab_steps_arr <= 0, 0.0, 18.0 + 10.0 * (slab_steps_arr - 1.0))
+
             slab_loss_db = 0.0 if rel_floor == 0 else (18.0 + 10.0 * (abs(rel_floor) - 1))
-            expected_peff = -40.0 - slab_loss_db
+            p0_lower, p0_upper = -44.5, -35.5
+            if rel_floor == 0 and max_rssi > -45.0:
+                p0_upper = max(p0_upper, min(-15.0, max_rssi + 2.0))
 
-            # Nudge initial guess slightly along RSSI gradient for weak signals so gradient doesn't vanish at centroid
-            nudge_m = 0.0 if max_rssi > -68.0 else min(3.5, max(0.5, (-68.0 - max_rssi) * 0.20))
-            x = init_x + ux * nudge_m
-            y = init_y + uy * nudge_m
-            lr = 0.08
+            d_est_3d = 10.0 ** (max(0.0, (-40.0 - slab_loss_db) - med_rssi) / 20.0)
+            r_horiz_est = max(0.8, min(8.5, math.sqrt(max(0.25, d_est_3d ** 2 - (z_m - pz_med) ** 2))))
 
-            for _ in range(45):
-                d_sq = (px_arr - x) ** 2 + (py_arr - y) ** 2 + z_m ** 2 + 0.25
-                d = np.sqrt(d_sq)
-                log_d = np.log10(d)
+            if is_camping_stationary:
+                # Azimuth is unobservable from one point: place AP on its RSSI horizontal range ring
+                # using a deterministic bearing from hardware_stem (keeps 2.4/5 GHz co-located).
+                h = zlib.crc32((stem or f"{med_rssi:.1f}").encode("utf-8"))
+                theta = (h % 3600) * (2.0 * math.pi / 3600.0)
+                x = init_x + r_horiz_est * math.cos(theta)
+                y = init_y + r_horiz_est * math.sin(theta)
+            else:
+                nudge_m = 0.0 if max_rssi > -68.0 else min(3.5, max(0.5, (-68.0 - max_rssi) * 0.20))
+                x = init_x + ux * nudge_m
+                y = init_y + uy * nudge_m
+                max_offset = 12.0 if spread_m >= 1.5 else max(4.0, min(9.5, r_horiz_est * 1.35))
+                lr = 0.08
 
-                raw_peff = float(np.sum(weights * (rssi_arr + 20.0 * log_d)) / sum_w)
-                # Constrain effective P0 to physical router transmit power on this floor (±4.5 dB)
-                p_eff = max(expected_peff - 4.5, min(expected_peff + 4.5, raw_peff))
+                for _ in range(45):
+                    d_sq = (px_arr - x) ** 2 + (py_arr - y) ** 2 + dz_arr ** 2 + 0.25
+                    d = np.sqrt(d_sq)
+                    log_d = np.log10(d)
 
-                pred_rssi = p_eff - 20.0 * log_d
-                err = pred_rssi - rssi_arr
+                    raw_p0 = float(np.sum(weights * (rssi_arr + sample_slab_db + 20.0 * log_d)) / sum_w)
+                    p0_val = max(p0_lower, min(p0_upper, raw_p0))
 
-                grad_factor = (-20.0 / (d_sq * math.log(10))) * err * weights
-                grad_x = float(np.sum(grad_factor * (-(px_arr - x))) / sum_w)
-                grad_y = float(np.sum(grad_factor * (-(py_arr - y))) / sum_w)
+                    pred_rssi = (p0_val - sample_slab_db) - 20.0 * log_d
+                    err = pred_rssi - rssi_arr
 
-                x -= lr * grad_x
-                y -= lr * grad_y
+                    grad_factor = (-20.0 / (d_sq * math.log(10))) * err * weights
+                    grad_x = float(np.sum(grad_factor * (-(px_arr - x))) / sum_w)
+                    grad_y = float(np.sum(grad_factor * (-(py_arr - y))) / sum_w)
 
-                offset = math.hypot(x - init_x, y - init_y)
-                if offset > 12.0:
-                    x = init_x + (x - init_x) * (12.0 / offset)
-                    y = init_y + (y - init_y) * (12.0 / offset)
+                    x -= lr * grad_x
+                    y -= lr * grad_y
 
-            # Evaluate fit
-            d_sq = (px_arr - x) ** 2 + (py_arr - y) ** 2 + z_m ** 2 + 0.25
+                    offset = math.hypot(x - init_x, y - init_y)
+                    if offset > max_offset:
+                        x = init_x + (x - init_x) * (max_offset / offset)
+                        y = init_y + (y - init_y) * (max_offset / offset)
+
+            # Evaluate fit using exact per-sample 3D distance (dz = z_m - pz) and floor slab attenuation
+            d_sq = (px_arr - x) ** 2 + (py_arr - y) ** 2 + dz_arr ** 2 + 0.25
             d = np.sqrt(d_sq)
             log_d = np.log10(d)
-            raw_peff = float(np.sum(weights * (rssi_arr + 20.0 * log_d)) / sum_w)
-            p_eff = max(expected_peff - 5.0, min(expected_peff + 5.0, raw_peff))
-            pred_rssi = p_eff - 20.0 * log_d
+            intrinsic_p0 = float(np.sum(weights * (rssi_arr + sample_slab_db + 20.0 * log_d)) / sum_w)
+            p0_val = max(p0_lower - 0.5, min(p0_upper + 0.5, intrinsic_p0))
+            pred_rssi = (p0_val - sample_slab_db) - 20.0 * log_d
             rmse = math.sqrt(float(np.sum(weights * (pred_rssi - rssi_arr) ** 2) / sum_w))
 
-            intrinsic_p0 = raw_peff + slab_loss_db
             p0_penalty = 0.18 * max(0.0, abs(intrinsic_p0 - (-40.0)) - 4.5) ** 2
+            if rel_floor == 0 and max_rssi > -45.0:
+                p0_penalty = 0.0
             total_cost = rmse + p0_penalty
+            cost_by_floor[int(rel_floor)] = total_cost
+            p_eff = p0_val - slab_loss_db
 
             if total_cost < min_total_cost:
                 min_total_cost = total_cost
@@ -309,15 +396,32 @@ class MultiApLocalizer:
                     "relative_floor": int(rel_floor),
                     "is_same_floor": bool(rel_floor == 0),
                     "floor_loss_db": round(float(slab_loss_db), 1),
-                    "p0_dbm": round(float(p_eff + slab_loss_db), 1),
+                    "p0_dbm": round(float(p0_val), 1),
                     "effective_p0_dbm": round(float(p_eff), 1),
-                    "rmse_db": round(float(rmse), 2)
+                    "rmse_db": round(float(rmse), 2),
+                    "is_radial_uncertain": bool(is_camping_stationary),
+                    "uncertainty_radius_m": round(float(r_horiz_est), 2),
                 }
+
+        if best_candidate:
+            rf = best_candidate["relative_floor"]
+            opp = -rf
+            v_ambig = bool(
+                rf != 0
+                and opp in cost_by_floor
+                and abs(cost_by_floor[opp] - cost_by_floor[rf]) < 0.05
+                and z_obs_span < 1.2
+            )
+            best_candidate["vertical_ambiguous"] = v_ambig
+            best_candidate["alt_relative_floor"] = int(opp) if v_ambig else int(rf)
+            best_candidate["alt_z_m"] = round(float(opp * 3.0), 1) if v_ambig else best_candidate["z_m"]
+            best_candidate["vertical_uncertainty_m"] = round(abs(best_candidate["z_m"]), 1) if v_ambig else 0.0
 
         return best_candidate or {
             "x": round(init_x, 3), "y": round(init_y, 3), "z_m": 0.0,
             "relative_floor": 0, "is_same_floor": True, "floor_loss_db": 0.0,
-            "p0_dbm": -40.0, "effective_p0_dbm": -40.0, "rmse_db": 0.0
+            "p0_dbm": -40.0, "effective_p0_dbm": -40.0, "rmse_db": 0.0,
+            "vertical_ambiguous": False, "alt_relative_floor": 0, "alt_z_m": 0.0, "vertical_uncertainty_m": 0.0,
         }
 
     def _fit_ap_position(self, obs: List[Tuple[float, float, float, str, int]], init_x: float, init_y: float) -> Tuple[float, float, float]:

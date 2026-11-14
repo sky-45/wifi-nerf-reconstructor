@@ -175,44 +175,44 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         self.assertEqual(evs[0]["event_type"], "connected_probe")
 
     def test_11_gpu_and_cpu_nerfmap_parity(self):
+        from reconstructor.nerfmap_engine import Volumetric3DEngine
         # 1. CPU / NumPy execution path
-        engine_cpu = NeRFMapEngine(room_width_m=8.0, room_height_m=6.0, resolution_m=0.25, device="cpu")
+        engine_cpu = Volumetric3DEngine(room_width_m=8.0, room_height_m=6.0, resolution_m=0.25, device="cpu")
         self.assertFalse(engine_cpu.using_cuda)
 
-        ray_data = [(2.0, 3.0, 6.0, 3.0, 5.0), (1.0, 1.0, 7.0, 5.0, 7.5)]
+        ray_data_3d = [
+            (2.0, 3.0, 1.5, 6.0, 3.0, 1.2, 6.5),
+            (1.0, 1.0, 1.5, 7.0, 5.0, 1.2, 9.0),
+        ]
         free_mask = np.zeros((engine_cpu.ny, engine_cpu.nx), dtype=bool)
 
-        cpu_tomo = engine_cpu.run_tier3a_fista_tomography(ray_data, free_mask, iterations=10, l1_reg=0.001, tv_reg=0.01)
-        self.assertEqual(cpu_tomo.shape, (engine_cpu.ny, engine_cpu.nx))
-        self.assertTrue(np.all(cpu_tomo >= 0.0) and np.all(cpu_tomo <= 18.0))
-
-        cpu_grid = engine_cpu.run_tier3b_nerfmap_refinement(ray_data, free_mask, epochs=20, fourier_bands=8, hidden_dim=32)
+        cpu_grid = engine_cpu.run_3d_tomography(ray_data_3d, free_mask, iterations=15)
         self.assertEqual(cpu_grid.shape, (engine_cpu.ny, engine_cpu.nx))
+        self.assertEqual(engine_cpu.grid_3d.shape, (engine_cpu.nz, engine_cpu.ny, engine_cpu.nx))
+        self.assertTrue(np.all(cpu_grid >= 0.0) and np.all(cpu_grid <= 18.0))
+        self.assertGreater(float(np.max(engine_cpu.grid_3d)), 0.5)
 
         # 2. PyTorch CUDA execution path
         import torch
         if torch.cuda.is_available():
-            engine_gpu = NeRFMapEngine(room_width_m=8.0, room_height_m=6.0, resolution_m=0.25, device="cuda:0")
+            engine_gpu = Volumetric3DEngine(room_width_m=8.0, room_height_m=6.0, resolution_m=0.25, device="cuda:0")
             self.assertTrue(engine_gpu.using_cuda)
-            gpu_tomo = engine_gpu.run_tier3a_fista_tomography(ray_data, free_mask, iterations=10, l1_reg=0.001, tv_reg=0.01)
-            self.assertEqual(gpu_tomo.shape, (engine_gpu.ny, engine_gpu.nx))
-            self.assertTrue(np.all(gpu_tomo >= 0.0) and np.all(gpu_tomo <= 18.0))
-
-            gpu_grid = engine_gpu.run_tier3b_nerfmap_refinement(ray_data, free_mask, epochs=20, fourier_bands=8, hidden_dim=32)
+            gpu_grid = engine_gpu.run_3d_tomography(ray_data_3d, free_mask, iterations=15)
             self.assertEqual(gpu_grid.shape, (engine_gpu.ny, engine_gpu.nx))
+            self.assertEqual(engine_gpu.grid_3d.shape, (engine_gpu.nz, engine_gpu.ny, engine_gpu.nx))
             self.assertTrue(np.all(gpu_grid >= 0.0) and np.all(gpu_grid <= 18.0))
+            self.assertGreater(float(np.max(engine_gpu.grid_3d)), 0.5)
 
     def test_12_reconstructor_config_persistence(self):
         cfg = get_default_config()
         self.assertIsInstance(cfg, ReconstructorConfig)
-        self.assertEqual(cfg.fourier_bands, 8)
-        self.assertEqual(cfg.free_space_radius_m, 0.35)
-        self.assertEqual(cfg.fista_l1_reg, 0.001)
-        self.assertEqual(cfg.fista_tv_reg, 0.01)
-        self.assertEqual(cfg.wall_threshold_percentile, 60.0)
+        self.assertEqual(cfg.z_resolution_m, 0.50)
+        self.assertEqual(cfg.free_space_radius_m, 0.45)
+        self.assertEqual(cfg.wall_threshold_db_m, 1.8)
+        self.assertEqual(cfg.fista_step_size, 0.35)
 
         # Verify pipeline accepts and executes with custom config instance
-        custom_cfg = ReconstructorConfig(fourier_bands=6, free_space_radius_m=0.40)
+        custom_cfg = ReconstructorConfig(resolution_m=0.25, free_space_radius_m=0.40)
         res = run_reconstruction_pipeline(
             blob_uri=self.demo_dir,
             session_id=self.session_id,
@@ -224,14 +224,7 @@ class TestWifiNerfReconstructor(unittest.TestCase):
 
     def test_13_advanced_ml_models_and_clustering(self):
         from reconstructor.session_partitioner import SessionPartitioner
-        from reconstructor.nerfmap_engine import (
-            MultiResolutionHashGridEncoding,
-            HashGridNeRFModel,
-            SIRENCoordinateNet,
-            Volumetric3DCoordinateMLP,
-            DirectionalAntennaPattern
-        )
-        import torch
+        from reconstructor.nerfmap_engine import Volumetric3DEngine
 
         # Test 1: AP Recurrence Clustering
         adapter = BlobStoreAdapter(self.fleet_dir)
@@ -239,43 +232,44 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         clusters = partitioner.cluster_environments_by_ap_recurrence(min_jaccard_similarity=0.15)
         self.assertGreaterEqual(len(clusters), 1)
 
-        # Test 2: Instant-NGP Hash Grid Model
-        coords = torch.tensor([[0.2, 0.3], [0.8, 0.9]], dtype=torch.float32)
-        hash_model = HashGridNeRFModel(num_levels=4, hidden_dim=32)
-        out_hash = hash_model(coords)
-        self.assertEqual(out_hash.shape, (2, 1))
+        # Test 2: True 3D Siddon ray marching, camping shells & sparse voxel export
+        engine = Volumetric3DEngine(room_width_m=8.0, room_height_m=6.0, resolution_m=0.25, device="cpu")
+        voxels_3d = engine.march_ray_voxels_3d(1.0, 1.0, 0.5, 5.0, 4.0, 2.5)
+        self.assertGreater(len(voxels_3d), 0)
+        self.assertEqual(len(voxels_3d[0]), 4)
 
-        # Test 3: SIREN Network
-        siren_model = SIRENCoordinateNet(in_features=2, hidden_dim=32, hidden_layers=2, omega_0=30.0)
-        out_siren = siren_model(coords)
-        self.assertEqual(out_siren.shape, (2, 1))
+        ray_data_3d = [
+            (6.0, 3.0, 1.5, 2.0, 3.0, 1.2, 8.0),
+            (2.0, 5.5, 3.2, 2.0, 3.0, 1.2, 6.0),
+            (1.0, 1.0, -2.5, 2.0, 3.0, 1.2, 9.5),
+        ]
+        engine.run_3d_tomography(ray_data_3d, np.zeros((engine.ny, engine.nx), dtype=bool), iterations=20)
+        shells = engine.compute_camping_shells(
+            ray_data_3d=ray_data_3d,
+            camping_centers=[(2.0, 3.0, 1.2)],
+        )
+        self.assertEqual(len(shells), 1)
+        self.assertEqual(len(shells[0]["sectors"]), 24)
+        self.assertGreater(shells[0]["azimuthal_coverage_pct"], 0.0)
 
-        # Test 4: Volumetric 3D NeRF Model
-        coords_3d = torch.tensor([[0.2, 0.3, 0.5], [0.8, 0.9, 0.1]], dtype=torch.float32)
-        vol_model = Volumetric3DCoordinateMLP(fourier_bands=4, hidden_dim=32)
-        out_3d = vol_model(coords_3d)
-        self.assertEqual(out_3d.shape, (2, 1))
-
-        # Test 5: Directional Antenna Pattern
-        angles = torch.tensor([[0.0, 0.0], [math.pi / 2, 0.0]], dtype=torch.float32)
-        ant_pattern = DirectionalAntennaPattern(hidden_dim=16)
-        out_ant = ant_pattern(angles)
-        self.assertEqual(out_ant.shape, (2, 1))
+        sparse = engine.export_sparse_voxels(min_atten_db_m=0.5)
+        self.assertGreater(len(sparse), 0)
+        self.assertIn("tier", sparse[0])
 
     def test_14_dual_canvas_proximity_viewer(self):
         from viewer.viewer_generator import generate_interactive_html_viewer
-        
+
         vectorizer = FloorplanVectorizer(resolution_m=0.25)
         dummy_grid = np.zeros((24, 32), dtype=np.float32)
-        dummy_grid[10:14, 15] = 12.0 # wall segment
+        dummy_grid[10:14, 15] = 12.0  # wall segment
         dummy_free = np.zeros((24, 32), dtype=bool)
         floorplan = vectorizer.vectorize(dummy_grid, dummy_free, [])
-        
+
         traj_points = [
             {"x": 1.0, "y": 1.0, "z": 0.0, "timestamp": 1000.0, "heading_deg": 45.0},
-            {"x": 2.0, "y": 2.0, "z": 0.0, "timestamp": 1001.0, "heading_deg": 50.0}
+            {"x": 2.0, "y": 2.0, "z": 0.0, "timestamp": 1001.0, "heading_deg": 50.0},
         ]
-        
+
         html_content = generate_interactive_html_viewer(
             session_id=self.session_id,
             floorplan_data=floorplan,
@@ -283,37 +277,23 @@ class TestWifiNerfReconstructor(unittest.TestCase):
             eval_metrics={"quality_grade": "GRADE A"},
             raw_trajectory=traj_points,
             slam_trajectory=traj_points,
-            grid_heatmap=dummy_grid.tolist()
+            grid_heatmap=dummy_grid.tolist(),
         )
-        self.assertGreater(len(html_content), 1000)
-            
-        # Verify dual canvas elements are present
-        self.assertIn('id="mapCanvasStatic"', html_content)
-        self.assertIn('id="mapCanvasDynamic"', html_content)
-        # Verify dynamic laser rangefinder, proximity halo, and HUD
-        self.assertIn("distToSegment", html_content)
-        self.assertIn("haloRadius", html_content)
-        self.assertIn("layer-proximity", html_content)
-        self.assertIn("telemetry-hud", html_content)
-        # Verify wall certainty filter slider and wall inspector
-        self.assertIn('id="slider-wall-conf"', html_content)
-        self.assertIn('id="wall-inspector"', html_content)
-        self.assertIn('id="layer-coverage"', html_content)
-        self.assertIn('id="layer-labels"', html_content)
+        self.assertIn("Wi-Fi 3D", html_content)
 
-        # Verify Top CAD Blueprint, Zero-Dependency 3D WebGL Orbit, and Recenter controls
-        self.assertIn('id="mapCanvas3D"', html_content)
-        self.assertIn('id="btn-cad"', html_content)
-        self.assertIn('id="btn-3d"', html_content)
-        self.assertIn('id="btn-pov"', html_content)
-        self.assertIn("recenterBuilding", html_content)
-        self.assertIn("centerOnPhone", html_content)
-        self.assertIn("drawCADWalls", html_content)
-        self.assertIn("initWebGL", html_content)
-        self.assertIn("rebuild3DScene", html_content)
-        self.assertIn("render3DScene", html_content)
-        self.assertNotIn('<script src="http', html_content)
-        self.assertIn("#0c2340", html_content)
+        static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "viewer", "static"))
+        for fname in ["index.html", "styles.css", "app.js", "cad2d.js", "scene3d.js", "map.js"]:
+            self.assertTrue(os.path.exists(os.path.join(static_dir, fname)), f"Missing static viewer file: {fname}")
+
+        with open(os.path.join(static_dir, "index.html"), "r", encoding="utf-8") as f:
+            index_html = f.read()
+        for elem_id in ['id="canvas-2d"', 'id="canvas-3d"', 'id="btn-cad"', 'id="btn-3d"', 'id="btn-pov"', 'id="btn-reload"']:
+            self.assertIn(elem_id, index_html)
+
+        with open(os.path.join(static_dir, "scene3d.js"), "r", encoding="utf-8") as f:
+            scene_js = f.read()
+        self.assertIn("createScene3dRenderer", scene_js)
+        self.assertIn("volume_3d", scene_js)
 
     def test_15_wall_confidence_and_output_cleanup(self):
         from reconstructor.pipeline import clean_output_directory
@@ -656,53 +636,19 @@ class TestWifiNerfReconstructor(unittest.TestCase):
         self.assertAlmostEqual(elev_baro["asl_altitude_m"], 101.5, delta=10.0)
 
     def test_27_zero_dependency_satellite_map_and_elevation_viewer(self):
-        from viewer.viewer_generator import generate_interactive_html_viewer
-        from reconstructor.floorplan_vectorizer import FloorplanVectorizer
+        static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "viewer", "static"))
+        with open(os.path.join(static_dir, "index.html"), "r", encoding="utf-8") as f:
+            index_html = f.read()
+        with open(os.path.join(static_dir, "map.js"), "r", encoding="utf-8") as f:
+            map_js = f.read()
 
-        vec = FloorplanVectorizer(resolution_m=0.25)
-        grid = np.zeros((20, 20), dtype=np.float32)
-        grid[8:12, 10] = 10.0
-        fp = vec.vectorize(grid, np.zeros((20, 20), dtype=bool), [])
-
-        elev_profile = {
-            "estimated_floor_number": 3,
-            "height_above_ground_m": 6.0,
-            "ground_rel_z_m": -6.0,
-            "total_floors_spanned": 3,
-            "asl_altitude_m": 126.5
-        }
-
-        html = generate_interactive_html_viewer(
-            session_id="test_geo_viewer",
-            floorplan_data=fp,
-            localized_aps={"ap1": {"ap_group_id": "AP1", "x": 2.5, "y": 2.5, "confidence": 0.85, "relative_floor": 0}},
-            eval_metrics={"quality_grade": "GRADE A"},
-            raw_trajectory=[{"x": 1.0, "y": 1.0, "z": 0.0, "yaw": 0.0, "ts": 100}],
-            slam_trajectory=[{"x": 1.0, "y": 1.0, "z": 0.0, "yaw": 0.0, "ts": 100}],
-            grid_heatmap=grid.tolist(),
-            elevation_profile=elev_profile
-        )
-
-        # 1. Test Earth Satellite & Terrain Canvas is integrated
-        self.assertIn('id="mapCanvasGeo"', html)
-        self.assertIn('id="btn-geo"', html)
-        self.assertIn('id="geo-toolbar"', html)
-        self.assertIn("BASEMAP_TILES", html)
-        self.assertIn("drawGeoScene", html)
-        self.assertIn("getMetersPerPixelAtLat", html)
-
-        # 2. Test AP Certainty filter
-        self.assertIn('id="slider-ap-conf"', html)
-        self.assertIn('id="chk-ap-same-floor"', html)
-        self.assertIn("getApConfidence", html)
-
-        # 3. Test Automatic Elevation Integration
-        self.assertIn("getSurveyElevOffset", html)
-        self.assertIn("updateHUDLevel", html)
-        self.assertIn("Floor 3", html)
-
-        # 4. Strict offline zero-dependency check
-        self.assertNotIn('<script src="http', html_content := html)
+        self.assertIn('id="btn-map"', index_html)
+        self.assertIn('id="canvas-map"', index_html)
+        self.assertIn('id="elev-summary"', index_html)
+        self.assertIn("lon2x", map_js)
+        self.assertIn("lat2y", map_js)
+        self.assertIn("World_Imagery", map_js)
+        self.assertNotIn('<script src="http', index_html)
 
     def test_28_ue_gnss_extraction_accuracy_weighting_and_live_pose(self):
         import gzip, json, tempfile
@@ -758,27 +704,28 @@ class TestWifiNerfReconstructor(unittest.TestCase):
             self.assertEqual(latest["gnss_accuracy_m"], 6.5)
             self.assertEqual(latest["geo_source"], "ue_live")
 
-        # 3. Verify viewer HTML properly prioritizes UE GPS & forbids caching fallback default
-        vec = FloorplanVectorizer(resolution_m=0.25)
-        grid = np.zeros((12, 12), dtype=np.float32)
-        grid[5:8, 6] = 8.0
-        fp = vec.vectorize(grid, np.zeros((12, 12), dtype=bool), [])
-        html = generate_interactive_html_viewer(
-            session_id="test_gnss_viewer",
-            floorplan_data=fp,
-            localized_aps={"ap1": {"ap_group_id": "AP1", "x": 1.5, "y": 1.5, "confidence": 0.9, "relative_floor": 0}},
-            eval_metrics={"quality_grade": "GRADE A"},
-            raw_trajectory=[{"x": 1.0, "y": 1.0, "z": 0.0, "yaw": 0.0, "ts": 100}],
-            slam_trajectory=[{"x": 1.0, "y": 1.0, "z": 0.0, "yaw": 0.0, "ts": 100}],
-            grid_heatmap=grid.tolist(),
-            elevation_profile=elev
+        # 3. Verify static viewer modules & floorplan JSON manifest expose UE GNSS + 3D camping data
+        static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "viewer", "static"))
+        with open(os.path.join(static_dir, "map.js"), "r", encoding="utf-8") as f:
+            map_js = f.read()
+        with open(os.path.join(static_dir, "app.js"), "r", encoding="utf-8") as f:
+            app_js = f.read()
+        self.assertIn("elevation_profile", map_js)
+        self.assertIn("livePose", map_js)
+        self.assertIn("/api/reload", app_js)
+
+        res = run_reconstruction_pipeline(
+            blob_uri=self.demo_dir,
+            session_id=self.session_id,
+            output_dir=self.output_dir,
         )
-        self.assertIn("applyGeoAnchor", html)
-        self.assertIn("snapToUeLocation", html)
-        self.assertIn('id="geo-source-badge"', html)
-        self.assertIn(str(elev["lat"]), html)
-        self.assertIn(str(elev["lon"]), html)
-        self.assertNotIn('<script src="http', html)
+        fp_json_path = os.path.join(self.output_dir, f"floorplan_{self.session_id}.json")
+        self.assertTrue(os.path.exists(fp_json_path))
+        with open(fp_json_path, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        self.assertIn("elevation_profile", manifest)
+        self.assertIn("volume_3d", manifest["floorplan"])
+        self.assertIn("camping_shells", manifest["floorplan"])
 
     def test_29_egm96_geoid_and_high_rise_floor_elevation(self):
         import gzip, json, tempfile
@@ -847,6 +794,193 @@ class TestWifiNerfReconstructor(unittest.TestCase):
             self.assertGreaterEqual(latest["floor"], 14)
             self.assertLessEqual(latest["floor"], 16)
             self.assertEqual(latest["vertical_source"], "ue_gps_egm96")
+
+    def test_30_camping_compression_zupt_and_3d_slabs(self):
+        import tempfile
+        from reconstructor.blob_index import TelemetryIndex
+        from reconstructor.blob_loader import SessionAssembler
+
+        # 1. ZUPT preserves genuine 2D L-shaped turn while gating >2.5m step-jump outliers
+        raw_events = [
+            {"pose": {"x": 0.0, "y": 0.0, "z": 0.0}, "timestamp_ns": 1_000_000_000},
+            {"pose": {"x": 2.0, "y": 0.0, "z": 0.0}, "timestamp_ns": 3_000_000_000},
+            {"pose": {"x": 2.0, "y": 2.0, "z": 0.0}, "timestamp_ns": 5_000_000_000},
+            {"pose": {"x": 25.0, "y": 25.0, "z": 0.0}, "timestamp_ns": 5_500_000_000},  # impossible jump
+            {"pose": {"x": 25.0, "y": 26.0, "z": 0.0}, "timestamp_ns": 7_500_000_000},
+        ]
+        stab = SessionAssembler._stabilize_indoor_pdr_drift(raw_events)
+        self.assertEqual(len(stab), len(raw_events))
+        self.assertAlmostEqual(stab[2]["pose"]["x"], 2.0, delta=0.1)
+        self.assertAlmostEqual(stab[2]["pose"]["y"], 2.0, delta=0.1)
+        self.assertLess(stab[3]["pose"]["x"], 10.0)  # jump gated
+
+        # 2. Camping probe compression collapses stationary bursts into statistical anchor
+        probes = [
+            {
+                "event_type": "connected_probe",
+                "timestamp_ns": i * 100_000_000,
+                "bssid": "aa:bb:cc:dd:ee:ff",
+                "rssi_dbm": -50 - (i % 3),
+                "pose": {"x": 1.0, "y": 1.0, "z": 0.0},
+            }
+            for i in range(60)
+        ]
+        compressed = SessionAssembler._compress_camping_probes(probes, radius_m=0.8)
+        self.assertEqual(len(compressed), 1)
+        self.assertTrue(compressed[0].get("is_camping_anchor"))
+        self.assertEqual(compressed[0].get("sample_count"), 60)
+        self.assertIn("rssi_p10", compressed[0])
+        self.assertIn("rssi_p90", compressed[0])
+
+        # 3. TelemetryIndex SQLite cache hit/miss and clear (rebuild_index)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            idx = TelemetryIndex(os.path.join(tmpdir, "telemetry_index.sqlite"))
+            self.assertEqual(idx.get_cached_batches(["b1.ndjson.gz"]), {})
+            sample_events = [{"event_type": "wifi_scan", "bssid": "11:22:33:44:55:66", "rssi_dbm": -62}]
+            idx.put_batches([
+                ("b1.ndjson.gz", 123, "dev1", "env1", "hf", 1, 1000, 1000, 0, sample_events, 1.0)
+            ])
+            hit = idx.get_cached_batches(["b1.ndjson.gz"])
+            self.assertIn("b1.ndjson.gz", hit)
+            sz, evs = hit["b1.ndjson.gz"]
+            self.assertEqual(sz, 123)
+            self.assertEqual(evs[0]["rssi_dbm"], -62)
+            idx.clear()
+            self.assertEqual(idx.get_cached_batches(["b1.ndjson.gz"]), {})
+
+    def test_31_camping_ap_non_stacking_objects_and_ui_filters(self):
+        from reconstructor.ap_localizer import MultiApLocalizer
+        from reconstructor.nerfmap_engine import Volumetric3DEngine
+        from reconstructor.floorplan_vectorizer import FloorplanVectorizer
+
+        # 1. Stationary camping UE sees multiple neighbor APs: must NOT stack at (3.5, 2.5)
+        events = []
+        for i in range(8):
+            events.append({
+                "event_type": "wifi_scan_batch",
+                "timestamp_ns": i * 1_000_000_000,
+                "pose": {"x": 3.5, "y": 2.5, "z": 0.0},
+                "scans": [
+                    {"bssid": "aa:11:22:33:44:51", "ssid": "RouterA", "ap_group_id": "RouterA-11:22:44:5x", "freq_mhz": 5180, "rssi_dbm": -74},
+                    {"bssid": "bb:55:66:77:88:91", "ssid": "RouterB", "ap_group_id": "RouterB-55:66:88:9x", "freq_mhz": 5180, "rssi_dbm": -78},
+                    {"bssid": "cc:99:aa:bb:cc:d1", "ssid": "HomeAP", "ap_group_id": "HomeAP-99:aa:cc:dx", "freq_mhz": 2412, "rssi_dbm": -22},
+                ],
+            })
+        aps = MultiApLocalizer().localize_all_aps(events)
+        self.assertEqual(len(aps), 3)
+        pos_a = (aps["RouterA-11:22:44:5x"]["x"], aps["RouterA-11:22:44:5x"]["y"])
+        pos_b = (aps["RouterB-55:66:88:9x"]["x"], aps["RouterB-55:66:88:9x"]["y"])
+        self.assertGreater(math.hypot(pos_a[0] - pos_b[0], pos_a[1] - pos_b[1]), 0.5)
+        self.assertEqual(aps["RouterA-11:22:44:5x"]["observability"], "camping_radial")
+        self.assertLessEqual(aps["RouterA-11:22:44:5x"]["confidence"], 0.45)
+        self.assertTrue(aps["RouterA-11:22:44:5x"]["is_radial_uncertain"])
+        self.assertTrue(aps["HomeAP-99:aa:cc:dx"]["is_internal"])
+
+        # 2. Compact 3D RF Object extraction + speculative camping barrier cues
+        engine = Volumetric3DEngine(room_width_m=8.0, room_height_m=6.0, resolution_m=0.25, device="cpu")
+        iz_room = engine._z_to_iz(1.2)
+        engine.grid_3d[iz_room:iz_room + 2, 10:12, 12:14] = 6.5
+        engine.hit_counts_3d[iz_room:iz_room + 2, 10:12, 12:14] = 4.0
+        objs = engine.extract_3d_objects(free_mask=np.zeros((engine.ny, engine.nx), dtype=bool), min_atten_db_m=2.5)
+        self.assertGreaterEqual(len(objs), 1)
+        self.assertIn("RF", objs[0]["label"])
+
+        vec = FloorplanVectorizer(resolution_m=0.25)
+        shells = [{
+            "anchor_id": "camp_1", "x": 3.5, "y": 2.5, "z": 1.2, "azimuthal_coverage_pct": 12.5,
+            "sectors": [{"sector": 0, "azimuth_deg": 45.0, "tiers": {"room": {"status": "obstructed", "rays": 4, "mean_excess_db": 7.5}}}],
+        }]
+        fp = vec.vectorize(np.zeros((engine.ny, engine.nx), dtype=np.float32), np.zeros((engine.ny, engine.nx), dtype=bool), [], camping_shells=shells)
+        self.assertGreaterEqual(len(fp["walls"]), 1)
+        self.assertEqual(fp["walls"][0]["classification"], "speculative")
+
+        # 3. WebUI confidence filters & 3D labels present
+        static_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "viewer", "static"))
+        with open(os.path.join(static_dir, "index.html"), "r", encoding="utf-8") as f:
+            idx_html = f.read()
+        for elem in ["slider-wall-conf", "slider-ap-conf", "chk-ap-same-floor", "chk-ap-rings", "chk-ap-mirrors", "inspector-body", "labels-3d", "chk-objects"]:
+            self.assertIn(elem, idx_html)
+
+    def test_32_vertical_z_symmetry_mirror_and_multisensor_cues(self):
+        from reconstructor.ap_localizer import MultiApLocalizer
+        from reconstructor.pipeline import _extract_auxiliary_sensor_cues, _append_3d_ray_with_z_symmetry
+
+        # 1. Flat single-floor survey: off-floor AP must flag vertical_ambiguous + mirror Ghost (+Z/-Z)
+        flat_events = []
+        for i in range(16):
+            flat_events.append({
+                "event_type": "wifi_scan_batch",
+                "timestamp_ns": i * 1_000_000_000,
+                "pose": {"x": 2.0 + (i % 4) * 0.8, "y": 2.0 + (i // 4) * 0.8, "z": 0.0},
+                "scans": [{
+                    "bssid": "cc:11:22:33:44:51",
+                    "ssid": "NeighborFlat",
+                    "ap_group_id": "NeighborFlat-11:22:44:5x",
+                    "freq_mhz": 5180,
+                    "rssi_dbm": -73,
+                }],
+            })
+        aps_flat = MultiApLocalizer().localize_all_aps(flat_events)
+        ap_f = aps_flat["NeighborFlat-11:22:44:5x"]
+        self.assertTrue(ap_f["vertical_ambiguous"])
+        self.assertEqual(ap_f["alt_relative_floor"], -ap_f["relative_floor"])
+        self.assertAlmostEqual(ap_f["alt_z_m"], -ap_f["z_m"], places=1)
+
+        # Verify symmetric 3D ray splitting
+        rays_3d = []
+        _append_3d_ray_with_z_symmetry(rays_3d, ap_f, 3.0, 3.0, 1.2, 6.0)
+        self.assertEqual(len(rays_3d), 2)
+        self.assertAlmostEqual(rays_3d[0][6], 3.0, places=2)
+        self.assertAlmostEqual(rays_3d[1][6], 3.0, places=2)
+        self.assertAlmostEqual(rays_3d[1][2], ap_f["alt_z_m"], places=1)
+
+        # 2. Vertical walk (stairs/elevator pz = 0m -> +3m): AP upstairs (+1) must win and NOT be vertical_ambiguous
+        stair_events = []
+        ap_pos = (4.0, 4.0, 3.0)
+        for pz in (0.0, 3.0):
+            for x in (2.5, 4.0, 5.5):
+                for y in (2.5, 4.0, 5.5):
+                    d3 = math.sqrt((x - ap_pos[0]) ** 2 + (y - ap_pos[1]) ** 2 + (pz - ap_pos[2]) ** 2 + 0.25)
+                    slab = 18.0 if pz < 1.5 else 0.0
+                    rssi = -40.0 - slab - 20.0 * math.log10(d3)
+                    stair_events.append({
+                        "event_type": "wifi_scan_batch",
+                        "timestamp_ns": len(stair_events) * 1_000_000_000,
+                        "pose": {"x": x, "y": y, "z": pz},
+                        "scans": [{
+                            "bssid": "dd:11:22:33:44:51",
+                            "ssid": "UpstairsAP",
+                            "ap_group_id": "UpstairsAP-11:22:44:5x",
+                            "freq_mhz": 5180,
+                            "rssi_dbm": rssi,
+                        }],
+                    })
+        aps_stair = MultiApLocalizer().localize_all_aps(stair_events)
+        ap_up = aps_stair["UpstairsAP-11:22:44:5x"]
+        self.assertEqual(ap_up["relative_floor"], 1)
+        self.assertAlmostEqual(ap_up["z_m"], 3.0, places=1)
+        self.assertFalse(ap_up["vertical_ambiguous"])
+
+        # 3. Auxiliary non-camera sensor extraction (magnetometer, BLE, acoustic sonar, cellular)
+        aux_events = [
+            {"event_type": "mag_baro_pdr", "pose": {"x": 1.0, "y": 1.0, "z": 0.0}, "mag_norm_ut": 45.0, "light_lux": 250.0},
+            {"event_type": "mag_baro_pdr", "pose": {"x": 1.5, "y": 1.0, "z": 0.0}, "mag_norm_ut": 46.0},
+            {"event_type": "mag_baro_pdr", "pose": {"x": 2.0, "y": 1.0, "z": 0.0}, "mag_norm_ut": 44.5},
+            {"event_type": "mag_baro_pdr", "pose": {"x": 2.5, "y": 1.0, "z": 0.0}, "mag_norm_ut": 45.5},
+            {"event_type": "mag_baro_pdr", "pose": {"x": 3.0, "y": 2.0, "z": 0.0}, "mag_norm_ut": 92.0},
+            {"event_type": "ble_scan_batch", "pose": {"x": 4.0, "y": 3.0, "z": 0.0}, "scans": [{"device_hash": "ble_tv_1", "rssi_dbm": -52, "category": "Smart TV"}]},
+            {"event_type": "ble_scan_batch", "pose": {"x": 4.2, "y": 3.1, "z": 0.0}, "scans": [{"device_hash": "ble_tv_1", "rssi_dbm": -50, "category": "Smart TV"}]},
+            {"event_type": "acoustic_sonar", "pose": {"x": 2.0, "y": 2.0, "z": 0.0, "qw": 1.0, "qx": 0.0, "qy": 0.0, "qz": 0.0}, "nearest_wall_m": 1.4, "echoes": [{"distance_m": 1.4, "snr_db": 18.0}]},
+            {"event_type": "cellular_batch", "cells": [{"rsrp_dbm": -89}]},
+        ]
+        aux_objs, summary = _extract_auxiliary_sensor_cues(aux_events, next_obj_idx=1)
+        sources = {o.get("source_sensor") for o in aux_objs}
+        self.assertIn("magnetometer", sources)
+        self.assertIn("ble", sources)
+        self.assertIn("acoustic_sonar", sources)
+        self.assertEqual(summary["cellular_median_rsrp_dbm"], -89.0)
+        self.assertEqual(summary["ambient_lux_median"], 250.0)
+
 
 if __name__ == "__main__":
     unittest.main()

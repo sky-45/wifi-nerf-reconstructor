@@ -26,10 +26,12 @@ class UnlabeledEvaluator:
         held_out_events: List[Dict[str, Any]],
         localized_aps: Dict[str, Dict[str, Any]],
         free_mask: np.ndarray,
-        resolution_m: float = 0.20
+        resolution_m: float = 0.20,
+        engine_3d: Optional[Any] = None,
+        camping_shells: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
-        Runs the full 4-Pillar Zero-Label Evaluation Suite.
+        Runs the full Zero-Label Evaluation Suite (3D volumetric + wall segment).
         """
         # Pillar 1: Spatial-Holdout Wall-Occlusion Ray Classification
         ray_metrics = self._evaluate_holdout_wall_rays(reconstructed_walls, held_out_events, localized_aps)
@@ -37,8 +39,15 @@ class UnlabeledEvaluator:
         # Pillar 2: Free-Space False Collision Rate
         collision_rate = self._compute_free_space_collision_rate(reconstructed_walls, free_mask, resolution_m)
 
-        # Pillar 3: Held-Out RSSI Prediction Error (RPE)
-        rpe_metrics = self._compute_holdout_rpe(reconstructed_walls, held_out_events, localized_aps)
+        # Pillar 3: Held-Out RSSI Prediction Error (RPE) using 3D volume when available
+        rpe_metrics = self._compute_holdout_rpe(
+            reconstructed_walls, held_out_events, localized_aps, engine_3d=engine_3d
+        )
+
+        az_cov = 0.0
+        if camping_shells:
+            az_cov = round(float(np.mean([s.get("azimuthal_coverage_pct", 0.0) for s in camping_shells])), 1)
+        camping_mode = bool(camping_shells and len(reconstructed_walls) <= 2)
 
         return {
             "unlabeled_wall_ray_precision": ray_metrics["precision"],
@@ -48,7 +57,12 @@ class UnlabeledEvaluator:
             "free_space_collision_rate_pct": collision_rate,
             "median_rpe_db": rpe_metrics["median_error_db"],
             "rpe_mae_db": rpe_metrics["mae_db"],
-            "quality_grade": self._assign_quality_grade(ray_metrics["f1"], rpe_metrics["median_error_db"])
+            "azimuthal_coverage_pct": az_cov,
+            "camping_mode": camping_mode,
+            "quality_grade": self._assign_quality_grade(
+                ray_metrics["f1"], rpe_metrics["median_error_db"],
+                camping_mode=camping_mode, azimuthal_coverage_pct=az_cov,
+            ),
         }
 
     def _find_ap_for_probe(self, bssid: str, aps: Dict[str, Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -233,17 +247,36 @@ class UnlabeledEvaluator:
         self,
         walls: List[Dict[str, Any]],
         events: List[Dict[str, Any]],
-        aps: Dict[str, Dict[str, Any]]
+        aps: Dict[str, Dict[str, Any]],
+        engine_3d: Optional[Any] = None,
     ) -> Dict[str, float]:
         errors = []
         wall_attenuation_db = 4.5 # Expected drywall absorption
         last_probe_pos: Dict[str, Tuple[float, float]] = {}
 
+        def _predict_atten(ap_info: Dict[str, Any], rx_x: float, rx_y: float, rx_z: float) -> float:
+            if engine_3d is not None and hasattr(engine_3d, "march_ray_voxels_3d"):
+                inter = engine_3d.march_ray_voxels_3d(
+                    ap_info["x"], ap_info["y"], float(ap_info.get("z_m", 1.2)),
+                    rx_x, rx_y, rx_z,
+                )
+                if inter:
+                    return sum(engine_3d.grid_3d[iz, iy, ix] * dl for ix, iy, iz, dl in inter)
+            d_2d = math.hypot(rx_x - ap_info["x"], rx_y - ap_info["y"])
+            dz = float(ap_info.get("z_m", 0.0))
+            d = max(0.4, math.hypot(d_2d, dz))
+            num_walls = sum(
+                1 for w in walls
+                if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"])
+            )
+            cos_elev = d_2d / max(0.1, d)
+            return (num_walls * wall_attenuation_db) * (cos_elev ** 2)
+
         for ev in events:
             pose = ev.get("pose")
             if not pose:
                 continue
-            rx_x, rx_y = pose["x"], pose["y"]
+            rx_x, rx_y, rx_z = pose["x"], pose["y"], float(pose.get("z", 1.2))
             ev_type = ev.get("event_type") or ev.get("type")
 
             if ev_type == "wifi_scan_batch":
@@ -260,17 +293,9 @@ class UnlabeledEvaluator:
                     slab_loss = float(ap_info.get("floor_loss_db", 0.0))
                     freq = int(scan.get("freq_mhz", 2412))
                     ref_p0 = float(ap_info.get("p0_5_dbm" if freq >= 4900 else "p0_24_dbm", ap_info["p0_dbm"]))
-                    num_walls = 0
-                    for w in walls:
-                        if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"]):
-                            num_walls += 1
-
-                    cos_elev = d_2d / max(0.1, d)
-                    eff_wall_loss = (num_walls * wall_attenuation_db) * (cos_elev ** 2)
-                    # Forward RSSI prediction using map with 3D slab & dual-band compensation
+                    eff_wall_loss = _predict_atten(ap_info, rx_x, rx_y, rx_z)
                     pred_rssi = ref_p0 - slab_loss - 20.0 * math.log10(d) - eff_wall_loss
-                    err = abs(pred_rssi - float(scan.get("rssi_dbm", -70)))
-                    errors.append(err)
+                    errors.append(abs(pred_rssi - float(scan.get("rssi_dbm", -70))))
 
             elif ev_type == "connected_probe":
                 bssid = ev.get("bssid", "")
@@ -287,16 +312,9 @@ class UnlabeledEvaluator:
                     slab_loss = float(ap_info.get("floor_loss_db", 0.0))
                     freq = int(ev.get("freq_mhz", 5180))
                     ref_p0 = float(ap_info.get("p0_5_dbm" if freq >= 4900 else "p0_24_dbm", ap_info["p0_dbm"]))
-                    num_walls = 0
-                    for w in walls:
-                        if self._line_segments_intersect(ap_info["x"], ap_info["y"], rx_x, rx_y, w["x1"], w["y1"], w["x2"], w["y2"]):
-                            num_walls += 1
-
-                    cos_elev = d_2d / max(0.1, d)
-                    eff_wall_loss = (num_walls * wall_attenuation_db) * (cos_elev ** 2)
+                    eff_wall_loss = _predict_atten(ap_info, rx_x, rx_y, rx_z)
                     pred_rssi = ref_p0 - slab_loss - 20.0 * math.log10(d) - eff_wall_loss
-                    err = abs(pred_rssi - float(ev.get("rssi_dbm", -70)))
-                    errors.append(err)
+                    errors.append(abs(pred_rssi - float(ev.get("rssi_dbm", -70))))
 
         if not errors:
             return {"median_error_db": 0.0, "mae_db": 0.0}
@@ -364,7 +382,14 @@ class UnlabeledEvaluator:
         return math.hypot(px - proj_x, py - proj_y)
 
     @staticmethod
-    def _assign_quality_grade(f1: float, median_rpe_db: float) -> str:
+    def _assign_quality_grade(
+        f1: float,
+        median_rpe_db: float,
+        camping_mode: bool = False,
+        azimuthal_coverage_pct: float = 0.0,
+    ) -> str:
+        if camping_mode and median_rpe_db <= 4.5:
+            return f"CAMPING 3D SHELL ({azimuthal_coverage_pct:.0f}% Azimuthal Coverage)"
         if f1 >= 0.85 and median_rpe_db <= 3.0:
             return "GRADE A (High Precision Architectural Floorplan)"
         elif f1 >= 0.70 and median_rpe_db <= 4.5:

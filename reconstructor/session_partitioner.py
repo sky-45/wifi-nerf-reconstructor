@@ -274,10 +274,13 @@ def estimate_automatic_building_elevation(
     """
     # 1. Analyze relative floor distribution across confirmed APs
     rel_floors = []
+    v_ambig_count = 0
     for ap in (localized_aps or {}).values():
         if ap.get("sample_count", 0) >= 3 or ap.get("confidence", 0.0) >= 0.20:
             rf = ap.get("relative_floor", 0)
             rel_floors.append(rf)
+            if ap.get("vertical_ambiguous"):
+                v_ambig_count += 1
 
     if rel_floors:
         min_rf = min(rel_floors)
@@ -401,6 +404,7 @@ def estimate_automatic_building_elevation(
         "total_floors_spanned": (max_rf - min_rf) + 1,
         "lower_floor_ap_count": lower_count,
         "upper_floor_ap_count": upper_count,
+        "vertical_ambiguous_ap_count": v_ambig_count,
         "asl_altitude_m": asl_altitude_m,
         "ground_terrain_asl_m": resolved_ground_asl,
         "geoid_undulation_m": geoid_undulation_m,
@@ -452,9 +456,30 @@ class MultiDeviceAligner:
             dy = base_aps[cid]["y"] - target_aps[cid]["y"]
             return float(dx), float(dy), 0.0
 
-        # Two or more shared APs: solve 2D Procrustes problem via SVD
+        # Two or more shared APs: check geometric conditioning before allowing unconstrained rotation.
+        # Collinear / camping AP constellations have rank-1 covariance; rotating them via SVD Procrustes
+        # spins devices wildly (e.g. -94 deg). Lock rotation to compass (dtheta=0) when rank-deficient.
         p_base = np.array([[base_aps[cid]["x"], base_aps[cid]["y"]] for cid in common_ids], dtype=np.float64)
         p_target = np.array([[target_aps[cid]["x"], target_aps[cid]["y"]] for cid in common_ids], dtype=np.float64)
+        conf_w = np.array([
+            min(float(base_aps[cid].get("confidence", 0.5)), float(target_aps[cid].get("confidence", 0.5)))
+            for cid in common_ids
+        ], dtype=np.float64)
+
+        def _is_well_conditioned(pts: np.ndarray) -> bool:
+            if len(pts) < 3:
+                return False
+            cov = np.cov(pts.T)
+            eigs = np.linalg.eigvalsh(cov)
+            minor_std = math.sqrt(max(0.0, float(eigs[0])))
+            major_std = math.sqrt(max(0.0, float(eigs[1])))
+            return minor_std >= 0.8 and (major_std / max(minor_std, 1e-4)) <= 3.5
+
+        if not (_is_well_conditioned(p_base) and _is_well_conditioned(p_target)):
+            w_norm = conf_w / max(1e-6, float(np.sum(conf_w)))
+            dx = float(np.sum(w_norm * (p_base[:, 0] - p_target[:, 0])))
+            dy = float(np.sum(w_norm * (p_base[:, 1] - p_target[:, 1])))
+            return dx, dy, 0.0
 
         mu_base = np.mean(p_base, axis=0)
         mu_target = np.mean(p_target, axis=0)

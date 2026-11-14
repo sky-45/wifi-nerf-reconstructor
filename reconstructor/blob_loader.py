@@ -22,12 +22,14 @@ import json
 import math
 import os
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Dict, Any, List, Optional, Tuple
 from urllib.parse import urlparse
 
 import numpy as np
 
+from reconstructor.blob_index import TelemetryIndex
 from reconstructor.session_partitioner import (
     SessionPartitioner,
     MultiDeviceAligner,
@@ -38,13 +40,59 @@ from reconstructor.session_partitioner import (
 class BlobStoreAdapter:
     """Pluggable adapter for reading raw .ndjson.gz batches from OCI, S3, or Local storage."""
 
-    def __init__(self, base_uri: str):
+    _SHARED_LIST_CACHE: Dict[Tuple[str, str], Tuple[float, List[str]]] = {}
+
+    def __init__(self, base_uri: str, list_cache_ttl_s: float = 120.0):
+        import threading
         self.base_uri = base_uri
         self.parsed = urlparse(base_uri)
         self._oci_client = None
+        self.list_cache_ttl_s = list_cache_ttl_s
+        self._list_cache: Dict[str, Tuple[float, List[str]]] = {}
+        self._tls = threading.local()
 
-    def list_all_objects(self, prefix: str = "") -> List[str]:
+    def _http_get_bytes(self, url: str, timeout: float = 25.0) -> bytes:
+        """HTTP GET with per-thread persistent keep-alive connection pooling."""
+        try:
+            import requests
+            from requests.adapters import HTTPAdapter
+            sess = getattr(self._tls, "session", None)
+            if sess is None:
+                sess = requests.Session()
+                adapter = HTTPAdapter(pool_connections=16, pool_maxsize=16)
+                sess.mount("https://", adapter)
+                sess.mount("http://", adapter)
+                sess.headers.update({"User-Agent": "WifiNerfReconstructor/1.0"})
+                self._tls.session = sess
+            resp = sess.get(url, timeout=timeout)
+            resp.raise_for_status()
+            return resp.content
+        except ImportError:
+            import urllib.request
+            req = urllib.request.Request(url, headers={"User-Agent": "WifiNerfReconstructor/1.0"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return resp.read()
+
+    def invalidate_list_cache(self) -> None:
+        self._list_cache.clear()
+        for k in [k for k in self._SHARED_LIST_CACHE if k[0] == self.base_uri]:
+            self._SHARED_LIST_CACHE.pop(k, None)
+
+    def list_all_objects(self, prefix: str = "", force_refresh: bool = False) -> List[str]:
         """Lists all telemetry batch files across the storage target matching the prefix."""
+        now = time.time()
+        shared_key = (self.base_uri, prefix)
+        if not force_refresh:
+            if prefix in self._list_cache:
+                ts, cached = self._list_cache[prefix]
+                if (now - ts) < self.list_cache_ttl_s:
+                    return list(cached)
+            if shared_key in self._SHARED_LIST_CACHE:
+                ts, cached = self._SHARED_LIST_CACHE[shared_key]
+                if (now - ts) < self.list_cache_ttl_s:
+                    self._list_cache[prefix] = (ts, list(cached))
+                    return list(cached)
+
         scheme = self.parsed.scheme
 
         if scheme in ("", "file"):
@@ -58,19 +106,19 @@ class BlobStoreAdapter:
                     if (fname.endswith(".ndjson.gz") or fname.endswith(".jsonl.gz") or
                         fname.endswith(".jsonl") or fname.endswith(".ndjson")):
                         found.append(os.path.join(root, fname))
-            return sorted(found)
-
+            res = sorted(found)
         elif scheme == "oci":
-            return self._list_all_oci_objects(prefix)
-
+            res = self._list_all_oci_objects(prefix)
         elif scheme == "s3":
-            return self._list_all_s3_objects(prefix)
-
+            res = self._list_all_s3_objects(prefix)
         elif scheme in ("http", "https"):
-            return self._list_all_http_par_objects(prefix)
-
+            res = self._list_all_http_par_objects(prefix)
         else:
             raise ValueError(f"Unsupported storage scheme: {scheme}")
+
+        self._list_cache[prefix] = (now, res)
+        self._SHARED_LIST_CACHE[(self.base_uri, prefix)] = (now, res)
+        return list(res)
 
     def list_fleet_objects(self, device_id: Optional[str] = None, env_id: Optional[str] = None, tier: Optional[str] = None) -> List[str]:
         """Filters objects under the fleet partition hierarchy by device_id, env_id, and/or tier ('hf' or 'lf')."""
@@ -193,29 +241,27 @@ class BlobStoreAdapter:
             query_str = ("?" + "&".join(params)) if params else ""
             list_url = f"{par_root}{query_str}"
 
-            req = urllib.request.Request(list_url, headers={"User-Agent": "WifiNerfReconstructor/1.0"})
             try:
-                with urllib.request.urlopen(req, timeout=20) as resp:
-                    raw = resp.read()
-                    if raw[:2] == b"\x1f\x8b":
-                        raw = gzip.decompress(raw)
-                    data = json.loads(raw.decode("utf-8"))
-                    if isinstance(data, dict) and "objects" in data:
-                        for obj in data["objects"]:
-                            name = obj.get("name", "")
-                            if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
-                                items.append(name)
-                        next_start = data.get("nextStartWith")
-                        if not next_start:
-                            break
-                    elif isinstance(data, list):
-                        for item in data:
-                            name = item if isinstance(item, str) else item.get("name", "")
-                            if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
-                                items.append(name)
+                raw = self._http_get_bytes(list_url, timeout=20)
+                if raw[:2] == b"\x1f\x8b":
+                    raw = gzip.decompress(raw)
+                data = json.loads(raw.decode("utf-8"))
+                if isinstance(data, dict) and "objects" in data:
+                    for obj in data["objects"]:
+                        name = obj.get("name", "")
+                        if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
+                            items.append(name)
+                    next_start = data.get("nextStartWith")
+                    if not next_start:
                         break
-                    else:
-                        break
+                elif isinstance(data, list):
+                    for item in data:
+                        name = item if isinstance(item, str) else item.get("name", "")
+                        if name.endswith(".gz") or name.endswith(".jsonl") or name.endswith(".ndjson"):
+                            items.append(name)
+                    break
+                else:
+                    break
             except Exception as e:
                 print(
                     f"[BlobStore] Warning: Failed to list objects via HTTP/HTTPS PAR ({list_url}): {e}\n"
@@ -249,9 +295,7 @@ class BlobStoreAdapter:
                 clean_key = f"{subpath}/{clean_key}"
             url = f"{par_root}{quote(clean_key, safe='/')}"
 
-        req = urllib.request.Request(url, headers={"User-Agent": "WifiNerfReconstructor/1.0"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = resp.read()
+        data = self._http_get_bytes(url, timeout=30)
 
         if data:
             try:
@@ -370,9 +414,23 @@ class SessionAssembler:
     Supports single-session loading and multi-device collaborative environment assembly.
     """
 
-    def __init__(self, adapter: BlobStoreAdapter):
+    def __init__(self, adapter: BlobStoreAdapter, use_index: bool = True):
         self.adapter = adapter
         self.aligner = MultiDeviceAligner()
+        self.use_index = use_index
+        self._index: Optional[TelemetryIndex] = None
+        if use_index:
+            scheme = getattr(adapter.parsed, "scheme", "")
+            if scheme in ("", "file"):
+                base_dir = adapter.parsed.path if scheme == "file" else adapter.base_uri
+                db_path = os.path.join(base_dir, ".telemetry_index.sqlite")
+            else:
+                root_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                db_path = os.path.join(root_dir, ".cache", "blobs", "telemetry_index.sqlite")
+            try:
+                self._index = TelemetryIndex(db_path)
+            except Exception:
+                self._index = None
 
     def _parse_batch_bytes(self, raw_bytes: bytes, key: str = "") -> Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]:
         if raw_bytes[:2] == b"\x1f\x8b":
@@ -451,136 +509,229 @@ class SessionAssembler:
     @staticmethod
     def _stabilize_indoor_pdr_drift(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Debounces hardware double-step triggers (< 350ms apart), stitches multi-session
-        origin resets seamlessly, and bounds open-loop unidirectional PDR drift when
-        the device paces back-and-forth while continuously connected to an indoor anchor AP.
+        ZUPT + step-jump outlier gating that preserves genuine 2D room turns and
+        vertical Z changes while preventing static IMU noise from drifting tens/hundreds
+        of meters during long camping intervals.
         """
         posed = [ev for ev in events if isinstance(ev.get("pose"), dict)]
-        if len(posed) < 10:
+        if len(posed) < 5:
             return events
 
-        xs_raw = [float(ev["pose"].get("x", 0.0)) for ev in posed]
-        ys_raw = [float(ev["pose"].get("y", 0.0)) for ev in posed]
-        span_m = math.hypot(max(xs_raw) - min(xs_raw), max(ys_raw) - min(ys_raw))
-        sids = {ev.get("session_id") for ev in posed if ev.get("session_id")}
-        if span_m <= 14.0 and len(sids) <= 1:
-            return events
-
-        # Check if device remained connected to a strong indoor anchor AP throughout the walk
-        probes = [
-            (float(ev["pose"]["x"]), float(ev["pose"]["y"]), float(ev.get("rssi_dbm", -70)))
-            for ev in posed
-            if ev.get("event_type") == "connected_probe" and ev.get("rssi_dbm") is not None
-        ]
-        has_indoor_anchor = False
-        ax, ay = 0.0, 0.0
-        max_r, min_r = -70.0, -70.0
-        if probes:
-            max_r = max(p[2] for p in probes)
-            min_r = min(p[2] for p in probes)
-            if max_r >= -50.0:
-                has_indoor_anchor = True
-                anchor_pts = [(p[0], p[1]) for p in probes if p[2] >= max_r - 2.5]
-                ax = sum(p[0] for p in anchor_pts) / len(anchor_pts)
-                ay = sum(p[1] for p in anchor_pts) / len(anchor_pts)
-
-        # If data suffers from unreversed open-loop drift (span > 14m while anchor AP stays in range),
-        # regularize pacing onto the 1D straight-line corridor axis between Room 1 (near AP) and Room 2.
-        use_corridor_regularization = bool(has_indoor_anchor and span_m > 14.0)
-        ux, uy = 1.0, 0.0
-        corridor_len = 6.2
-        if use_corridor_regularization:
-            # Estimate principal pacing direction from valid step increments
-            step_dxs, step_dys = [], []
-            for i in range(1, len(posed)):
-                p0 = posed[i - 1]["pose"]
-                p1 = posed[i]["pose"]
-                dx = float(p1.get("x", 0.0)) - float(p0.get("x", 0.0))
-                dy = float(p1.get("y", 0.0)) - float(p0.get("y", 0.0))
-                dist = math.hypot(dx, dy)
-                if 0.10 <= dist <= 1.5:
-                    step_dxs.append(dx)
-                    step_dys.append(dy)
-
-            mean_dx = float(np.mean(step_dxs)) if step_dxs else 1.0
-            mean_dy = float(np.mean(step_dys)) if step_dys else 0.0
-            norm = math.hypot(mean_dx, mean_dy)
-            ux, uy = (mean_dx / norm, mean_dy / norm) if norm > 1e-4 else (1.0, 0.0)
-            corridor_len = min(7.5, max(4.0, 10.0 ** ((-40.0 - min_r) / 28.0)))
-
-        cx, cy = float(posed[0]["pose"].get("x", 0.0)), float(posed[0]["pose"].get("y", 0.0))
-        prev_rx, prev_ry = cx, cy
+        cx = float(posed[0]["pose"].get("x", 0.0))
+        cy = float(posed[0]["pose"].get("y", 0.0))
+        cz = float(posed[0]["pose"].get("z", 0.0))
+        prev_rx, prev_ry, prev_rz = cx, cy, cz
         prev_sid = posed[0].get("session_id")
+        prev_t = int(posed[0].get("timestamp_ns", 0))
         last_step_t = 0
-        cur_rssi = -52.0
-        corridor_s = 0.0
-        corridor_dir = 1.0
 
         for ev in events:
             pose = ev.get("pose")
             if not isinstance(pose, dict):
                 continue
+
             t = int(ev.get("timestamp_ns", 0))
             sid = ev.get("session_id")
-            if ev.get("event_type") == "connected_probe" and ev.get("rssi_dbm") is not None:
-                cur_rssi = 0.35 * float(ev["rssi_dbm"]) + 0.65 * cur_rssi
+            rx = float(pose.get("x", 0.0))
+            ry = float(pose.get("y", 0.0))
+            rz = float(pose.get("z", 0.0))
 
-            rx, ry = float(pose.get("x", 0.0)), float(pose.get("y", 0.0))
             if sid and prev_sid and sid != prev_sid:
-                dx, dy = 0.0, 0.0
+                dx, dy, dz = 0.0, 0.0, 0.0
                 prev_sid = sid
             else:
-                dx, dy = rx - prev_rx, ry - prev_ry
-            prev_rx, prev_ry = rx, ry
-            step_d = math.hypot(dx, dy)
+                dx, dy, dz = rx - prev_rx, ry - prev_ry, rz - prev_rz
 
-            if step_d > 1e-4:
-                # Ignore unbridged telemetry gap jumps (> 2.5m) or duplicate step triggers (< 350ms)
-                if step_d > 2.5 or (has_indoor_anchor and (t - last_step_t) < 350_000_000):
+            prev_rx, prev_ry, prev_rz = rx, ry, rz
+            step_d = math.hypot(dx, dy)
+            dt_s = max(0.05, (t - prev_t) / 1e9) if prev_t > 0 and t > prev_t else 0.5
+            prev_t = t
+
+            is_static = bool(pose.get("is_stationary", False)) or (
+                ev.get("dwell_state") == "CAMPING" and ev.get("step_count_delta", 0) == 0
+            )
+            if is_static and step_d < 0.25:
+                dx, dy = 0.0, 0.0
+            elif step_d > 2.5 or (step_d / dt_s) > 4.0:
+                # Reject unbridged PDR / origin jumps (> 2.5m single step or > 4 m/s indoor)
+                dx, dy = 0.0, 0.0
+            elif step_d > 1e-4:
+                if (t - last_step_t) < 280_000_000 and step_d < 0.20:
                     dx, dy = 0.0, 0.0
                 else:
                     last_step_t = t
-                    effective_stride = min(0.65, max(0.45, step_d))
 
-                    if use_corridor_regularization:
-                        # Advance along 1D straight corridor line with boundary & RSSI turnarounds
-                        next_s = corridor_s + corridor_dir * effective_stride
-                        if next_s > corridor_len:
-                            corridor_dir = -1.0
-                        elif next_s < 0.0:
-                            corridor_dir = 1.0
-                        elif cur_rssi <= (min_r + 2.0) and corridor_dir > 0 and corridor_s > (0.60 * corridor_len):
-                            corridor_dir = -1.0
-                        elif cur_rssi >= (max_r - 2.5) and corridor_dir < 0 and corridor_s < (0.40 * corridor_len):
-                            corridor_dir = 1.0
-
-                        corridor_s = max(0.0, min(corridor_len, corridor_s + corridor_dir * effective_stride))
-                        cx = ax + corridor_s * ux
-                        cy = ay + corridor_s * uy
-                    else:
-                        cx += dx
-                        cy += dy
-            else:
-                # Stationary interval
-                if use_corridor_regularization:
-                    if cur_rssi >= (max_r - 3.0):
-                        corridor_s = 0.0
-                    elif cur_rssi <= (min_r + 3.0):
-                        corridor_s = corridor_len
-                    cx = ax + corridor_s * ux
-                    cy = ay + corridor_s * uy
+            cx += dx
+            cy += dy
+            if abs(dz) <= 4.0:
+                cz += dz
 
             pose["x"] = round(cx, 4)
             pose["y"] = round(cy, 4)
+            pose["z"] = round(cz, 4)
             if "scans" in ev:
                 for s in ev["scans"]:
                     if isinstance(s.get("pose"), dict):
                         s["pose"]["x"] = round(cx, 4)
                         s["pose"]["y"] = round(cy, 4)
+                        s["pose"]["z"] = round(cz, 4)
 
         return events
 
-    def assemble_session(self, session_id: str) -> Dict[str, Any]:
+    @staticmethod
+    def _compress_camping_probes(
+        events: List[Dict[str, Any]],
+        radius_m: float = 0.15,
+        window_ns: int = 10_000_000_000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Compresses stationary bursts of high-frequency connected_probe events into
+        high-SNR statistical anchor nodes carrying median RSSI, temporal rssi_std,
+        quantiles, median udp_rtt_ms, and sample_count.
+        Non-probe events (wifi_scan_batch, gnss_location, mag_baro_pdr) pass through intact.
+        """
+        if len(events) < 50:
+            return events
+
+        out: List[Dict[str, Any]] = []
+        active_group: Optional[List[Dict[str, Any]]] = None
+
+        def _flush_group(grp: List[Dict[str, Any]]) -> None:
+            if not grp:
+                return
+            if len(grp) == 1:
+                out.append(grp[0])
+                return
+            rep = dict(grp[len(grp) // 2])
+            rssis = [float(g["rssi_dbm"]) for g in grp if g.get("rssi_dbm") is not None]
+            rtts = [float(g["udp_rtt_ms"]) for g in grp if g.get("udp_rtt_ms") is not None]
+            if rssis:
+                arr = np.array(rssis, dtype=np.float32)
+                rep["rssi_dbm"] = float(np.median(arr))
+                rep["rssi_std"] = round(float(np.std(arr)), 3)
+                rep["rssi_p10"] = round(float(np.percentile(arr, 10)), 2)
+                rep["rssi_p90"] = round(float(np.percentile(arr, 90)), 2)
+            if rtts:
+                rep["udp_rtt_ms"] = round(float(np.median(rtts)), 3)
+            rep["sample_count"] = len(grp)
+            rep["is_camping_anchor"] = True
+            out.append(rep)
+
+        for ev in events:
+            et = ev.get("event_type") or ev.get("type")
+            pose = ev.get("pose")
+            if et != "connected_probe" or not isinstance(pose, dict):
+                if active_group is not None:
+                    _flush_group(active_group)
+                    active_group = None
+                out.append(ev)
+                continue
+
+            if active_group is None:
+                active_group = [ev]
+                continue
+
+            head = active_group[0]
+            hp = head["pose"]
+            same_bssid = ev.get("bssid") == head.get("bssid")
+            same_dev = ev.get("device_id") == head.get("device_id")
+            dt = abs(int(ev.get("timestamp_ns", 0)) - int(head.get("timestamp_ns", 0)))
+            dist = math.hypot(float(pose.get("x", 0.0)) - float(hp.get("x", 0.0)),
+                              float(pose.get("y", 0.0)) - float(hp.get("y", 0.0)))
+            if same_bssid and same_dev and dt <= window_ns and dist <= radius_m:
+                active_group.append(ev)
+            else:
+                _flush_group(active_group)
+                active_group = [ev]
+
+        if active_group is not None:
+            _flush_group(active_group)
+
+        return out
+
+    def _fetch_batches_indexed(
+        self,
+        keys: List[str],
+        dev_id: str = "",
+        env_id: str = "",
+        rebuild_index: bool = False,
+    ) -> List[Tuple[str, Optional[Dict[str, Any]], List[Dict[str, Any]]]]:
+        """
+        Fetches and decodes telemetry batches, consulting TelemetryIndex when enabled
+        to avoid re-decompressing historical .ndjson.gz files on every run.
+        """
+        if not keys:
+            return []
+
+        if rebuild_index and self._index is not None:
+            self._index.clear()
+
+        cached_map: Dict[str, Tuple[int, List[Dict[str, Any]]]] = {}
+        if self._index is not None and not rebuild_index:
+            cached_map = self._index.get_cached_batches(keys)
+
+        missing_keys = [k for k in keys if k not in cached_map]
+        fetched_results: Dict[str, Tuple[Optional[Dict[str, Any]], List[Dict[str, Any]]]] = {}
+        to_upsert = []
+        now_ts = time.time()
+
+        if missing_keys:
+            from concurrent.futures import as_completed
+            total_missing = len(missing_keys)
+            if total_missing >= 200:
+                print(
+                    f"[Stage 0] Indexing {total_missing} uncached batches for "
+                    f"{dev_id or env_id or 'session'} ({len(cached_map)} SQLite hits)...",
+                    flush=True,
+                )
+
+            def _fetch_one(k: str):
+                try:
+                    raw = self.adapter.read_object_bytes(k)
+                    env, evs = self._parse_batch_bytes(raw, k)
+                    return k, len(raw), env, evs
+                except Exception:
+                    return k, 0, None, []
+
+            max_workers = min(48, max(1, total_missing))
+            done_cnt = 0
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futs = [executor.submit(_fetch_one, k) for k in missing_keys]
+                for fut in as_completed(futs):
+                    k, sz, env, evs = fut.result()
+                    done_cnt += 1
+                    if total_missing >= 200 and (done_cnt % 1000 == 0 or done_cnt == total_missing):
+                        print(f"          Indexed {done_cnt}/{total_missing} batches...", flush=True)
+                    fetched_results[k] = (env, evs)
+                    if sz > 0 and (env is not None or evs):
+                        tier = "hf" if "/hf/" in k.replace("\\", "/") else ("lf" if "/lf/" in k.replace("\\", "/") else "default")
+                        ts_vals = [int(e.get("timestamp_ns", 0)) for e in evs if e.get("timestamp_ns")]
+                        min_ts = min(ts_vals) if ts_vals else 0
+                        max_ts = max(ts_vals) if ts_vals else 0
+                        is_tr = 1 if (env and env.get("is_transit")) else 0
+                        payload = {"env": env, "evs": evs}
+                        to_upsert.append((k, sz, dev_id, env_id, tier, len(evs), min_ts, max_ts, is_tr, payload, now_ts))
+
+            if to_upsert and self._index is not None:
+                try:
+                    self._index.put_batches(to_upsert)
+                except Exception:
+                    pass
+
+        out: List[Tuple[str, Optional[Dict[str, Any]], List[Dict[str, Any]]]] = []
+        for k in keys:
+            if k in cached_map:
+                payload = cached_map[k][1]
+                if isinstance(payload, dict) and "evs" in payload:
+                    out.append((k, payload.get("env"), payload.get("evs", [])))
+                else:
+                    out.append((k, None, payload if isinstance(payload, list) else []))
+            else:
+                env, evs = fetched_results.get(k, (None, []))
+                out.append((k, env, evs))
+        return out
+
+    def assemble_session(self, session_id: str, rebuild_index: bool = False) -> Dict[str, Any]:
         """
         Assembles all telemetry batches for a single session or environment into
         a deduplicated, chronologically ordered event stream.
@@ -593,17 +744,9 @@ class SessionAssembler:
         envelopes = []
         seen_batch_ids = set()
 
-        def _fetch_batch(k):
-            try:
-                raw = self.adapter.read_object_bytes(k)
-                env, evs = self._parse_batch_bytes(raw, k)
-                return k, env, evs
-            except Exception:
-                return k, None, []
-
-        max_workers = min(32, max(1, len(object_keys)))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            batch_results = list(executor.map(_fetch_batch, object_keys))
+        batch_results = self._fetch_batches_indexed(
+            object_keys, env_id=session_id, rebuild_index=rebuild_index
+        )
 
         for key, envelope, batch_events in batch_results:
             if envelope:
@@ -620,6 +763,7 @@ class SessionAssembler:
 
         all_events = self._reconcile_stream_clocks(all_events)
         all_events.sort(key=lambda ev: ev.get("timestamp_ns", 0))
+        all_events = self._compress_camping_probes(all_events)
         sanitized_events = self._filter_transient_hotspots(all_events)
 
         return {
@@ -637,14 +781,15 @@ class SessionAssembler:
         self,
         env_id: str,
         device_ids: Optional[List[str]] = None,
-        align_coordinates: bool = True
+        align_coordinates: bool = True,
+        rebuild_index: bool = False,
     ) -> Dict[str, Any]:
         """
         Assembles batches across multiple devices for a shared environment:
         1. Discovers all devices mapping env_id.
-        2. Ingests and deduplicates events per device.
-        3. Aligns device trajectories into a unified coordinate frame using shared APs.
-        4. Merges into a consolidated chronological stream.
+        2. Ingests and deduplicates events per device via incremental SQLite index.
+        3. Compresses stationary camping probes into high-SNR anchor nodes.
+        4. Aligns device trajectories into a unified coordinate frame.
         """
         partitioner = SessionPartitioner(self.adapter)
         if env_id.startswith("cluster_"):
@@ -665,21 +810,12 @@ class SessionAssembler:
         all_envelopes: List[Dict[str, Any]] = []
         total_batches = 0
 
-        for dev_id, keys in device_batches.items():
+        for idx_dev, (dev_id, keys) in enumerate(device_batches.items()):
             seen_batch_ids = set()
             dev_evs = []
-
-            def _fetch_dev_batch(k):
-                try:
-                    raw = self.adapter.read_object_bytes(k)
-                    env, evs = self._parse_batch_bytes(raw, k)
-                    return k, env, evs
-                except Exception:
-                    return k, None, []
-
-            max_workers = min(32, max(1, len(keys)))
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                dev_results = list(executor.map(_fetch_dev_batch, keys))
+            dev_results = self._fetch_batches_indexed(
+                keys, dev_id=dev_id, env_id=env_id, rebuild_index=(rebuild_index and idx_dev == 0)
+            )
 
             # Exclude stationary leftover sessions (0 PDR steps) when active walking sessions exist for this device
             sid_pdr_counts: Dict[str, int] = {}
@@ -709,6 +845,7 @@ class SessionAssembler:
 
             dev_evs = self._reconcile_stream_clocks(dev_evs)
             dev_evs.sort(key=lambda ev: ev.get("timestamp_ns", 0))
+            dev_evs = self._compress_camping_probes(dev_evs)
             device_events[dev_id] = dev_evs
             total_batches += len(seen_batch_ids)
 

@@ -25,24 +25,27 @@ class FloorplanVectorizer:
         doorways: List[Tuple[float, float]],
         wall_threshold_db: float = 2.5,
         ray_data: Optional[List[Tuple[float, float, float, float, float]]] = None,
-        ray_density_map: Optional[np.ndarray] = None
+        ray_density_map: Optional[np.ndarray] = None,
+        camping_shells: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         ny, nx = grid.shape
 
-        # 1. Non-Maximum Suppression (NMS) Ridge Thinning
-        binary_walls = (grid >= wall_threshold_db)
+        # 1. Physical Gating & Non-Maximum Suppression (NMS) Ridge Thinning
+        effective_thresh = float(wall_threshold_db)
+        if ray_data:
+            effective_thresh = max(1.0, effective_thresh)
+        binary_walls = (grid >= effective_thresh)
         if free_mask is not None and free_mask.shape == binary_walls.shape:
             binary_walls[free_mask] = False
 
         thinned = self._thin_ridges(grid, binary_walls)
 
-        # 2. Extract Orthogonal Vector Segments (Horizontal & Vertical Lines)
+        # 2. Extract Orthogonal + Oriented Vector Segments
         horiz_segments = self._extract_horizontal_lines(thinned, doorways)
         vert_segments = self._extract_vertical_lines(thinned, doorways)
-        raw_segments = horiz_segments + vert_segments
-
-        # 3. Collinear segment merging (bridge micro-gaps < 0.45m without doorways)
-        merged_segments = self._merge_collinear_segments(raw_segments, doorways, max_gap_m=0.45)
+        merged_ortho = self._merge_collinear_segments(horiz_segments + vert_segments, doorways, max_gap_m=0.45)
+        diag_segments = self._extract_oriented_segments(thinned, merged_ortho, min_length_m=0.9)
+        merged_segments = merged_ortho + diag_segments
 
         # 4. Compute Ray Density Grid if not provided
         if ray_density_map is None:
@@ -50,6 +53,14 @@ class FloorplanVectorizer:
 
         # 5. Enrich Segments with Confidence Scores, Material Guess & Ray Hits
         enriched_walls = self._enrich_wall_confidence(merged_segments, grid, ray_density_map, ray_data)
+
+        # 5b. For stationary/low-angle camping surveys without full CT cross-rays,
+        # synthesize speculative directional partition cues from obstructed camping sectors.
+        if camping_shells:
+            spec_walls = self._extract_camping_partition_cues(
+                camping_shells, enriched_walls, free_mask, nx * self.res, ny * self.res
+            )
+            enriched_walls.extend(spec_walls)
 
         # 6. Segment Discrete Room Polygons via Flood-Fill Watershed
         rooms = self._extract_room_polygons(thinned, free_mask)
@@ -61,6 +72,62 @@ class FloorplanVectorizer:
             "grid_dimensions": {"width_m": nx * self.res, "height_m": ny * self.res},
             "ray_density_map": ray_density_map.tolist() if ray_density_map is not None else None
         }
+
+    def _extract_camping_partition_cues(
+        self,
+        camping_shells: List[Dict[str, Any]],
+        existing_walls: List[Dict[str, Any]],
+        free_mask: Optional[np.ndarray],
+        width_m: float,
+        height_m: float,
+    ) -> List[Dict[str, Any]]:
+        """Generates speculative directional barrier segments from obstructed camping shell sectors."""
+        cues: List[Dict[str, Any]] = []
+        ny, nx = free_mask.shape if free_mask is not None else (0, 0)
+        for sh in camping_shells:
+            cx, cy = float(sh.get("x", 0.0)), float(sh.get("y", 0.0))
+            for sec in sh.get("sectors", []):
+                room = (sec.get("tiers") or {}).get("room")
+                if not room or room.get("status") == "unobserved":
+                    continue
+                m_ex = float(room.get("mean_excess_db", 0.0))
+                rays = int(room.get("rays", 0))
+                if m_ex < 3.0 or rays < 1:
+                    continue
+                ang_rad = math.radians(float(sec.get("azimuth_deg", 0.0)))
+                r_dist = 2.0
+                wx = max(0.3, min(width_m - 0.3, cx + math.cos(ang_rad) * r_dist))
+                wy = max(0.3, min(height_m - 0.3, cy + math.sin(ang_rad) * r_dist))
+                if free_mask is not None and nx > 0 and ny > 0:
+                    ix = max(0, min(nx - 1, int(wx / self.res)))
+                    iy = max(0, min(ny - 1, int(wy / self.res)))
+                    if free_mask[iy, ix]:
+                        continue
+                # Skip if already represented by a nearby CAD wall
+                near_existing = any(
+                    math.hypot(((w["x1"] + w["x2"]) * 0.5) - wx, ((w["y1"] + w["y2"]) * 0.5) - wy) < 1.1
+                    for w in existing_walls
+                )
+                if near_existing:
+                    continue
+                half_len = 0.55
+                tx, ty = -math.sin(ang_rad) * half_len, math.cos(ang_rad) * half_len
+                x1, y1 = round(max(0.1, min(width_m - 0.1, wx - tx)), 2), round(max(0.1, min(height_m - 0.1, wy - ty)), 2)
+                x2, y2 = round(max(0.1, min(width_m - 0.1, wx + tx)), 2), round(max(0.1, min(height_m - 0.1, wy + ty)), 2)
+                conf = round(max(0.15, min(0.38, 0.15 + 0.02 * min(8.0, m_ex) + 0.015 * min(6, rays))), 2)
+                cues.append({
+                    "wall_id": f"camp_wall_{len(existing_walls) + len(cues) + 1}",
+                    "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                    "length_m": round(math.hypot(x2 - x1, y2 - y1), 2),
+                    "confidence": conf,
+                    "classification": "speculative",
+                    "avg_attenuation_db": round(m_ex, 2),
+                    "peak_attenuation_db": round(m_ex, 2),
+                    "ray_hits": rays,
+                    "angular_diversity_deg": 0.0,
+                    "material_guess": "Speculative Camping Barrier (Single-Angle RF Shadow)",
+                })
+        return cues
 
     def _thin_ridges(self, grid: np.ndarray, binary_walls: np.ndarray) -> np.ndarray:
         """Keeps only local maxima along horizontal or vertical slices."""
@@ -353,8 +420,12 @@ class FloorplanVectorizer:
             else:
                 classification = "speculative"
 
+            if ray_data and (ray_hits == 0 or avg_attenuation < 0.8):
+                # Do not hallucinate uncrossed noise ripples as architectural walls
+                continue
+
             enriched.append({
-                "wall_id": f"wall_{seg_idx}",
+                "wall_id": f"wall_{len(enriched) + 1}",
                 "x1": round(x1, 2),
                 "y1": round(y1, 2),
                 "x2": round(x2, 2),
@@ -370,6 +441,72 @@ class FloorplanVectorizer:
             })
 
         return enriched
+
+    def _extract_oriented_segments(
+        self,
+        thinned: np.ndarray,
+        ortho_segments: List[Dict[str, Any]],
+        min_length_m: float = 0.9,
+    ) -> List[Dict[str, Any]]:
+        """Extracts diagonal/non-axis-aligned wall ridges via connected-component PCA."""
+        ny, nx = thinned.shape
+        uncovered = np.copy(thinned)
+        for seg in ortho_segments:
+            dist = math.hypot(seg["x2"] - seg["x1"], seg["y2"] - seg["y1"])
+            steps = max(2, int(dist / (self.res * 0.5)))
+            for s in range(steps + 1):
+                t = s / float(steps)
+                ix = int(round((seg["x1"] + t * (seg["x2"] - seg["x1"])) / self.res))
+                iy = int(round((seg["y1"] + t * (seg["y2"] - seg["y1"])) / self.res))
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        if 0 <= ix + dx < nx and 0 <= iy + dy < ny:
+                            uncovered[iy + dy, ix + dx] = False
+
+        visited = np.zeros_like(uncovered, dtype=bool)
+        segments: List[Dict[str, Any]] = []
+        min_pts = max(4, int(min_length_m / self.res))
+
+        for iy in range(ny):
+            for ix in range(nx):
+                if not uncovered[iy, ix] or visited[iy, ix]:
+                    continue
+                comp = []
+                q = [(ix, iy)]
+                visited[iy, ix] = True
+                while q:
+                    cx, cy = q.pop()
+                    comp.append((cx * self.res, cy * self.res))
+                    for dy in (-1, 0, 1):
+                        for dx in (-1, 0, 1):
+                            if dx == 0 and dy == 0:
+                                continue
+                            nx_c, ny_c = cx + dx, cy + dy
+                            if 0 <= nx_c < nx and 0 <= ny_c < ny:
+                                if uncovered[ny_c, nx_c] and not visited[ny_c, nx_c]:
+                                    visited[ny_c, nx_c] = True
+                                    q.append((nx_c, ny_c))
+                if len(comp) < min_pts:
+                    continue
+                pts = np.array(comp, dtype=np.float64)
+                mean = np.mean(pts, axis=0)
+                centered = pts - mean
+                cov = np.cov(centered.T)
+                vals, vecs = np.linalg.eigh(cov)
+                major = vecs[:, 1]
+                minor_std = math.sqrt(max(0.0, float(vals[0])))
+                proj = centered @ major
+                length_m = float(proj.max() - proj.min())
+                if length_m >= min_length_m and minor_std <= 0.45:
+                    p1 = mean + proj.min() * major
+                    p2 = mean + proj.max() * major
+                    segments.append({
+                        "x1": round(float(p1[0]), 2),
+                        "y1": round(float(p1[1]), 2),
+                        "x2": round(float(p2[0]), 2),
+                        "y2": round(float(p2[1]), 2),
+                    })
+        return segments
 
     @staticmethod
     def _segments_intersect(x1: float, y1: float, x2: float, y2: float, x3: float, y3: float, x4: float, y4: float) -> bool:

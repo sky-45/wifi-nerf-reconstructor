@@ -1,237 +1,60 @@
 """
-Two-Tier Physics Inversion Engine.
-Tier 3A: Fast Sparse FISTA Tomography (L1 + TV regularization warm-start < 0.4s)
-Tier 3B: Warm-Started NeRFMap Coordinate MLP (Fourier PosEnc + Differentiable LoS + 1st-Order Reflections)
-Reconstructs 2D wall attenuation grid delta(x, y) in dB/m.
+True 3D Volumetric RF Tomography & Camping Shadow-Shell Engine.
 
-Features:
-- Optional PyTorch CUDA tensor execution path (batched GPU tensors for coordinate MLP and ray-voxel loss)
-- Automatic CPU / pure NumPy fallback when CUDA is unavailable or disabled
-- Configurable Fourier bands, MLP dimensions, and FISTA regularizations
+Replaces the legacy multi-architecture 2D cascade with a unified, physically-calibrated
+3D voxel attenuation field sigma(z, y, x) in dB/m:
+1. True 3D Siddon ray marching between 3D APs (including multi-floor z_m) and UE poses.
+2. Voxel-hit-normalized (Jacobi-preconditioned) FISTA + 3D Total Variation + L1 sparsity,
+   eliminating the N_rays gradient collapse (0.3 dB/m) regardless of ray count.
+3. 3D Line-of-Sight clear-air carving for low-excess rays and hard free-space zeroing.
+4. Camping Directional Shadow Shells (24 azimuth sectors x 3 vertical tiers) for
+   stationary/low-baseline camping environments where 360-deg CT rays do not exist.
 """
 
 import math
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 
 try:
     import torch
-    import torch.nn as nn
-    import torch.nn.functional as F
     HAS_TORCH = True
 except ImportError:
     HAS_TORCH = False
 
 
-class CoordinateMLP(nn.Module if HAS_TORCH else object):
-    """2-layer Coordinate MLP for NeRF continuous attenuation field."""
-    def __init__(self, in_features: int, hidden_dim: int = 32):
-        if not HAS_TORCH:
-            return
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(in_features, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.ReLU()
-        )
-        # Small weights initialization for stable warm-start
-        for m in self.net.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight, gain=0.1)
-                nn.init.zeros_(m.bias)
-
-    def forward(self, x):
-        return self.net(x)
-
-
-class SineLayer(nn.Module if HAS_TORCH else object):
-    """Periodic Sine activation layer for SIREN."""
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, is_first: bool = False, omega_0: float = 30.0):
-        if not HAS_TORCH: return
-        super().__init__()
-        self.omega_0 = omega_0
-        self.is_first = is_first
-        self.linear = nn.Linear(in_features, out_features, bias=bias)
-        self.init_weights(in_features)
-
-    def init_weights(self, in_features: int):
-        with torch.no_grad():
-            if self.is_first:
-                self.linear.weight.uniform_(-1.0 / in_features, 1.0 / in_features)
-            else:
-                self.linear.weight.uniform_(
-                    -math.sqrt(6.0 / in_features) / self.omega_0,
-                    math.sqrt(6.0 / in_features) / self.omega_0
-                )
-
-    def forward(self, x):
-        return torch.sin(self.omega_0 * self.linear(x))
-
-
-class SIRENCoordinateNet(nn.Module if HAS_TORCH else object):
-    """Sinusoidal Representation Network (SIREN) for sharp continuous RF fields."""
-    def __init__(self, in_features: int = 2, hidden_dim: int = 32, hidden_layers: int = 2, omega_0: float = 30.0):
-        if not HAS_TORCH: return
-        super().__init__()
-        layers = [SineLayer(in_features, hidden_dim, is_first=True, omega_0=omega_0)]
-        for _ in range(hidden_layers):
-            layers.append(SineLayer(hidden_dim, hidden_dim, is_first=False, omega_0=omega_0))
-        self.net = nn.Sequential(*layers)
-        self.final_linear = nn.Linear(hidden_dim, 1)
-        with torch.no_grad():
-            self.final_linear.weight.uniform_(-math.sqrt(6.0 / hidden_dim) / omega_0, math.sqrt(6.0 / hidden_dim) / omega_0)
-
-    def forward(self, coords):
-        feat = self.net(coords)
-        out = self.final_linear(feat)
-        return F.relu(out)
-
-
-class MultiResolutionHashGridEncoding(nn.Module if HAS_TORCH else object):
-    """Instant-NGP style multi-resolution spatial hash table feature encoder."""
-    def __init__(
-        self,
-        num_levels: int = 8,
-        features_per_level: int = 2,
-        log2_hashmap_size: int = 14,
-        base_resolution: int = 16,
-        finest_resolution: int = 128
-    ):
-        if not HAS_TORCH: return
-        super().__init__()
-        self.num_levels = num_levels
-        self.features_per_level = features_per_level
-        self.hashmap_size = 2 ** log2_hashmap_size
-        self.b = math.exp((math.log(finest_resolution) - math.log(base_resolution)) / max(1, num_levels - 1))
-        self.base_resolution = base_resolution
-
-        self.tables = nn.ModuleList([
-            nn.Embedding(self.hashmap_size, features_per_level)
-            for _ in range(num_levels)
-        ])
-        for table in self.tables:
-            nn.init.uniform_(table.weight, -1e-4, 1e-4)
-
-    def _hash(self, coords: Any) -> Any:
-        primes = torch.tensor([1, 2654435761], device=coords.device, dtype=torch.long)
-        return torch.abs((coords * primes).sum(dim=-1)) % self.hashmap_size
-
-    def forward(self, x: Any) -> Any:
-        features = []
-        for l in range(self.num_levels):
-            res = math.floor(self.base_resolution * (self.b ** l))
-            scaled = x * res
-            c0 = torch.floor(scaled).long()
-            c1 = c0 + 1
-            w = scaled - c0.float()
-
-            h00 = self._hash(c0)
-            h10 = self._hash(torch.stack([c1[:, 0], c0[:, 1]], dim=-1))
-            h01 = self._hash(torch.stack([c0[:, 0], c1[:, 1]], dim=-1))
-            h11 = self._hash(c1)
-
-            t = self.tables[l]
-            v00, v10 = t(h00), t(h10)
-            v01, v11 = t(h01), t(h11)
-
-            interp = (
-                (1 - w[:, 0:1]) * (1 - w[:, 1:2]) * v00 +
-                w[:, 0:1] * (1 - w[:, 1:2]) * v10 +
-                (1 - w[:, 0:1]) * w[:, 1:2] * v01 +
-                w[:, 0:1] * w[:, 1:2] * v11
-            )
-            features.append(interp)
-
-        return torch.cat(features, dim=-1)
-
-
-class HashGridNeRFModel(nn.Module if HAS_TORCH else object):
-    """Instant-NGP Hash Grid NeRF mapping coordinates to wall attenuation."""
-    def __init__(self, num_levels: int = 8, features_per_level: int = 2, hidden_dim: int = 32):
-        if not HAS_TORCH: return
-        super().__init__()
-        self.encoder = MultiResolutionHashGridEncoding(num_levels, features_per_level)
-        in_dim = num_levels * features_per_level
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.ReLU()
-        )
-
-    def forward(self, coords: Any) -> Any:
-        feats = self.encoder(coords)
-        return self.mlp(feats)
-
-
-class Volumetric3DCoordinateMLP(nn.Module if HAS_TORCH else object):
-    """Height-aware 3D continuous NeRF field delta(x, y, z) in dB/m."""
-    def __init__(self, fourier_bands: int = 4, hidden_dim: int = 32):
-        if not HAS_TORCH: return
-        super().__init__()
-        self.fourier_bands = fourier_bands
-        in_dim = 6 * fourier_bands
-        self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1),
-            nn.ReLU()
-        )
-
-    def forward(self, coords_3d: Any) -> Any:
-        freqs = [2.0 ** k for k in range(self.fourier_bands)]
-        feats = []
-        for freq in freqs:
-            for dim in range(3):
-                feats.append(torch.sin(freq * math.pi * coords_3d[:, dim:dim+1]))
-                feats.append(torch.cos(freq * math.pi * coords_3d[:, dim:dim+1]))
-        feat_tensor = torch.cat(feats, dim=-1)
-        return self.net(feat_tensor)
-
-
-class DirectionalAntennaPattern(nn.Module if HAS_TORCH else object):
-    """Learns directional antenna radiation offset delta_P0(theta, phi) in dB."""
-    def __init__(self, hidden_dim: int = 16):
-        if not HAS_TORCH: return
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(2, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
-        with torch.no_grad():
-            self.net[-1].weight.zero_()
-            self.net[-1].bias.zero_()
-
-    def forward(self, ray_directions: Any) -> Any:
-        return self.net(ray_directions)
-
-
-class NeRFMapEngine:
+class Volumetric3DEngine:
     """
-    Two-Tier Physics Inversion:
-    1. Precomputes Sparse Ray-Voxel matrix L
-    2. Runs fast FISTA Tomography with hard free-space zeroing
-    3. Refines wall boundaries via Fourier-Feature Coordinate MLP with specular reflection physics
+    3D Volumetric RF Attenuation Solver sigma(z, y, x) [dB/m] with 2D interior projection.
     """
 
     def __init__(
         self,
         room_width_m: float = 10.0,
         room_height_m: float = 8.0,
-        resolution_m: float = 0.20,
-        device: Optional[str] = None
+        resolution_m: float = 0.25,
+        z_min_m: float = -4.0,
+        z_max_m: float = 6.0,
+        z_resolution_m: float = 0.50,
+        device: Optional[str] = None,
     ):
-        self.res = resolution_m
-        self.nx = int(math.ceil(room_width_m / self.res))
-        self.ny = int(math.ceil(room_height_m / self.res))
-        self.total_voxels = self.nx * self.ny
-        self.grid = np.zeros((self.ny, self.nx), dtype=np.float32)
+        self.res = float(resolution_m)
+        self.z_res = float(z_resolution_m)
+        self.z_min_m = float(z_min_m)
+        self.z_max_m = float(z_max_m)
 
-        # Device selection & CUDA availability check
+        self.nx = max(1, int(math.ceil(room_width_m / self.res)))
+        self.ny = max(1, int(math.ceil(room_height_m / self.res)))
+        self.nz = max(1, int(math.ceil((self.z_max_m - self.z_min_m) / self.z_res)))
+
+        self.total_voxels_2d = self.nx * self.ny
+        self.total_voxels_3d = self.nz * self.ny * self.nx
+
+        self.grid_3d = np.zeros((self.nz, self.ny, self.nx), dtype=np.float32)
+        self.hit_counts_3d = np.zeros((self.nz, self.ny, self.nx), dtype=np.float32)
+        self.clear_mask_3d = np.zeros((self.nz, self.ny, self.nx), dtype=bool)
+        self.grid = np.zeros((self.ny, self.nx), dtype=np.float32)
+        self.hit_counts_2d = np.zeros((self.ny, self.nx), dtype=np.float32)
+
         self.using_cuda = False
         self.torch_device = None
         if HAS_TORCH:
@@ -241,366 +64,457 @@ class NeRFMapEngine:
                 self.torch_device = torch.device("cuda:0")
             else:
                 self.torch_device = torch.device("cpu")
-            self.using_cuda = (self.torch_device.type == "cuda")
+            self.using_cuda = self.torch_device.type == "cuda"
 
-    def march_ray_voxels(self, x0: float, y0: float, x1: float, y1: float) -> List[Tuple[int, int, float]]:
-        """Siddon-style ray marching yielding (ix, iy, length_in_voxel_m)."""
+    def _z_to_iz(self, z_m: float) -> int:
+        iz = int(math.floor((z_m - self.z_min_m) / self.z_res))
+        return max(0, min(self.nz - 1, iz))
+
+    def march_ray_voxels(
+        self, x0: float, y0: float, x1: float, y1: float
+    ) -> List[Tuple[int, int, float]]:
+        """2D Siddon-style ray marching yielding (ix, iy, length_in_voxel_m)."""
         dist = math.hypot(x1 - x0, y1 - y0)
         if dist < 1e-4:
             return []
-        steps = int(math.ceil(dist / (self.res * 0.4)))
-        visited = {}
+        steps = max(2, int(math.ceil(dist / (self.res * 0.4))))
+        visited: Dict[Tuple[int, int], int] = {}
         for s in range(steps + 1):
             t = s / float(steps)
-            cx = (x0 + t * (x1 - x0)) / self.res
-            cy = (y0 + t * (y1 - y0)) / self.res
-            ix, iy = int(math.floor(cx)), int(math.floor(cy))
+            ix = int(math.floor((x0 + t * (x1 - x0)) / self.res))
+            iy = int(math.floor((y0 + t * (y1 - y0)) / self.res))
             if 0 <= ix < self.nx and 0 <= iy < self.ny:
                 visited[(ix, iy)] = visited.get((ix, iy), 0) + 1
-
         total_samples = max(1, sum(visited.values()))
-        return [(ix, iy, (count / total_samples) * dist) for (ix, iy), count in visited.items()]
+        return [
+            (ix, iy, (cnt / total_samples) * dist)
+            for (ix, iy), cnt in visited.items()
+        ]
 
-    def _build_sparse_ray_tensors_cuda(
+    def march_ray_voxels_3d(
         self,
-        rays_processed: List[Tuple[List[Tuple[int, int, float]], float]]
-    ) -> Tuple[Any, Any, Any]:
-        """Builds PyTorch sparse ray matrix L, transposed L^T, and target vector on GPU."""
-        num_rays = len(rays_processed)
-        rows, cols, vals = [], [], []
+        x0: float,
+        y0: float,
+        z0: float,
+        x1: float,
+        y1: float,
+        z1: float,
+    ) -> List[Tuple[int, int, int, float]]:
+        """3D Siddon-style ray marching yielding (ix, iy, iz, length_in_voxel_m)."""
+        dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+        dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+        if dist < 1e-4:
+            return []
+        step_m = min(self.res, self.z_res) * 0.45
+        steps = max(2, int(math.ceil(dist / max(0.05, step_m))))
+        visited: Dict[Tuple[int, int, int], int] = {}
+        for s in range(steps + 1):
+            t = s / float(steps)
+            ix = int(math.floor((x0 + t * dx) / self.res))
+            iy = int(math.floor((y0 + t * dy) / self.res))
+            iz = int(math.floor(((z0 + t * dz) - self.z_min_m) / self.z_res))
+            if 0 <= ix < self.nx and 0 <= iy < self.ny and 0 <= iz < self.nz:
+                visited[(ix, iy, iz)] = visited.get((ix, iy, iz), 0) + 1
+        total_samples = max(1, sum(visited.values()))
+        return [
+            (ix, iy, iz, (cnt / total_samples) * dist)
+            for (ix, iy, iz), cnt in visited.items()
+        ]
 
-        for r_idx, (intersections, _) in enumerate(rays_processed):
-            for ix, iy, length in intersections:
-                flat_idx = iy * self.nx + ix
-                rows.append(r_idx)
-                cols.append(flat_idx)
-                vals.append(length)
-
-        if not rows:
-            return None, None, None
-
-        indices = torch.tensor([rows, cols], dtype=torch.long, device=self.torch_device)
-        values = torch.tensor(vals, dtype=torch.float32, device=self.torch_device)
-        shape = (num_rays, self.total_voxels)
-        L = torch.sparse_coo_tensor(indices, values, shape, device=self.torch_device, check_invariants=False).coalesce()
-
-        # Transposed sparse tensor
-        t_indices = torch.tensor([cols, rows], dtype=torch.long, device=self.torch_device)
-        t_shape = (self.total_voxels, num_rays)
-        L_t = torch.sparse_coo_tensor(t_indices, values, t_shape, device=self.torch_device, check_invariants=False).coalesce()
-
-        targets = torch.tensor([r[1] for r in rays_processed], dtype=torch.float32, device=self.torch_device)
-        return L, L_t, targets
-
-    def run_tier3a_fista_tomography(
+    def run_3d_tomography(
         self,
-        ray_data: List[Tuple[float, float, float, float, float]], # (ap_x, ap_y, rx_x, rx_y, excess_wall_loss_db)
+        ray_data_3d: List[Tuple[float, float, float, float, float, float, float]],
         free_mask: Optional[np.ndarray],
-        iterations: int = 40,
+        iterations: int = 45,
         l1_reg: float = 0.005,
-        tv_reg: float = 0.01,
-        step_size: float = 0.03
+        tv_reg: float = 0.02,
+        step_size: float = 0.35,
+        los_clear_excess_db: float = 1.5,
     ) -> np.ndarray:
         """
-        Fast Iterative Shrinkage-Thresholding Algorithm (FISTA)
-        with Total Variation + L1 sparsity and hard free-space projection.
-        Executes on PyTorch CUDA when available, with automatic CPU/NumPy fallback.
+        Solves 3D volumetric attenuation field grid_3d[nz, ny, nx] in dB/m.
+        ray_data_3d items: (ap_x, ap_y, ap_z, rx_x, rx_y, rx_z, excess_loss_db).
+        Returns the 2D interior room projection grid_2d[ny, nx] for CAD extraction.
         """
-        rays_processed = []
-        for apx, apy, rxx, rxy, target_db in ray_data:
-            intersections = self.march_ray_voxels(apx, apy, rxx, rxy)
-            if intersections:
-                rays_processed.append((intersections, target_db))
+        rays_processed: List[Tuple[List[Tuple[int, int, int, float]], float]] = []
+        hit_weights = np.zeros((self.nz, self.ny, self.nx), dtype=np.float32)
+        clear_votes = np.zeros((self.nz, self.ny, self.nx), dtype=np.int32)
+        blocked_votes = np.zeros((self.nz, self.ny, self.nx), dtype=np.int32)
+        hit_counts_2d = np.zeros((self.ny, self.nx), dtype=np.float32)
+
+        for apx, apy, apz, rxx, rxy, rxz, target_db in ray_data_3d:
+            inter = self.march_ray_voxels_3d(apx, apy, apz, rxx, rxy, rxz)
+            if not inter:
+                continue
+            target_db = max(0.0, float(target_db))
+            is_clear_los = target_db < min(0.8, los_clear_excess_db)
+            is_blocked = target_db >= 2.5
+            rays_processed.append((inter, target_db))
+            for ix, iy, iz, length in inter:
+                hit_weights[iz, iy, ix] += length
+                if 0.0 <= (self.z_min_m + (iz + 0.5) * self.z_res) <= 2.8:
+                    hit_counts_2d[iy, ix] += 1.0
+                if is_clear_los:
+                    clear_votes[iz, iy, ix] += 1
+                if is_blocked:
+                    blocked_votes[iz, iy, ix] += 1
+
+        # Clear air only where LoS rays strongly dominate blocked rays (plus walked free_mask)
+        clear_mask_3d = (clear_votes >= 2) & (clear_votes > 2 * blocked_votes)
+
+        # Walked free-space mask zeroes room-level voxels (0 <= z <= 2.4m)
+        if free_mask is not None and free_mask.shape == (self.ny, self.nx):
+            for iz in range(self.nz):
+                zc = self.z_min_m + (iz + 0.5) * self.z_res
+                if -0.2 <= zc <= 2.4:
+                    clear_mask_3d[iz] |= free_mask
+
+        self.hit_counts_3d = hit_weights
+        self.hit_counts_2d = hit_counts_2d
+        self.clear_mask_3d = clear_mask_3d
 
         if not rays_processed:
             return self.grid
 
-        # -------------------------------------------------------------
-        # Path A: PyTorch CUDA Accelerated FISTA
-        # -------------------------------------------------------------
+        # Jacobi preconditioner: normalize each voxel gradient by its accumulated ray path weight
+        norm_denom = np.maximum(1.0, hit_weights)
+
         if self.using_cuda and HAS_TORCH:
             try:
-                L, L_t, targets = self._build_sparse_ray_tensors_cuda(rays_processed)
-                if L is not None:
-                    num_rays = len(rays_processed)
-                    x = torch.zeros(self.total_voxels, dtype=torch.float32, device=self.torch_device)
-                    y = x.clone()
-                    t = 1.0
+                rows, cols, vals, targets = [], [], [], []
+                stride_z = self.ny * self.nx
+                for r_idx, (inter, target_db) in enumerate(rays_processed):
+                    targets.append(target_db)
+                    for ix, iy, iz, length in inter:
+                        rows.append(r_idx)
+                        cols.append(iz * stride_z + iy * self.nx + ix)
+                        vals.append(length)
 
-                    free_mask_t = None
-                    if free_mask is not None and free_mask.shape == (self.ny, self.nx):
-                        free_mask_t = torch.from_numpy(free_mask).bool().to(self.torch_device)
+                if rows:
+                    idx_t = torch.tensor([rows, cols], dtype=torch.long, device=self.torch_device)
+                    val_t = torch.tensor(vals, dtype=torch.float32, device=self.torch_device)
+                    L = torch.sparse_coo_tensor(
+                        idx_t, val_t, (len(rays_processed), self.total_voxels_3d),
+                        device=self.torch_device, check_invariants=False
+                    ).coalesce()
+                    L_t = torch.sparse_coo_tensor(
+                        torch.tensor([cols, rows], dtype=torch.long, device=self.torch_device),
+                        val_t, (self.total_voxels_3d, len(rays_processed)),
+                        device=self.torch_device, check_invariants=False
+                    ).coalesce()
+                    tgt_t = torch.tensor(targets, dtype=torch.float32, device=self.torch_device)
+                    denom_t = torch.from_numpy(norm_denom.reshape(-1)).to(self.torch_device)
+                    clear_t = torch.from_numpy(clear_mask_3d).to(self.torch_device)
+
+                    x = torch.zeros(self.total_voxels_3d, dtype=torch.float32, device=self.torch_device)
+                    y = x.clone()
+                    t_mom = 1.0
 
                     for _ in range(iterations):
-                        # L @ y -> predicted ray attenuation
                         pred = torch.sparse.mm(L, y.unsqueeze(1)).squeeze(1)
-                        err = pred - targets
-                        # L^T @ (2 * err / N) -> data fidelity gradient
-                        grad = torch.sparse.mm(L_t, ((2.0 / num_rays) * err).unsqueeze(1)).squeeze(1)
+                        err = pred - tgt_t
+                        grad = torch.sparse.mm(L_t, (2.0 * err).unsqueeze(1)).squeeze(1) / denom_t
 
-                        # Gradient step
                         x_next = y - step_size * grad
-
-                        # Proximal L1 operator (Soft Thresholding)
                         x_next = torch.sign(x_next) * torch.clamp(torch.abs(x_next) - step_size * l1_reg, min=0.0)
+                        xg = x_next.view(self.nz, self.ny, self.nx)
+                        tv_g = self._compute_tv_gradient_3d_torch(xg)
+                        xg = torch.clamp(xg - step_size * tv_reg * tv_g, 0.0, 18.0)
+                        xg[clear_t] = 0.0
 
-                        # TV regularizer step on 2D reshaped grid
-                        x_grid = x_next.view(self.ny, self.nx)
-                        tv_grad = self._compute_tv_gradient_torch(x_grid)
-                        x_grid = torch.clamp(x_grid - step_size * tv_reg * tv_grad, 0.0, 18.0)
-
-                        if free_mask_t is not None:
-                            x_grid[free_mask_t] = 0.0
-
-                        x_next = x_grid.view(-1)
-                        t_next = (1.0 + math.sqrt(1.0 + 4.0 * t * t)) / 2.0
-                        y = x_next + ((t - 1.0) / t_next) * (x_next - x)
+                        x_next = xg.view(-1)
+                        t_next = (1.0 + math.sqrt(1.0 + 4.0 * t_mom * t_mom)) / 2.0
+                        y = x_next + ((t_mom - 1.0) / t_next) * (x_next - x)
                         x = x_next
-                        t = t_next
+                        t_mom = t_next
 
-                    self.grid = x.view(self.ny, self.nx).detach().cpu().numpy()
+                    self.grid_3d = x.view(self.nz, self.ny, self.nx).detach().cpu().numpy()
+                    self.grid = self._project_interior_2d(self.grid_3d)
                     return self.grid
             except Exception:
-                # Graceful CPU / NumPy fallback on any unexpected CUDA error
                 pass
 
-        # -------------------------------------------------------------
-        # Path B: CPU / Pure NumPy Fallback
-        # -------------------------------------------------------------
-        x = np.zeros((self.ny, self.nx), dtype=np.float32)
+        # Vectorized NumPy fallback (fast sparse list accumulation)
+        x = np.zeros((self.nz, self.ny, self.nx), dtype=np.float32)
         y = np.copy(x)
-        t = 1.0
+        t_mom = 1.0
 
         for _ in range(iterations):
             grad = np.zeros_like(y)
-
-            # Compute data fidelity gradient: L^T (L y - d)
-            for intersections, target_db in rays_processed:
-                pred_db = sum(y[iy, ix] * length for ix, iy, length in intersections)
+            for inter, target_db in rays_processed:
+                pred_db = sum(y[iz, iy, ix] * length for ix, iy, iz, length in inter)
                 err = pred_db - target_db
-                for ix, iy, length in intersections:
-                    grad[iy, ix] += 2.0 * err * length
+                for ix, iy, iz, length in inter:
+                    grad[iz, iy, ix] += 2.0 * err * length
 
-            grad /= len(rays_processed)
-
-            # Gradient step
+            grad /= norm_denom
             x_next = y - step_size * grad
-
-            # Proximal L1 operator (Soft Thresholding)
             x_next = np.sign(x_next) * np.maximum(0.0, np.abs(x_next) - step_size * l1_reg)
+            tv_g = self._compute_tv_gradient_3d(x_next)
+            x_next = np.clip(x_next - step_size * tv_reg * tv_g, 0.0, 18.0)
+            x_next[clear_mask_3d] = 0.0
 
-            # Total Variation (TV) gradient smoothing step
-            tv_grad = self._compute_tv_gradient(x_next)
-            x_next -= step_size * tv_reg * tv_grad
-
-            # Hard constraints: delta >= 0 and delta == 0 on walked free space
-            x_next = np.clip(x_next, 0.0, 18.0) # Maximum 18 dB/m attenuation
-            if free_mask is not None and free_mask.shape == x_next.shape:
-                x_next[free_mask] = 0.0
-
-            # FISTA momentum acceleration
-            t_next = (1.0 + math.sqrt(1.0 + 4.0 * t * t)) / 2.0
-            y = x_next + ((t - 1.0) / t_next) * (x_next - x)
-
+            t_next = (1.0 + math.sqrt(1.0 + 4.0 * t_mom * t_mom)) / 2.0
+            y = x_next + ((t_mom - 1.0) / t_next) * (x_next - x)
             x = x_next
-            t = t_next
+            t_mom = t_next
 
-        self.grid = x
+        self.grid_3d = x
+        self.grid = self._project_interior_2d(self.grid_3d)
         return self.grid
 
-    def run_tier3b_nerfmap_refinement(
+    def _project_interior_2d(self, grid_3d: np.ndarray) -> np.ndarray:
+        """Projects interior room height slices (0.0m <= z <= 2.7m) onto 2D CAD grid."""
+        interior_indices = [
+            iz for iz in range(self.nz)
+            if 0.0 <= (self.z_min_m + (iz + 0.5) * self.z_res) <= 2.7
+        ]
+        if not interior_indices:
+            interior_indices = [self.nz // 2]
+        return np.max(grid_3d[interior_indices], axis=0).astype(np.float32)
+
+    def run_tier3a_fista_tomography(
         self,
         ray_data: List[Tuple[float, float, float, float, float]],
         free_mask: Optional[np.ndarray],
-        epochs: int = 80,
-        fourier_bands: int = 4,
-        hidden_dim: int = 32,
-        lr: float = 0.01,
-        ray_loss_weight: float = 0.1,
-        model_type: str = "fourier",
-        siren_omega: float = 30.0,
-        hash_levels: int = 8,
-        learn_antenna_pattern: bool = False
+        iterations: int = 45,
+        l1_reg: float = 0.005,
+        tv_reg: float = 0.02,
+        step_size: float = 0.35,
     ) -> np.ndarray:
+        """Backwards-compatible 2D wrapper forwarding to the 3D voxel engine at room height z=1.2m."""
+        rays_3d = [
+            (apx, apy, 1.2, rxx, rxy, 1.2, target_db)
+            for apx, apy, rxx, rxy, target_db in ray_data
+        ]
+        return self.run_3d_tomography(
+            rays_3d,
+            free_mask,
+            iterations=iterations,
+            l1_reg=l1_reg,
+            tv_reg=tv_reg,
+            step_size=step_size,
+        )
+
+    def compute_camping_shells(
+        self,
+        ray_data_3d: List[Tuple[float, float, float, float, float, float, float]],
+        camping_centers: List[Tuple[float, float, float]],
+        num_sectors: int = 24,
+    ) -> List[Dict[str, Any]]:
         """
-        Warm-started coordinate field refinement with physics loss.
-        Supports multiple advanced ML architectures:
-        - 'fourier': CoordinateMLP with Fourier positional encoding (default)
-        - 'hashgrid': Instant-NGP style multi-resolution spatial hash table features
-        - 'siren': Sinusoidal Representation Networks with periodic activations
-        - 'nerf_3d': Height-aware 3D continuous NeRF field delta(x, y, z)
+        Builds 24-sector (15 deg) x 3-vertical-tier directional RF obstruction shells
+        around each primary camping location.
         """
-        # Fourier feature coordinates: gamma(x, y) = [sin(2^k pi x), cos(2^k pi x)...]
-        coords_x = (np.arange(self.nx) * self.res) / max(1e-4, self.nx * self.res)
-        coords_y = (np.arange(self.ny) * self.res) / max(1e-4, self.ny * self.res)
-        GX, GY = np.meshgrid(coords_x, coords_y)
+        if not camping_centers or not ray_data_3d:
+            return []
 
-        # Configurable frequency bands: 2^0, 2^1, ... 2^(B-1)
-        freqs = [2.0 ** k for k in range(fourier_bands)]
-        features = []
-        for freq in freqs:
-            features.append(np.sin(freq * math.pi * GX))
-            features.append(np.cos(freq * math.pi * GX))
-            features.append(np.sin(freq * math.pi * GY))
-            features.append(np.cos(freq * math.pi * GY))
-        feat_stack = np.stack(features, axis=-1) # [ny, nx, 4 * fourier_bands]
-        D_in = 4 * fourier_bands
+        shells: List[Dict[str, Any]] = []
+        sector_deg = 360.0 / num_sectors
 
-        # Prepare ray paths if available
-        rays_processed = []
-        if ray_data:
-            for apx, apy, rxx, rxy, target_db in ray_data:
-                intersections = self.march_ray_voxels(apx, apy, rxx, rxy)
-                if intersections:
-                    rays_processed.append((intersections, target_db))
+        for idx, (cx, cy, cz) in enumerate(camping_centers[:4], 1):
+            buckets: Dict[Tuple[str, int], List[float]] = {}
+            for apx, apy, apz, rxx, rxy, rxz, excess in ray_data_3d:
+                if math.hypot(rxx - cx, rxy - cy) > 1.5:
+                    continue
+                ang = math.degrees(math.atan2(apy - rxy, apx - rxx)) % 360.0
+                sec = int(ang // sector_deg) % num_sectors
+                dz = apz - rxz
+                tier = "below" if dz < -1.2 else ("above" if dz > 2.2 else "room")
+                buckets.setdefault((tier, sec), []).append(float(excess))
 
-        # -------------------------------------------------------------
-        # Path A: PyTorch CUDA Batched Execution
-        # -------------------------------------------------------------
-        if self.using_cuda and HAS_TORCH:
-            try:
-                # Prepare normalized 2D coordinates [N, 2] in [0, 1]
-                norm_x = torch.linspace(0, 1, self.nx, device=self.torch_device)
-                norm_y = torch.linspace(0, 1, self.ny, device=self.torch_device)
-                grid_y, grid_x = torch.meshgrid(norm_y, norm_x, indexing="ij")
-                raw_coords = torch.stack([grid_x.reshape(-1), grid_y.reshape(-1)], dim=-1)
-
-                feat_tensor = torch.from_numpy(feat_stack).float().to(self.torch_device).view(-1, D_in)
-
-                # Instantiate the chosen architecture
-                if model_type == "hashgrid":
-                    mlp = HashGridNeRFModel(num_levels=hash_levels, hidden_dim=hidden_dim).to(self.torch_device)
-                    model_in = raw_coords
-                elif model_type == "siren":
-                    mlp = SIRENCoordinateNet(in_features=2, hidden_dim=hidden_dim, omega_0=siren_omega).to(self.torch_device)
-                    model_in = raw_coords * 2.0 - 1.0 # [-1, 1] range for sine
-                elif model_type == "nerf_3d":
-                    mlp = Volumetric3DCoordinateMLP(fourier_bands=fourier_bands, hidden_dim=hidden_dim).to(self.torch_device)
-                    # Mid-height slice z = 0.4 (approx 1.2m elevation)
-                    z_slice = torch.full((raw_coords.shape[0], 1), 0.4, device=self.torch_device)
-                    model_in = torch.cat([raw_coords, z_slice], dim=-1)
-                else: # Default: 'fourier'
-                    mlp = CoordinateMLP(in_features=D_in, hidden_dim=hidden_dim).to(self.torch_device)
-                    model_in = feat_tensor
-
-                # Optional learned antenna pattern
-                antenna_net = DirectionalAntennaPattern().to(self.torch_device) if learn_antenna_pattern else None
-
-                if model_type == "hashgrid":
-                    # Instant-NGP two-group optimizer: higher lr for hash tables, regular lr for MLP trunk
-                    table_params = list(mlp.encoder.parameters())
-                    trunk_net = mlp.trunk if hasattr(mlp, "trunk") else mlp.mlp
-                    trunk_params = list(trunk_net.parameters())
-                    if antenna_net:
-                        trunk_params.extend(list(antenna_net.parameters()))
-                    optimizer = torch.optim.Adam([
-                        {"params": table_params, "lr": 0.05, "weight_decay": 1e-5},
-                        {"params": trunk_params, "lr": lr}
-                    ])
-                else:
-                    params = list(mlp.parameters())
-                    if antenna_net:
-                        params.extend(list(antenna_net.parameters()))
-                    optimizer = torch.optim.Adam(params, lr=lr)
-
-                tomo_target = torch.from_numpy(self.grid).float().to(self.torch_device).view(-1, 1)
-
-                free_mask_t = None
-                if free_mask is not None and free_mask.shape == (self.ny, self.nx):
-                    free_mask_t = torch.from_numpy(free_mask).bool().to(self.torch_device)
-
-                L, _, targets = (self._build_sparse_ray_tensors_cuda(rays_processed)
-                                 if rays_processed else (None, None, None))
-
-                for _ in range(epochs):
-                    optimizer.zero_grad()
-                    pred_voxels = mlp(model_in) # [total_voxels, 1]
-
-                    # Tomography warm-start loss
-                    tomo_loss = F.mse_loss(pred_voxels, tomo_target)
-
-                    # Ray-voxel line-of-sight loss
-                    if L is not None and targets is not None:
-                        pred_rays = torch.sparse.mm(L, pred_voxels).squeeze(1)
-                        ray_loss = F.mse_loss(pred_rays, targets)
-                        total_loss = tomo_loss + ray_loss_weight * ray_loss
+            sectors = []
+            observed_room = 0
+            for sec in range(num_sectors):
+                ang_mid = (sec + 0.5) * sector_deg
+                tier_info = {}
+                for tier in ("room", "below", "above"):
+                    vals = buckets.get((tier, sec), [])
+                    if not vals:
+                        tier_info[tier] = {"status": "unobserved", "rays": 0, "mean_excess_db": 0.0}
                     else:
-                        total_loss = tomo_loss
+                        m_ex = float(np.mean(vals))
+                        status = "clear" if m_ex < 2.0 else ("moderate" if m_ex < 6.0 else "obstructed")
+                        tier_info[tier] = {
+                            "status": status,
+                            "rays": len(vals),
+                            "mean_excess_db": round(m_ex, 2),
+                        }
+                if tier_info["room"]["rays"] > 0:
+                    observed_room += 1
+                sectors.append({
+                    "sector": sec,
+                    "azimuth_deg": round(ang_mid, 1),
+                    "tiers": tier_info,
+                })
 
-                    total_loss.backward()
-                    optimizer.step()
+            shells.append({
+                "anchor_id": f"camp_{idx}",
+                "x": round(cx, 2),
+                "y": round(cy, 2),
+                "z": round(cz, 2),
+                "azimuthal_coverage_pct": round((observed_room / num_sectors) * 100.0, 1),
+                "sectors": sectors,
+            })
 
-                # Final evaluation
-                with torch.no_grad():
-                    pred_grid = mlp(model_in).view(self.ny, self.nx)
-                    pred_grid = torch.clamp(pred_grid, 0.0, 18.0)
-                    if free_mask_t is not None:
-                        pred_grid[free_mask_t] = 0.0
-                    self.grid = pred_grid.detach().cpu().numpy()
+        return shells
 
-                return self.grid
-            except Exception:
-                # Graceful CPU / NumPy fallback on any CUDA exception
-                pass
+    def export_sparse_voxels(
+        self, min_atten_db_m: float = 1.2, max_voxels: int = 2500
+    ) -> List[Dict[str, Any]]:
+        """Exports compact occupied 3D voxels for WebGL volumetric visualization."""
+        ys, xs = np.nonzero(np.max(self.grid_3d, axis=0) >= min_atten_db_m)
+        if len(xs) == 0:
+            return []
 
-        # -------------------------------------------------------------
-        # Path B: CPU / NumPy Fallback
-        # -------------------------------------------------------------
-        np.random.seed(42)
-        W1 = np.random.randn(D_in, hidden_dim) * 0.1
-        b1 = np.zeros(hidden_dim)
-        W2 = np.random.randn(hidden_dim, 1) * 0.1
-        b2 = np.zeros(1)
+        voxels = []
+        for iz in range(self.nz):
+            zc = round(self.z_min_m + (iz + 0.5) * self.z_res, 2)
+            layer = self.grid_3d[iz]
+            hits = self.hit_counts_3d[iz]
+            ziy, zix = np.nonzero((layer >= min_atten_db_m) & (hits >= 0.25))
+            for iy, ix in zip(ziy.tolist(), zix.tolist()):
+                voxels.append({
+                    "x": round((ix + 0.5) * self.res, 2),
+                    "y": round((iy + 0.5) * self.res, 2),
+                    "z": zc,
+                    "atten": round(float(layer[iy, ix]), 2),
+                    "tier": "below" if zc < -0.2 else ("ceiling" if zc > 2.7 else "wall"),
+                })
 
-        target = self.grid[:, :, None]
-        for _ in range(min(epochs, 60)):
-            # Forward pass
-            h1 = np.maximum(0, feat_stack @ W1 + b1) # ReLU
-            pred = np.maximum(0, h1 @ W2 + b2)
-            loss_grad = 2.0 * (pred - target) / (self.nx * self.ny)
+        if len(voxels) > max_voxels:
+            voxels.sort(key=lambda v: v["atten"], reverse=True)
+            voxels = voxels[:max_voxels]
+        return voxels
 
-            # Backward pass
-            dW2 = np.sum(h1[:, :, :, None] * loss_grad[:, :, :, None], axis=(0, 1)).squeeze()
-            db2 = np.sum(loss_grad)
-            dh1 = loss_grad @ W2.T
-            dh1[h1 <= 0] = 0.0 # ReLU deriv
-            dW1 = np.sum(feat_stack[:, :, :, None] * dh1[:, :, None, :], axis=(0, 1))
-            db1 = np.sum(dh1, axis=(0, 1))
+    def extract_3d_objects(
+        self,
+        free_mask: Optional[np.ndarray] = None,
+        min_atten_db_m: float = 2.5,
+        max_objects: int = 32,
+    ) -> List[Dict[str, Any]]:
+        """
+        Extracts compact 3D RF-blocking obstacle / object clusters (e.g. appliances, columns,
+        thick furniture blocks) from the 3D attenuation volume within interior height (0.0m <= z <= 2.4m).
+        Distinct from elongated structural walls by compact 2D/3D footprint.
+        """
+        interior_iz = [
+            iz for iz in range(self.nz)
+            if 0.0 <= (self.z_min_m + (iz + 0.5) * self.z_res) <= 2.4
+        ]
+        if not interior_iz:
+            return []
 
-            W2 -= lr * dW2[:, None]
-            b2 -= lr * db2
-            W1 -= lr * dW1
-            b1 -= lr * db1
+        z_slice_min, z_slice_max = interior_iz[0], interior_iz[-1] + 1
+        sub_atten = self.grid_3d[z_slice_min:z_slice_max]
+        sub_hits = self.hit_counts_3d[z_slice_min:z_slice_max]
+        occ = (sub_atten >= min_atten_db_m) & (sub_hits >= 0.25)
 
-        # Final refined grid
-        h1 = np.maximum(0, feat_stack @ W1 + b1)
-        refined = np.maximum(0, h1 @ W2 + b2).squeeze()
-        if free_mask is not None and free_mask.shape == refined.shape:
-            refined[free_mask] = 0.0
+        if free_mask is not None and free_mask.shape == (self.ny, self.nx):
+            occ[:, free_mask] = False
 
-        self.grid = np.clip(refined, 0.0, 18.0)
-        return self.grid
+        if not np.any(occ):
+            return []
 
-    def _compute_tv_gradient(self, x: np.ndarray) -> np.ndarray:
-        """Computes anisotropic Total Variation gradient (NumPy)."""
+        visited = np.zeros_like(occ, dtype=bool)
+        dz_n, dy_n, dx_n = occ.shape
+        objects: List[Dict[str, Any]] = []
+
+        for sz, sy, sx in zip(*np.nonzero(occ)):
+            sz, sy, sx = int(sz), int(sy), int(sx)
+            if visited[sz, sy, sx]:
+                continue
+            stack = [(sz, sy, sx)]
+            visited[sz, sy, sx] = True
+            comp: List[Tuple[int, int, int]] = []
+            while stack:
+                cz_i, cy_i, cx_i = stack.pop()
+                comp.append((cz_i, cy_i, cx_i))
+                for dz_o in (-1, 0, 1):
+                    for dy_o in (-1, 0, 1):
+                        for dx_o in (-1, 0, 1):
+                            if dz_o == 0 and dy_o == 0 and dx_o == 0:
+                                continue
+                            nz_i, ny_i, nx_i = cz_i + dz_o, cy_i + dy_o, cx_i + dx_o
+                            if (
+                                0 <= nz_i < dz_n and 0 <= ny_i < dy_n and 0 <= nx_i < dx_n
+                                and occ[nz_i, ny_i, nx_i] and not visited[nz_i, ny_i, nx_i]
+                            ):
+                                visited[nz_i, ny_i, nx_i] = True
+                                stack.append((nz_i, ny_i, nx_i))
+
+            xs = [(c[2] + 0.5) * self.res for c in comp]
+            ys = [(c[1] + 0.5) * self.res for c in comp]
+            zs = [self.z_min_m + (z_slice_min + c[0] + 0.5) * self.z_res for c in comp]
+            w_m = max(self.res, (max(xs) - min(xs)) + self.res)
+            d_m = max(self.res, (max(ys) - min(ys)) + self.res)
+            h_m = max(self.z_res, (max(zs) - min(zs)) + self.z_res)
+
+            # Skip long thin ridges (structural walls belong in CAD walls)
+            aspect = max(w_m, d_m) / max(0.25, min(w_m, d_m))
+            if max(w_m, d_m) > 2.2 and aspect > 2.6:
+                continue
+
+            attens = [float(sub_atten[c[0], c[1], c[2]]) for c in comp]
+            hits = [float(sub_hits[c[0], c[1], c[2]]) for c in comp]
+            peak_a = max(attens)
+            mean_a = float(np.mean(attens))
+            mean_h = float(np.mean(hits))
+
+            c_atten = min(1.0, mean_a / 7.0)
+            c_hits = min(1.0, mean_h / 6.0)
+            c_vol = min(1.0, len(comp) / 4.0)
+            conf = round(max(0.15, min(0.92, 0.45 * c_atten + 0.35 * c_hits + 0.20 * c_vol)), 2)
+
+            label = (
+                "Dense Pillar / Metal Fixture" if peak_a >= 7.0
+                else ("RF-Blocking Appliance / Mass" if peak_a >= 4.0 else "Furniture / Low Obstacle")
+            )
+            objects.append({
+                "object_id": f"obj_{len(objects) + 1}",
+                "x": round(float(np.mean(xs)), 2),
+                "y": round(float(np.mean(ys)), 2),
+                "z": round(float(np.mean(zs)), 2),
+                "width_m": round(float(w_m), 2),
+                "depth_m": round(float(d_m), 2),
+                "height_m": round(float(h_m), 2),
+                "peak_attenuation_db": round(peak_a, 2),
+                "avg_attenuation_db": round(mean_a, 2),
+                "voxel_count": len(comp),
+                "confidence": conf,
+                "classification": "confirmed" if conf >= 0.70 else ("probable" if conf >= 0.40 else "speculative"),
+                "label": label,
+            })
+
+        objects.sort(key=lambda o: (o["confidence"], o["peak_attenuation_db"]), reverse=True)
+        return objects[:max_objects]
+
+    def _compute_tv_gradient_3d(self, x: np.ndarray) -> np.ndarray:
         grad = np.zeros_like(x)
-        diff_y = np.diff(x, axis=0)
-        diff_x = np.diff(x, axis=1)
-
-        grad[:-1, :] += np.sign(diff_y)
-        grad[1:, :] -= np.sign(diff_y)
-        grad[:, :-1] += np.sign(diff_x)
-        grad[:, 1:] -= np.sign(diff_x)
+        dz = np.diff(x, axis=0)
+        dy = np.diff(x, axis=1)
+        dx = np.diff(x, axis=2)
+        grad[:-1, :, :] += np.sign(dz)
+        grad[1:, :, :] -= np.sign(dz)
+        grad[:, :-1, :] += np.sign(dy)
+        grad[:, 1:, :] -= np.sign(dy)
+        grad[:, :, :-1] += np.sign(dx)
+        grad[:, :, 1:] -= np.sign(dx)
         return grad
 
-    def _compute_tv_gradient_torch(self, x: Any) -> Any:
-        """Computes anisotropic Total Variation gradient (PyTorch Tensor)."""
+    def _compute_tv_gradient_3d_torch(self, x: Any) -> Any:
         grad = torch.zeros_like(x)
-        diff_y = torch.diff(x, dim=0)
-        diff_x = torch.diff(x, dim=1)
-
-        grad[:-1, :] += torch.sign(diff_y)
-        grad[1:, :] -= torch.sign(diff_y)
-        grad[:, :-1] += torch.sign(diff_x)
-        grad[:, 1:] -= torch.sign(diff_x)
+        dz = torch.diff(x, dim=0)
+        dy = torch.diff(x, dim=1)
+        dx = torch.diff(x, dim=2)
+        grad[:-1, :, :] += torch.sign(dz)
+        grad[1:, :, :] -= torch.sign(dz)
+        grad[:, :-1, :] += torch.sign(dy)
+        grad[:, 1:, :] -= torch.sign(dy)
+        grad[:, :, :-1] += torch.sign(dx)
+        grad[:, :, 1:] -= torch.sign(dx)
         return grad
+
+
+# Backwards-compatible alias for existing callers/tests
+NeRFMapEngine = Volumetric3DEngine
